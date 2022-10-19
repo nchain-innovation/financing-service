@@ -103,6 +103,7 @@ pub async fn get_funds(data: web::Data<AppState>, info: web::Path<FundingInfo>) 
     }
 
     let locking_script_as_bytes = decode_locking_script.unwrap();
+    dbg!(&locking_script_as_bytes);
 
     let has_sufficent = service.has_sufficent_balance(
         client_id,

@@ -112,12 +112,11 @@ impl BlockchainInterface {
         let network = self.get_network_str();
 
         let url = format!("https://api.whatsonchain.com/v1/bsv/{network}/tx/raw");
-
+        dbg!(&url);
         let data_for_broadcast = BroadcastTxType {
             txhex: tx.to_string(),
         };
         let data = serde_json::to_string(&data_for_broadcast).unwrap();
-        // = format!("{{\"txhex\" : \"{tx}\"}}");
         dbg!(&data);
         let client = reqwest::Client::new();
         client.post(url).json(&data).send().await
