@@ -7,7 +7,7 @@ use sv::network::Network as SvNetwork;
 use sv::script::Script;
 use sv::transaction::generate_signature;
 use sv::transaction::p2pkh::{create_lock_script, create_unlock_script};
-use sv::transaction::sighash::{sighash, SigHashCache, SIGHASH_FORKID, SIGHASH_NONE};
+use sv::transaction::sighash::{sighash, SigHashCache, SIGHASH_ALL, SIGHASH_FORKID};
 use sv::util::{Hash160, Hash256};
 
 use crate::blockchain_interface::{
@@ -125,7 +125,7 @@ impl Client {
         let fee_estimate: u64 =
             (((locking_script_len as u64 * no_of_outpoints as u64) / 1000) * 500) + 750;
         let total_cost: u64 = (satoshi * no_of_outpoints as u64) + fee_estimate;
-
+        dbg!(&total_cost);
         // Chreat a locking script for change
         let change_script = create_lock_script(&self.funding_address);
 
@@ -138,7 +138,8 @@ impl Client {
                 hash: Hash256::decode(&unspent.tx_hash).unwrap(),
                 index: unspent.tx_pos,
             },
-            ..Default::default()
+            unlock_script: Script::new(),
+            sequence: 0xffffffff,
         }];
         // Create the vout
         // create vout for change
@@ -167,19 +168,35 @@ impl Client {
             outputs: vouts,
             lock_time: 0,
         };
-        // Sign tx
+
+        // Sign transaction
         let mut cache = SigHashCache::new();
-        let sighash_type = SIGHASH_NONE | SIGHASH_FORKID;
-        let sighash = sighash(&tx, 0, &change_script.0, 0, sighash_type, &mut cache).unwrap();
+        // let sighash_type = SIGHASH_NONE | SIGHASH_FORKID;
+        let sighash_type = SIGHASH_ALL | SIGHASH_FORKID;
+        dbg!(&change_script);
+        dbg!(&change_script.0);
+
+        let sighash = sighash(
+            &tx,
+            0,
+            &change_script.0,
+            unspent.value.try_into().unwrap(),
+            sighash_type,
+            &mut cache,
+        )
+        .unwrap();
+        //let sighash = sighash(&tx, 0, &change_script.0, total_cost.try_into().unwrap(), sighash_type, &mut cache).unwrap();
         let signature = generate_signature(
             &self.private_key.to_bytes().try_into().unwrap(),
             &sighash,
             sighash_type,
         )
         .unwrap();
+        // insert the ScriptSig (unlock_script)
         tx.inputs[0].unlock_script =
             create_unlock_script(&signature, &self.public_key.to_bytes().try_into().unwrap());
 
+        dbg!(&tx);
         // find unspent index
         let index = self.unspent.iter().position(|x| x == unspent).unwrap();
 
