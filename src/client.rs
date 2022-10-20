@@ -10,7 +10,7 @@ use sv::transaction::p2pkh::{create_lock_script, create_unlock_script};
 use sv::transaction::sighash::{sighash, SigHashCache, SIGHASH_ALL, SIGHASH_FORKID};
 use sv::util::{Hash160, Hash256};
 
-use crate::blockchain_interface::{
+use crate::blockchain_interface::blockchain_if::{
     as_bitcoin_network, BlockchainInterface, WocBalance, WocUtxo, WocUtxoEntry,
 };
 use crate::config::ClientConfig;
@@ -58,7 +58,7 @@ impl Client {
     /// Given an interface query it for the latest balance
     pub async fn update_balance(
         &mut self,
-        blockchain_interface: &BlockchainInterface,
+        blockchain_interface: &dyn BlockchainInterface,
     ) -> Result<(), Box<dyn std::error::Error>> {
         self.balance = blockchain_interface
             .get_balance(&self.address.to_string())
@@ -90,7 +90,7 @@ impl Client {
         self.unspent.iter().find(|x| x.value > satoshi)
     }
 
-    /// Given the tx inputs, determine if there is a suitable Utxo for it
+    /// Given the tx inputs, determine if there is a suitable Utxo for a funding tx
     pub fn has_sufficent_balance(
         &self,
         satoshi: u64,
@@ -125,13 +125,10 @@ impl Client {
         let fee_estimate: u64 =
             (((locking_script_len as u64 * no_of_outpoints as u64) / 1000) * 500) + 750;
         let total_cost: u64 = (satoshi * no_of_outpoints as u64) + fee_estimate;
-        dbg!(&total_cost);
         // Chreat a locking script for change
         let change_script = create_lock_script(&self.funding_address);
-
         // Find smallest funding unspent that is big enough for tx
         let unspent = self.get_smallest_unspent(total_cost)?;
-
         // Create vin
         let vins: Vec<TxIn> = vec![TxIn {
             prev_output: OutPoint {
@@ -168,13 +165,9 @@ impl Client {
             outputs: vouts,
             lock_time: 0,
         };
-
         // Sign transaction
         let mut cache = SigHashCache::new();
-        // let sighash_type = SIGHASH_NONE | SIGHASH_FORKID;
         let sighash_type = SIGHASH_ALL | SIGHASH_FORKID;
-        dbg!(&change_script);
-        dbg!(&change_script.0);
 
         let sighash = sighash(
             &tx,
@@ -196,7 +189,6 @@ impl Client {
         tx.inputs[0].unlock_script =
             create_unlock_script(&signature, &self.public_key.to_bytes().try_into().unwrap());
 
-        dbg!(&tx);
         // find unspent index
         let index = self.unspent.iter().position(|x| x == unspent).unwrap();
 
@@ -234,7 +226,122 @@ impl Client {
                 }
             }
         }
-
+        // Return the list of created txs
         txs
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::blockchain_interface::BlockchainInterfaceTest;
+    use crate::config::{BlockchainInterfaceConfig, ClientConfig, Config};
+    use crate::util::tx_as_hexstr;
+
+    fn setup_blockchain(config: &Config) -> Box<dyn BlockchainInterface + Send + Sync> {
+        let mut blockchain_interface = BlockchainInterfaceTest::new(&config);
+
+        let utxo = vec![
+            WocUtxoEntry {
+                height: 1514933,
+                tx_pos: 0,
+                tx_hash: "f67272e5c1408ecbeb8da543437c125ee1a17110317d44d13eafe31b771b795e"
+                    .to_string(),
+                value: 240,
+            },
+            WocUtxoEntry {
+                height: 1514939,
+                tx_pos: 1,
+                tx_hash: "b3ec9a52a1fe1689a998c869c2ae38d64d08ece8aaf218286461f330f6fd2ca8"
+                    .to_string(),
+                value: 100,
+            },
+            WocUtxoEntry {
+                height: 1514939,
+                tx_pos: 1,
+                tx_hash: "76f9302ab84fc5da40de02617c10f1a26dff7007c2bfffa9d0845e57d47fa82f"
+                    .to_string(),
+                value: 100,
+            },
+            WocUtxoEntry {
+                height: 1514939,
+                tx_pos: 1,
+                tx_hash: "447ee285748e88d8b875ce09026815578f0474ec3f1babcd5ba917ecb9f1dd7a"
+                    .to_string(),
+                value: 100,
+            },
+            WocUtxoEntry {
+                height: 1514939,
+                tx_pos: 2,
+                tx_hash: "447ee285748e88d8b875ce09026815578f0474ec3f1babcd5ba917ecb9f1dd7a"
+                    .to_string(),
+                value: 100,
+            },
+            WocUtxoEntry {
+                height: 1516841,
+                tx_pos: 0,
+                tx_hash: "70d0365df8062e5af41f8e8f2e42bafde3cabbaebd1fc94e94fa5559e87777b2"
+                    .to_string(),
+                value: 39080962,
+            },
+            WocUtxoEntry {
+                height: 1517272,
+                tx_pos: 0,
+                tx_hash: "51b349bda57674a02ea5b90b43f2204dd6df330d751d646d74d76b19348bf5be"
+                    .to_string(),
+                value: 39327675,
+            },
+            WocUtxoEntry {
+                height: 1517429,
+                tx_pos: 0,
+                tx_hash: "e533109de9df0184299e2199fa8f74baae7d99e4b39d3dea1e957e2f26636578"
+                    .to_string(),
+                value: 9564208,
+            },
+            WocUtxoEntry {
+                height: 1517429,
+                tx_pos: 1,
+                tx_hash: "e533109de9df0184299e2199fa8f74baae7d99e4b39d3dea1e957e2f26636578"
+                    .to_string(),
+                value: 123,
+            },
+        ];
+
+        blockchain_interface.set_utxo("n1jaAsKZfE6kufLy5DAtAyQ1RzGXwMeNAF", &utxo);
+        blockchain_interface.set_height(1517571);
+        Box::new(blockchain_interface)
+    }
+
+    #[tokio::test]
+    async fn test_create_tx() {
+        // Create a test config
+        let config = Config {
+            blockchain_interface: BlockchainInterfaceConfig {
+                interface_type: "Test".to_string(),
+                network_type: "testnet".to_string(),
+            },
+
+            client: vec![ClientConfig {
+                client_id: "id1".to_string(),
+                wif_key: "cTYmKQzX3CvHJAxe2sctsQaHG8ktiEnpXgyyycVXGg5pRcLJEeLd".to_string(),
+            }],
+            ..Default::default()
+        };
+
+        // Set up test blockchain
+
+        let blockchain_interface = setup_blockchain(&config);
+
+        let mut client = Client::new(&config.client[0], blockchain_interface.get_network());
+
+        let result = client.update_balance(&*blockchain_interface).await;
+        assert!(&result.is_ok());
+
+        let locking_script =
+            hex::decode("76a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac").unwrap();
+        let tx = client.create_funding_tx(123, 1, &locking_script).unwrap();
+
+        dbg!(&tx);
+        assert_eq!(tx_as_hexstr(&tx), "0100000001786563262f7e951eea3d9db3e4997daeba748ffa99219e298401dfe99d1033e5000000006b483045022100c7a22fbf24470b2c96b82ce1bfd5896f515e3f0f509f307e94f699baefe0f8c3022044ddbb29952769c67ba117762ee628d299846039a6d90bc59618c770b226bfc2412103a8ae071ddd8690b94755c7112ca304bcac45c15904cc013f0ad6c2ea0b1019b2ffffffff02c7ec9100000000001976a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac7b000000000000001976a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac00000000");
     }
 }
