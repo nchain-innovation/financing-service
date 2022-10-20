@@ -1,45 +1,10 @@
+use async_trait::async_trait;
+
 use crate::config::Config;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use sv::network::Network;
 
-#[allow(unused_must_use)]
-
-/// Balance returned from WoC
-#[derive(Debug, Deserialize, Clone, Copy)]
-pub struct WocBalance {
-    pub confirmed: u64,
-    pub unconfirmed: u64,
-}
-
-impl WocBalance {
-    pub fn new() -> Self {
-        WocBalance {
-            confirmed: 0,
-            unconfirmed: 0,
-        }
-    }
-}
-
-/// Type to represent UTXO Entry
-#[allow(dead_code)]
-#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
-pub struct WocUtxoEntry {
-    pub height: u32,
-    pub tx_pos: u32,
-    pub tx_hash: String,
-    pub value: u64,
-}
-/// Type to represent UTXO set
-pub type WocUtxo = Vec<WocUtxoEntry>;
-
-/// Convert network to bitcoin network type
-pub fn as_bitcoin_network(network: &Network) -> bitcoin::Network {
-    match network {
-        Network::Mainnet => bitcoin::Network::Bitcoin,
-        Network::Testnet => bitcoin::Network::Testnet,
-        Network::STN => bitcoin::Network::Signet,
-    }
-}
+use super::blockchain_if::{BlockchainInterface, WocBalance, WocUtxo};
 
 /// Structure for json serialisation for broadcast_tx
 #[derive(Debug, Serialize)]
@@ -50,16 +15,15 @@ pub struct BroadcastTxType {
 /// Represents an interface to the blockchain
 #[allow(dead_code)]
 #[derive(Debug)]
-pub struct BlockchainInterface {
-    /// the interface type associated with this interface - currently only supports WoC - WhatsOnChain
+pub struct BlockchainInterfaceWoc {
     interface_type: String,
     /// the network associated with this interface
     network_type: Network,
 }
 
-impl BlockchainInterface {
+impl BlockchainInterfaceWoc {
     pub fn new(config: &Config) -> Self {
-        BlockchainInterface {
+        BlockchainInterfaceWoc {
             interface_type: config.blockchain_interface.interface_type.clone(),
             network_type: config.get_network().unwrap(),
         }
@@ -73,41 +37,42 @@ impl BlockchainInterface {
             Network::STN => "stn",
         }
     }
+}
 
+#[async_trait]
+impl BlockchainInterface for BlockchainInterfaceWoc {
     /// Return the network associated with this interface
-    pub fn get_network(&self) -> Network {
+    fn get_network(&self) -> Network {
         self.network_type
     }
 
     /// Get balance associated with address
-    pub async fn get_balance(
-        &self,
-        address: &str,
-    ) -> Result<WocBalance, Box<dyn std::error::Error>> {
+    async fn get_balance(&self, address: &str) -> Result<WocBalance, Box<dyn std::error::Error>> {
         let network = self.get_network_str();
         let url =
             format!("https://api.whatsonchain.com/v1/bsv/{network}/address/{address}/balance");
         let response = reqwest::get(url).await?;
         let data = response.json::<WocBalance>().await?;
+        dbg!(&address);
         dbg!(&data);
         Ok(data)
     }
 
     /// Get UXTO associated with address
-    pub async fn get_utxo(&self, address: &str) -> Result<WocUtxo, Box<dyn std::error::Error>> {
+    async fn get_utxo(&self, address: &str) -> Result<WocUtxo, Box<dyn std::error::Error>> {
         let network = self.get_network_str();
 
         let url =
             format!("https://api.whatsonchain.com/v1/bsv/{network}/address/{address}/unspent");
         let response = reqwest::get(url).await?;
         let data = response.json::<WocUtxo>().await?;
-
+        dbg!(&address);
         dbg!(&data);
         Ok(data)
     }
 
     /// Broadcast Tx
-    pub async fn broadcast_tx(&self, tx: &str) -> Result<reqwest::Response, reqwest::Error> {
+    async fn broadcast_tx(&mut self, tx: &str) -> Result<reqwest::Response, reqwest::Error> {
         println!("broadcast_tx");
         let network = self.get_network_str();
 
@@ -123,19 +88,17 @@ impl BlockchainInterface {
     }
 }
 
-// address for test mwxrVFsJps3sxz5A38Mbrze8kPKq7D5NxF
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    //use tokio_test;
 
-    fn get_blockchain_interface() -> BlockchainInterface {
-        BlockchainInterface {
+    fn get_blockchain_interface() -> BlockchainInterfaceWoc {
+        BlockchainInterfaceWoc {
             interface_type: "WoC".to_string(),
             network_type: Network::Testnet,
         }
     }
+    // address for test mwxrVFsJps3sxz5A38Mbrze8kPKq7D5NxF
 
     #[tokio::test]
     async fn test_get_balance() {

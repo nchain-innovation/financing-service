@@ -4,14 +4,14 @@ use std::net::Ipv4Addr;
 use sv::network::Network;
 
 /// Blockchain Interface Configuration
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Default, Deserialize, Clone)]
 pub struct BlockchainInterfaceConfig {
     pub interface_type: String,
     pub network_type: String,
 }
 
 /// Client Configuration
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Default, Deserialize, Clone)]
 pub struct ClientConfig {
     pub client_id: String,
     pub wif_key: String,
@@ -24,8 +24,17 @@ pub struct WebInterfaceConfig {
     pub port: u16,
 }
 
+impl Default for WebInterfaceConfig {
+    fn default() -> Self {
+        WebInterfaceConfig {
+            address: Ipv4Addr::new(0, 0, 0, 0),
+            port: 0,
+        }
+    }
+}
+
 /// Service Configuration
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Default, Deserialize, Clone)]
 pub struct Config {
     pub blockchain_interface: BlockchainInterfaceConfig,
     pub web_interface: WebInterfaceConfig,
