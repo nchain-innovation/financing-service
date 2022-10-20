@@ -4,17 +4,17 @@ use std::time::SystemTime;
 use chrono::prelude::DateTime;
 use chrono::Utc;
 
-use sv::messages::{OutPoint, Payload, Tx};
-use sv::util::Serializable;
+use sv::messages::{OutPoint, Tx};
 
-use crate::blockchain_interface::BlockchainInterface;
+use crate::blockchain_interface::{blockchain_factory, BlockchainInterface};
 use crate::client::Client;
 use crate::config::Config;
+use crate::util::tx_as_hexstr;
 
 /// Blockchain Connection Status
 #[derive(Debug, Serialize, Clone, Copy)]
 pub enum BlockchainConnectionStatus {
-    /// Unknown - This is the starting state of the service
+    /// Unknown - Starting state of the service
     Unknown,
     /// Failed - The service has failed to connect to the blockchain
     Failed,
@@ -23,28 +23,20 @@ pub enum BlockchainConnectionStatus {
 }
 
 /// Service data
-#[derive(Debug)]
+//#[derive(Debug)]
 pub struct Service {
     blockchain_status: BlockchainConnectionStatus,
     blockchain_update_time: Option<SystemTime>,
-    blockchain_interface: BlockchainInterface,
+    blockchain_interface: Box<dyn BlockchainInterface + Send + Sync>,
     clients: Vec<Client>,
-}
-
-/// Convert a transaction into a hexstring
-fn tx_as_hexstr(tx: &Tx) -> String {
-    let mut b = Vec::with_capacity(tx.size());
-    tx.write(&mut b).unwrap();
-    hex::encode(&b)
-    // format!("{}", hex::HexSlice::new(&b))
 }
 
 impl Service {
     /// Create a new Service from the provided config
-    pub async fn new(config: &Config) -> Self {
+    pub async fn new(config: &Config) -> Service {
         let mut clients: Vec<Client> = Vec::new();
 
-        let blockchain_interface = BlockchainInterface::new(config);
+        let blockchain_interface = blockchain_factory(config);
         for client_config in &config.client {
             let new_client = Client::new(client_config, blockchain_interface.get_network());
             clients.push(new_client);
@@ -56,9 +48,7 @@ impl Service {
             blockchain_interface,
             clients,
         };
-
         service.update_balances().await;
-
         service
     }
 
@@ -93,7 +83,8 @@ impl Service {
     /// Update client balances
     pub async fn update_balances(&mut self) {
         for client in &mut self.clients {
-            self.blockchain_status = match client.update_balance(&self.blockchain_interface).await {
+            self.blockchain_status = match client.update_balance(&*self.blockchain_interface).await
+            {
                 Ok(_) => BlockchainConnectionStatus::Connected,
                 Err(_) => BlockchainConnectionStatus::Failed,
             };
@@ -139,6 +130,7 @@ impl Service {
         retval
     }
 
+    /// Given outpoints return them as a string
     fn outpoints_to_string(&self, outpoints: &[OutPoint]) -> String {
         let mut retval: String = "[".to_string();
 
@@ -220,6 +212,7 @@ impl Service {
                     dbg!(&result);
                     println!("result.status = {}", result.status() );
                     let result_text = result.text().await.unwrap();
+
                     println!("result.text() = {}", result_text);
                     let outpoints = self.get_outpoints(&b_tx.hash().encode(), no_of_outpoints);
                     format!("{{\"status\": \"Success\", \"outpoints\": {outpoints}}}")

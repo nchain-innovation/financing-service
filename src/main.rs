@@ -1,13 +1,12 @@
 use actix_web::{web, App, HttpServer};
-// use std::sync::Mutex;
 use async_mutex::Mutex;
 
 mod blockchain_interface;
 mod client;
 mod config;
-mod service;
-
 mod rest_api;
+mod service;
+mod util;
 
 use crate::config::get_config;
 use crate::rest_api::{balance, get_funds, index, status, AppState};
@@ -32,7 +31,6 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(move || {
         App::new()
             .app_data(counter.clone())
-            //.route("/", web::get().to(index))
             .service(index)
             .service(status)
             .service(balance)
