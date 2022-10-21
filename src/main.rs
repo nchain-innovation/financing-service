@@ -1,3 +1,6 @@
+use std::time::Duration;
+use tokio::time;
+
 use actix_web::{web, App, HttpServer};
 use async_mutex::Mutex;
 
@@ -9,7 +12,7 @@ mod service;
 mod util;
 
 use crate::config::get_config;
-use crate::rest_api::{balance, get_funds, index, status, AppState};
+use crate::rest_api::{balance, get_funds, index, status, AppState, update_clients};
 use crate::service::Service;
 
 /// Main - Read config and setup Web server.
@@ -26,7 +29,21 @@ async fn main() -> std::io::Result<()> {
         service: Mutex::new(service.await),
     });
 
+    let counter2 = counter.clone();
+
     let addr = (config.web_interface.address, config.web_interface.port);
+
+    // Setup periodic task
+    tokio::spawn(async move {
+        // Every minute
+        let mut interval = time::interval(Duration::from_secs(60));
+        loop{
+            interval.tick().await;
+            // Refresh the utxo for clients
+            update_clients(counter2.clone()).await;
+        }
+    });
+
 
     HttpServer::new(move || {
         App::new()
