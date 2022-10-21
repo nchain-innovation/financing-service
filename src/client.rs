@@ -238,8 +238,8 @@ mod tests {
     use crate::config::{BlockchainInterfaceConfig, ClientConfig, Config};
     use crate::util::tx_as_hexstr;
 
-    fn setup_blockchain(config: &Config) -> Box<dyn BlockchainInterface + Send + Sync> {
-        let mut blockchain_interface = BlockchainInterfaceTest::new(&config);
+    async fn setup_blockchain(config: &Config) -> Box<dyn BlockchainInterface + Send + Sync> {
+        let blockchain_interface = BlockchainInterfaceTest::new(&config);
 
         let utxo = vec![
             WocUtxoEntry {
@@ -307,8 +307,10 @@ mod tests {
             },
         ];
 
-        blockchain_interface.set_utxo("mwxrVFsJps3sxz5A38Mbrze8kPKq7D5NxF", &utxo);
-        blockchain_interface.set_height(1517571);
+        blockchain_interface
+            .set_utxo("mwxrVFsJps3sxz5A38Mbrze8kPKq7D5NxF", &utxo)
+            .await;
+        blockchain_interface.set_height(1517571).await;
         Box::new(blockchain_interface)
     }
 
@@ -330,7 +332,7 @@ mod tests {
 
         // Set up test blockchain
 
-        let blockchain_interface = setup_blockchain(&config);
+        let blockchain_interface = setup_blockchain(&config).await;
 
         let mut client = Client::new(&config.client[0], blockchain_interface.get_network());
 
