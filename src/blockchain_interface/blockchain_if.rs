@@ -44,7 +44,7 @@ pub fn as_bitcoin_network(network: &Network) -> bitcoin::Network {
 
 /// BlockchainInterface trait
 #[async_trait]
-pub trait BlockchainInterface {
+pub trait BlockchainInterface: Send + Sync {
     /// Return the network associated with this interface
     fn get_network(&self) -> Network;
 
@@ -57,3 +57,4 @@ pub trait BlockchainInterface {
     /// Broadcast Tx
     async fn broadcast_tx(&self, tx: &str) -> Result<reqwest::Response, reqwest::Error>;
 }
+
