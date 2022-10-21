@@ -27,6 +27,17 @@ pub async fn status(data: web::Data<AppState>) -> impl Responder {
         .body(status)
 }
 
+/// Endpoint to update all the clients, aim is to call this periodically
+// #[get("/update_clients")]
+pub async fn update_clients(data: web::Data<AppState>) -> impl Responder {
+    let mut service = data.service.lock().await;
+    println!("update_clients");
+    service.update_balances().await;
+
+    HttpResponse::Ok()
+}
+
+
 /// Get Balance for a particular client_id endpoint
 #[get("/balance/{client_id}")]
 pub async fn balance(data: web::Data<AppState>, info: web::Path<String>) -> impl Responder {
