@@ -207,8 +207,7 @@ impl Service {
             let tx_as_str = tx_as_hexstr(&b_tx);
             dbg!(&tx_as_str);
             match self.blockchain_interface.broadcast_tx(&tx_as_str).await {
-                Ok(result)//if result.status() == 200u16 => {
-                    => {
+                Ok(result) if result.status() == 200u16 => {
                     dbg!(&result);
                     println!("result.status = {}", result.status() );
                     let result_text = result.text().await.unwrap();
