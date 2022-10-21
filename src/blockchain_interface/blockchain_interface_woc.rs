@@ -72,7 +72,7 @@ impl BlockchainInterface for BlockchainInterfaceWoc {
     }
 
     /// Broadcast Tx
-    async fn broadcast_tx(&mut self, tx: &str) -> Result<reqwest::Response, reqwest::Error> {
+    async fn broadcast_tx(&self, tx: &str) -> Result<reqwest::Response, reqwest::Error> {
         println!("broadcast_tx");
         let network = self.get_network_str();
 
