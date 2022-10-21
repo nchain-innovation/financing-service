@@ -55,6 +55,5 @@ pub trait BlockchainInterface {
     async fn get_utxo(&self, address: &str) -> Result<WocUtxo, Box<dyn std::error::Error>>;
 
     /// Broadcast Tx
-    async fn broadcast_tx(&mut self, tx: &str) -> Result<reqwest::Response, reqwest::Error>;
-    //Result<http::Response<String>, reqwest::Error>;
+    async fn broadcast_tx(&self, tx: &str) -> Result<reqwest::Response, reqwest::Error>;
 }
