@@ -1,5 +1,7 @@
-use sv::messages::{Payload, Tx};
-use sv::util::Serializable;
+use chain_gang::{
+    messages::{Payload, Tx},
+    util::Serializable,
+};
 
 /// Convert a transaction into a hexstring
 pub fn tx_as_hexstr(tx: &Tx) -> String {

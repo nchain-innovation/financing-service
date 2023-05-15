@@ -37,7 +37,6 @@ pub async fn update_clients(data: web::Data<AppState>) -> impl Responder {
     HttpResponse::Ok()
 }
 
-
 /// Get Balance for a particular client_id endpoint
 #[get("/balance/{client_id}")]
 pub async fn balance(data: web::Data<AppState>, info: web::Path<String>) -> impl Responder {
