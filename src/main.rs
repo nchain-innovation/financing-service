@@ -12,7 +12,7 @@ mod service;
 mod util;
 
 use crate::config::get_config;
-use crate::rest_api::{balance, get_funds, index, status, AppState, update_clients};
+use crate::rest_api::{balance, get_funds, index, status, update_clients, AppState};
 use crate::service::Service;
 
 /// Main - Read config and setup Web server.
@@ -37,13 +37,12 @@ async fn main() -> std::io::Result<()> {
     tokio::spawn(async move {
         // Every minute
         let mut interval = time::interval(Duration::from_secs(60));
-        loop{
+        loop {
             interval.tick().await;
             // Refresh the utxo for clients
             update_clients(counter2.clone()).await;
         }
     });
-
 
     HttpServer::new(move || {
         App::new()

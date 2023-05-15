@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 
 use crate::config::Config;
+use chain_gang::network::Network;
 use serde::Serialize;
-use sv::network::Network;
 
 use super::blockchain_if::{BlockchainInterface, WocBalance, WocUtxo};
 
@@ -32,9 +32,10 @@ impl BlockchainInterfaceWoc {
     /// Return the current network as a string
     fn get_network_str(&self) -> &'static str {
         match self.network_type {
-            Network::Mainnet => "main",
-            Network::Testnet => "test",
-            Network::STN => "stn",
+            Network::BSV_Mainnet => "main",
+            Network::BSV_Testnet => "test",
+            Network::BSV_STN => "stn",
+            _ => "unknown",
         }
     }
 }

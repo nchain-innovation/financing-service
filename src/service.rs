@@ -4,7 +4,7 @@ use std::time::SystemTime;
 use chrono::prelude::DateTime;
 use chrono::Utc;
 
-use sv::messages::{OutPoint, Tx};
+use chain_gang::messages::{OutPoint, Tx};
 
 use crate::blockchain_interface::{blockchain_factory, BlockchainInterface};
 use crate::client::Client;

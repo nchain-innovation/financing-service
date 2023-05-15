@@ -3,8 +3,8 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 
 use crate::config::Config;
+use chain_gang::network::Network;
 use serde::Serialize;
-use sv::network::Network;
 
 use crate::blockchain_interface::{BlockchainInterface, WocBalance, WocUtxo};
 

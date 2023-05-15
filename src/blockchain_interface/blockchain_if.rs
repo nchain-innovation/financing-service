@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 
+use chain_gang::network::Network;
 use serde::Deserialize;
-use sv::network::Network;
 
 #[allow(unused_must_use)]
 
@@ -36,9 +36,10 @@ pub type WocUtxo = Vec<WocUtxoEntry>;
 /// Convert network to bitcoin network type
 pub fn as_bitcoin_network(network: &Network) -> bitcoin::Network {
     match network {
-        Network::Mainnet => bitcoin::Network::Bitcoin,
-        Network::Testnet => bitcoin::Network::Testnet,
-        Network::STN => bitcoin::Network::Signet,
+        Network::BSV_Mainnet => bitcoin::Network::Bitcoin,
+        Network::BSV_Testnet => bitcoin::Network::Testnet,
+        Network::BSV_STN => bitcoin::Network::Signet,
+        _ => panic!("unknown network {}", &network),
     }
 }
 
@@ -57,4 +58,3 @@ pub trait BlockchainInterface: Send + Sync {
     /// Broadcast Tx
     async fn broadcast_tx(&self, tx: &str) -> Result<reqwest::Response, reqwest::Error>;
 }
-
