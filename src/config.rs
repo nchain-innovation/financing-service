@@ -1,7 +1,7 @@
+use chain_gang::network::Network;
 use serde::Deserialize;
 use std::env;
 use std::net::Ipv4Addr;
-use sv::network::Network;
 
 /// Blockchain Interface Configuration
 #[derive(Debug, Default, Deserialize, Clone)]
@@ -45,9 +45,9 @@ impl Config {
     /// Return the configured network as Network type
     pub fn get_network(&self) -> Result<Network, &str> {
         match self.blockchain_interface.network_type.as_str() {
-            "mainnet" => Ok(Network::Mainnet),
-            "testnet" => Ok(Network::Testnet),
-            "stn" => Ok(Network::STN),
+            "mainnet" => Ok(Network::BSV_Mainnet),
+            "testnet" => Ok(Network::BSV_Testnet),
+            "stn" => Ok(Network::BSV_STN),
             _ => Err("unable to decode network"),
         }
     }

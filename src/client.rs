@@ -1,14 +1,18 @@
 use bitcoin::secp256k1::Secp256k1;
 use bitcoin::util::key::PrivateKey;
 use bitcoin::{Address, PublicKey};
-use sv::address::addr_decode;
-use sv::messages::{OutPoint, Tx, TxIn, TxOut};
-use sv::network::Network as SvNetwork;
-use sv::script::Script;
-use sv::transaction::generate_signature;
-use sv::transaction::p2pkh::{create_lock_script, create_unlock_script};
-use sv::transaction::sighash::{sighash, SigHashCache, SIGHASH_ALL, SIGHASH_FORKID};
-use sv::util::{Hash160, Hash256};
+use chain_gang::{
+    address::addr_decode,
+    messages::{OutPoint, Tx, TxIn, TxOut},
+    network::Network as SvNetwork,
+    script::Script,
+    transaction::{
+        generate_signature,
+        p2pkh::{create_lock_script, create_unlock_script},
+        sighash::{sighash, SigHashCache, SIGHASH_ALL, SIGHASH_FORKID},
+    },
+    util::{Hash160, Hash256},
+};
 
 use crate::blockchain_interface::blockchain_if::{
     as_bitcoin_network, BlockchainInterface, WocBalance, WocUtxo, WocUtxoEntry,
@@ -37,11 +41,11 @@ pub struct Client {
 impl Client {
     /// Create a new
     pub fn new(config: &ClientConfig, network: SvNetwork) -> Self {
-        let private_key = PrivateKey::from_wif(&config.wif_key).unwrap();
+        let private_key: PrivateKey = PrivateKey::from_wif(&config.wif_key).unwrap();
         let secp = Secp256k1::new();
-        let public_key = private_key.public_key(&secp);
+        let public_key: PublicKey = private_key.public_key(&secp);
 
-        let address = Address::p2pkh(&public_key, as_bitcoin_network(&network));
+        let address: Address = Address::p2pkh(&public_key, as_bitcoin_network(&network));
         let (funding_address, _addr_type) = addr_decode(&address.to_string(), network).unwrap();
 
         Client {
@@ -105,8 +109,7 @@ impl Client {
             (satoshi * no_of_outpoints as u64) + (fee_estimate * no_of_outpoints as u64)
         } else {
             // One tx
-            let fee_estimate =
-                (((locking_script_len as u64 * no_of_outpoints as u64) / 1000) * 500) + 750;
+            let fee_estimate = (((locking_script_len * no_of_outpoints as u64) / 1000) * 500) + 750;
             (satoshi * no_of_outpoints as u64) + fee_estimate
         };
 
@@ -123,7 +126,7 @@ impl Client {
         // Calculate fee...
         let locking_script_len: u64 = locking_script.len() as u64;
         let fee_estimate: u64 =
-            (((locking_script_len as u64 * no_of_outpoints as u64) / 1000) * 500) + 750;
+            (((locking_script_len * no_of_outpoints as u64) / 1000) * 500) + 750;
         let total_cost: u64 = (satoshi * no_of_outpoints as u64) + fee_estimate;
         // Chreat a locking script for change
         let change_script = create_lock_script(&self.funding_address);
