@@ -9,7 +9,7 @@ use chain_gang::{
     messages::{OutPoint, Tx},
 };
 
-//use crate::blockchain_interface::{blockchain_factory, BlockchainInterface};
+use log::{warn, debug};
 
 use crate::{
     blockchain_factory::blockchain_factory, client::Client, config::Config, util::tx_as_hexstr,
@@ -91,7 +91,7 @@ impl Service {
             {
                 Ok(_) => BlockchainConnectionStatus::Connected,
                 Err(_) => {
-                    println!("update_balance - failed");
+                    warn!("update_balance - failed");
                     BlockchainConnectionStatus::Failed
                 },
             };
@@ -214,7 +214,7 @@ impl Service {
                 .unwrap();
             // broadcast tx
             let tx_as_str = tx_as_hexstr(&b_tx);
-            dbg!(&tx_as_str);
+            debug!("tx_as_str = {}", &tx_as_str);
             match self.blockchain_interface.broadcast_tx(&tx_as_str).await {
                 Ok(_) => {
                     let outpoints = self.get_outpoints(&b_tx.hash().encode(), no_of_outpoints);
