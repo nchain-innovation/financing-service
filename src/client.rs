@@ -91,14 +91,14 @@ impl Client {
     }
 
     /// Return the value of the largest unspent UTXO
-    fn get_largest_unspent(&self) -> Option<u64> {
+    fn get_largest_unspent(&self) -> Option<i64> {
         self.unspent.iter().max_by_key(|x| x.value).map(|x| x.value)
     }
 
     /// Return the smallest unspent that is greater than given satoshi
     fn get_smallest_unspent(&self, satoshi: u64) -> Option<&UtxoEntry> {
         // Note unspent is already sorted by value
-        self.unspent.iter().find(|x| x.value > satoshi)
+        self.unspent.iter().find(|x| x.value > satoshi.try_into().unwrap())
     }
 
     /// Given the tx inputs, determine if there is a suitable Utxo for a funding tx
@@ -120,7 +120,7 @@ impl Client {
             (satoshi * no_of_outpoints as u64) + fee_estimate
         };
 
-        Some(total_cost < largest_unspent)
+        Some(total_cost < largest_unspent.try_into().unwrap())
     }
 
     /// Create one funding transaction
@@ -150,7 +150,7 @@ impl Client {
         }];
         // Create the vout
         // create vout for change
-        let change = unspent.value - total_cost;
+        let change = unspent.value - total_cost as i64;
         assert!(change > 0);
         let mut vouts: Vec<TxOut> = vec![TxOut {
             satoshis: change as i64,
