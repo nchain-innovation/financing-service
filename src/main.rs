@@ -4,16 +4,19 @@ use tokio::time;
 use actix_web::{web, App, HttpServer};
 use async_mutex::Mutex;
 
-mod blockchain_interface;
+// mod blockchain_interface;
+mod blockchain_factory;
 mod client;
 mod config;
 mod rest_api;
 mod service;
 mod util;
 
-use crate::config::get_config;
-use crate::rest_api::{balance, get_funds, index, status, update_clients, AppState};
-use crate::service::Service;
+use crate::{
+    config::get_config,
+    rest_api::{balance, get_funds, index, status, update_clients, AppState},
+    service::Service,
+};
 
 /// Main - Read config and setup Web server.
 #[actix_web::main]
@@ -23,10 +26,10 @@ async fn main() -> std::io::Result<()> {
         None => panic!("Unable to read config"),
     };
 
-    let service = Service::new(&config);
+    let service = Service::new(&config).await;
 
     let counter = web::Data::new(AppState {
-        service: Mutex::new(service.await),
+        service: Mutex::new(service),
     });
 
     let counter2 = counter.clone();

@@ -18,4 +18,4 @@ hex = "0.4.3"
 async-mutex = "1.4.0"
 async-trait = "0.1.58"
 http = "0.1.21"
-chain-gang = { path = "../chain-gang" }
+chain-gang = { path = "../chain-gang", features = ["interface"] }
