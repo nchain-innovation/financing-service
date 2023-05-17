@@ -1,8 +1,8 @@
-use bitcoin::secp256k1::Secp256k1;
-use bitcoin::util::key::PrivateKey;
-use bitcoin::{Address, PublicKey};
+use bitcoin::{secp256k1::Secp256k1, util::key::PrivateKey, Address, PublicKey};
+
 use chain_gang::{
     address::addr_decode,
+    interface::{Balance, BlockchainInterface, Utxo, UtxoEntry},
     messages::{OutPoint, Tx, TxIn, TxOut},
     network::Network as SvNetwork,
     script::Script,
@@ -14,10 +14,17 @@ use chain_gang::{
     util::{Hash160, Hash256},
 };
 
-use crate::blockchain_interface::blockchain_if::{
-    as_bitcoin_network, BlockchainInterface, WocBalance, WocUtxo, WocUtxoEntry,
-};
 use crate::config::ClientConfig;
+
+/// Convert network to bitcoin network type
+pub fn as_bitcoin_network(network: &SvNetwork) -> bitcoin::Network {
+    match network {
+        SvNetwork::BSV_Mainnet => bitcoin::Network::Bitcoin,
+        SvNetwork::BSV_Testnet => bitcoin::Network::Testnet,
+        SvNetwork::BSV_STN => bitcoin::Network::Signet,
+        _ => panic!("unknown network {}", &network),
+    }
+}
 
 /// Represents a Client of the service
 #[derive(Debug, Clone)]
@@ -33,9 +40,9 @@ pub struct Client {
     // Funding Address as Hash
     funding_address: Hash160,
     /// Current funding balance
-    balance: WocBalance,
+    balance: Balance,
     /// Current funding UTXO
-    unspent: WocUtxo,
+    unspent: Utxo,
 }
 
 impl Client {
@@ -54,7 +61,7 @@ impl Client {
             public_key,
             address,
             funding_address,
-            balance: WocBalance::new(),
+            balance: Balance::default(),
             unspent: Vec::new(),
         }
     }
@@ -89,7 +96,7 @@ impl Client {
     }
 
     /// Return the smallest unspent that is greater than given satoshi
-    fn get_smallest_unspent(&self, satoshi: u64) -> Option<&WocUtxoEntry> {
+    fn get_smallest_unspent(&self, satoshi: u64) -> Option<&UtxoEntry> {
         // Note unspent is already sorted by value
         self.unspent.iter().find(|x| x.value > satoshi)
     }
@@ -198,7 +205,7 @@ impl Client {
         // Remove input from unspent
         self.unspent.remove(index);
         // Add output to unspent
-        let entry: WocUtxoEntry = WocUtxoEntry {
+        let entry = UtxoEntry {
             height: 0,
             tx_pos: 0,
             tx_hash: tx.hash().encode(),
@@ -237,71 +244,75 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blockchain_interface::BlockchainInterfaceTest;
-    use crate::config::{BlockchainInterfaceConfig, ClientConfig, Config};
-    use crate::util::tx_as_hexstr;
+    use crate::{
+        //blockchain_interface::BlockchainInterfaceTest,
+        config::{BlockchainInterfaceConfig, ClientConfig, Config},
+        util::tx_as_hexstr,
+    };
+    use chain_gang::interface::{BlockchainInterface, TestInterface, UtxoEntry};
 
     async fn setup_blockchain(config: &Config) -> Box<dyn BlockchainInterface + Send + Sync> {
-        let blockchain_interface = BlockchainInterfaceTest::new(&config);
+        let mut blockchain_interface = TestInterface::new();
+        blockchain_interface.set_network(&config.get_network().unwrap());
 
         let utxo = vec![
-            WocUtxoEntry {
+            UtxoEntry {
                 height: 1514933,
                 tx_pos: 0,
                 tx_hash: "f67272e5c1408ecbeb8da543437c125ee1a17110317d44d13eafe31b771b795e"
                     .to_string(),
                 value: 240,
             },
-            WocUtxoEntry {
+            UtxoEntry {
                 height: 1514939,
                 tx_pos: 1,
                 tx_hash: "b3ec9a52a1fe1689a998c869c2ae38d64d08ece8aaf218286461f330f6fd2ca8"
                     .to_string(),
                 value: 100,
             },
-            WocUtxoEntry {
+            UtxoEntry {
                 height: 1514939,
                 tx_pos: 1,
                 tx_hash: "76f9302ab84fc5da40de02617c10f1a26dff7007c2bfffa9d0845e57d47fa82f"
                     .to_string(),
                 value: 100,
             },
-            WocUtxoEntry {
+            UtxoEntry {
                 height: 1514939,
                 tx_pos: 1,
                 tx_hash: "447ee285748e88d8b875ce09026815578f0474ec3f1babcd5ba917ecb9f1dd7a"
                     .to_string(),
                 value: 100,
             },
-            WocUtxoEntry {
+            UtxoEntry {
                 height: 1514939,
                 tx_pos: 2,
                 tx_hash: "447ee285748e88d8b875ce09026815578f0474ec3f1babcd5ba917ecb9f1dd7a"
                     .to_string(),
                 value: 100,
             },
-            WocUtxoEntry {
+            UtxoEntry {
                 height: 1516841,
                 tx_pos: 0,
                 tx_hash: "70d0365df8062e5af41f8e8f2e42bafde3cabbaebd1fc94e94fa5559e87777b2"
                     .to_string(),
                 value: 39080962,
             },
-            WocUtxoEntry {
+            UtxoEntry {
                 height: 1517272,
                 tx_pos: 0,
                 tx_hash: "51b349bda57674a02ea5b90b43f2204dd6df330d751d646d74d76b19348bf5be"
                     .to_string(),
                 value: 39327675,
             },
-            WocUtxoEntry {
+            UtxoEntry {
                 height: 1517429,
                 tx_pos: 0,
                 tx_hash: "e533109de9df0184299e2199fa8f74baae7d99e4b39d3dea1e957e2f26636578"
                     .to_string(),
                 value: 9564208,
             },
-            WocUtxoEntry {
+            UtxoEntry {
                 height: 1517429,
                 tx_pos: 1,
                 tx_hash: "e533109de9df0184299e2199fa8f74baae7d99e4b39d3dea1e957e2f26636578"
@@ -313,6 +324,7 @@ mod tests {
         blockchain_interface
             .set_utxo("mwxrVFsJps3sxz5A38Mbrze8kPKq7D5NxF", &utxo)
             .await;
+
         blockchain_interface.set_height(1517571).await;
         Box::new(blockchain_interface)
     }
@@ -322,7 +334,7 @@ mod tests {
         // Create a test config
         let config = Config {
             blockchain_interface: BlockchainInterfaceConfig {
-                interface_type: "Test".to_string(),
+                interface_type: "test".to_string(),
                 network_type: "testnet".to_string(),
             },
 
@@ -337,7 +349,7 @@ mod tests {
 
         let blockchain_interface = setup_blockchain(&config).await;
 
-        let mut client = Client::new(&config.client[0], blockchain_interface.get_network());
+        let mut client = Client::new(&config.client[0], config.get_network().unwrap());
 
         let result = client.update_balance(&*blockchain_interface).await;
         assert!(&result.is_ok());

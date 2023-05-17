@@ -4,12 +4,16 @@ use std::time::SystemTime;
 use chrono::prelude::DateTime;
 use chrono::Utc;
 
-use chain_gang::messages::{OutPoint, Tx};
+use chain_gang::{
+    interface::BlockchainInterface,
+    messages::{OutPoint, Tx},
+};
 
-use crate::blockchain_interface::{blockchain_factory, BlockchainInterface};
-use crate::client::Client;
-use crate::config::Config;
-use crate::util::tx_as_hexstr;
+//use crate::blockchain_interface::{blockchain_factory, BlockchainInterface};
+
+use crate::{
+    blockchain_factory::blockchain_factory, client::Client, config::Config, util::tx_as_hexstr,
+};
 
 /// Blockchain Connection Status
 #[derive(Debug, Serialize, Clone, Copy)]
@@ -27,7 +31,7 @@ pub enum BlockchainConnectionStatus {
 pub struct Service {
     blockchain_status: BlockchainConnectionStatus,
     blockchain_update_time: Option<SystemTime>,
-    blockchain_interface: Box<dyn BlockchainInterface + Send + Sync>,
+    blockchain_interface: Box<dyn BlockchainInterface>,
     clients: Vec<Client>,
 }
 
@@ -35,10 +39,10 @@ impl Service {
     /// Create a new Service from the provided config
     pub async fn new(config: &Config) -> Service {
         let mut clients: Vec<Client> = Vec::new();
-
+        let network = config.get_network().unwrap();
         let blockchain_interface = blockchain_factory(config);
         for client_config in &config.client {
-            let new_client = Client::new(client_config, blockchain_interface.get_network());
+            let new_client = Client::new(client_config, network);
             clients.push(new_client);
         }
 
@@ -86,7 +90,10 @@ impl Service {
             self.blockchain_status = match client.update_balance(&*self.blockchain_interface).await
             {
                 Ok(_) => BlockchainConnectionStatus::Connected,
-                Err(_) => BlockchainConnectionStatus::Failed,
+                Err(_) => {
+                    println!("update_balance - failed");
+                    BlockchainConnectionStatus::Failed
+                },
             };
             self.blockchain_update_time = Some(SystemTime::now());
         }
@@ -176,7 +183,9 @@ impl Service {
                 let tx_as_str = tx_as_hexstr(&a_tx);
 
                 match self.blockchain_interface.broadcast_tx(&tx_as_str).await {
-                    Ok(result) if result.status() == 200u16 => {
+                    Ok(_result)
+                    //if result.status() == 200u16 
+                        => {
                         // append to the list
                         outpoints.push(OutPoint {
                             hash: a_tx.hash(),
@@ -207,18 +216,13 @@ impl Service {
             let tx_as_str = tx_as_hexstr(&b_tx);
             dbg!(&tx_as_str);
             match self.blockchain_interface.broadcast_tx(&tx_as_str).await {
-                Ok(result) if result.status() == 200u16 => {
-                    dbg!(&result);
-                    println!("result.status = {}", result.status() );
-                    let result_text = result.text().await.unwrap();
-
-                    println!("result.text() = {}", result_text);
+                Ok(_) => {
                     let outpoints = self.get_outpoints(&b_tx.hash().encode(), no_of_outpoints);
                     format!("{{\"status\": \"Success\", \"outpoints\": {outpoints}}}")
-                }
+                },
                 _ => {
                     "{{\"status\": \"Failure\", \"description\": \"Failed to broadcast funding transaction.\"}}".to_string()
-                }
+                },
             }
         }
     }
