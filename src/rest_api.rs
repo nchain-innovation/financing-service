@@ -1,8 +1,9 @@
 use crate::service::Service;
 use actix_web::{get, http::header::ContentType, post, web, HttpResponse, Responder};
 use serde::Deserialize;
-//use std::sync::Mutex;
 use async_mutex::Mutex;
+use log::{info, debug};
+
 /// Application State Data
 pub struct AppState {
     pub service: Mutex<Service>,
@@ -31,7 +32,7 @@ pub async fn status(data: web::Data<AppState>) -> impl Responder {
 // #[get("/update_clients")]
 pub async fn update_clients(data: web::Data<AppState>) -> impl Responder {
     let mut service = data.service.lock().await;
-    println!("update_clients");
+    info!("update_clients");
     service.update_balances().await;
 
     HttpResponse::Ok()
@@ -113,7 +114,7 @@ pub async fn get_funds(data: web::Data<AppState>, info: web::Path<FundingInfo>) 
     }
 
     let locking_script_as_bytes = decode_locking_script.unwrap();
-    dbg!(&locking_script_as_bytes);
+    debug!("locking_script_as_bytes = {:?}", &locking_script_as_bytes);
 
     let has_sufficent = service.has_sufficent_balance(
         client_id,
@@ -138,7 +139,7 @@ pub async fn get_funds(data: web::Data<AppState>, info: web::Path<FundingInfo>) 
                 &locking_script_as_bytes,
             )
             .await;
-        dbg!(&outpoints);
+        debug!("outpoints = {:?}", &outpoints);
         HttpResponse::Ok().body(outpoints)
     }
 }

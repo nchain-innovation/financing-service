@@ -245,11 +245,12 @@ impl Client {
 mod tests {
     use super::*;
     use crate::{
-        //blockchain_interface::BlockchainInterfaceTest,
         config::{BlockchainInterfaceConfig, ClientConfig, Config},
         util::tx_as_hexstr,
     };
     use chain_gang::interface::{BlockchainInterface, TestInterface, UtxoEntry};
+    use log::debug;
+
 
     async fn setup_blockchain(config: &Config) -> Box<dyn BlockchainInterface + Send + Sync> {
         let mut blockchain_interface = TestInterface::new();
@@ -358,7 +359,7 @@ mod tests {
             hex::decode("76a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac").unwrap();
         let tx = client.create_funding_tx(123, 1, &locking_script).unwrap();
 
-        dbg!(&tx);
+        debug!("tx = {}", &tx);
         assert_eq!(tx_as_hexstr(&tx), "0100000001786563262f7e951eea3d9db3e4997daeba748ffa99219e298401dfe99d1033e5000000006b483045022100c7a22fbf24470b2c96b82ce1bfd5896f515e3f0f509f307e94f699baefe0f8c3022044ddbb29952769c67ba117762ee628d299846039a6d90bc59618c770b226bfc2412103a8ae071ddd8690b94755c7112ca304bcac45c15904cc013f0ad6c2ea0b1019b2ffffffff02c7ec9100000000001976a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac7b000000000000001976a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac00000000");
     }
 }

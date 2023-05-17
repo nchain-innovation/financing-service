@@ -26,6 +26,8 @@ async fn main() -> std::io::Result<()> {
         None => panic!("Unable to read config"),
     };
 
+    simple_logger::init_with_level(config.get_log_level()).unwrap();
+
     let service = Service::new(&config).await;
 
     let counter = web::Data::new(AppState {

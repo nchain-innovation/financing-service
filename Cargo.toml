@@ -19,3 +19,5 @@ async-mutex = "1.4.0"
 async-trait = "0.1.58"
 http = "0.1.21"
 chain-gang = { path = "../chain-gang", features = ["interface"] }
+log = { version = "0.4", features = ["max_level_trace", "release_max_level_warn"] }
+simple_logger = "4.0.0"

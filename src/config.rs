@@ -1,7 +1,12 @@
+
+use std::{
+    env,
+    net::Ipv4Addr,
+};
+
 use chain_gang::network::Network;
 use serde::Deserialize;
-use std::env;
-use std::net::Ipv4Addr;
+use log::debug;
 
 /// Blockchain Interface Configuration
 #[derive(Debug, Default, Deserialize, Clone)]
@@ -15,6 +20,11 @@ pub struct BlockchainInterfaceConfig {
 pub struct ClientConfig {
     pub client_id: String,
     pub wif_key: String,
+}
+
+#[derive(Debug, Default, Deserialize, Clone)]
+pub struct LoggingConfig {
+    pub level: String,
 }
 
 /// Web Interface Configuration
@@ -33,11 +43,14 @@ impl Default for WebInterfaceConfig {
     }
 }
 
+
+
 /// Service Configuration
 #[derive(Debug, Default, Deserialize, Clone)]
 pub struct Config {
     pub blockchain_interface: BlockchainInterfaceConfig,
     pub web_interface: WebInterfaceConfig,
+    pub logging: LoggingConfig,
     pub client: Vec<ClientConfig>,
 }
 
@@ -51,11 +64,24 @@ impl Config {
             _ => Err("unable to decode network"),
         }
     }
+
+    // Return the log level 
+    // Return the log level (as a log::Level type) from the config
+    pub fn get_log_level(&self) -> log::Level {
+        match self.logging.level.as_str() {
+            "error" => log::Level::Error,
+            "warn" | "warning" => log::Level::Warn,
+            "info" | "information" => log::Level::Info,
+            "debug" => log::Level::Debug,
+            "trace" => log::Level::Trace,
+            _ => panic!("Unknown log level {}", self.logging.level),
+        }
+    }
 }
 
 /// Read the config from the provided file
 fn read_config(filename: &str) -> std::io::Result<Config> {
-    dbg!(filename);
+    debug!("read_config = {}", &filename);
     // Given filename read the config
     let content = std::fs::read_to_string(filename)?;
     Ok(toml::from_str(&content)?)
