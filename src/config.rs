@@ -1,12 +1,8 @@
-
-use std::{
-    env,
-    net::Ipv4Addr,
-};
+use std::{env, net::Ipv4Addr};
 
 use chain_gang::network::Network;
-use serde::Deserialize;
 use log::debug;
+use serde::Deserialize;
 
 /// Blockchain Interface Configuration
 #[derive(Debug, Default, Deserialize, Clone)]
@@ -43,8 +39,6 @@ impl Default for WebInterfaceConfig {
     }
 }
 
-
-
 /// Service Configuration
 #[derive(Debug, Default, Deserialize, Clone)]
 pub struct Config {
@@ -65,7 +59,7 @@ impl Config {
         }
     }
 
-    // Return the log level 
+    // Return the log level
     // Return the log level (as a log::Level type) from the config
     pub fn get_log_level(&self) -> log::Level {
         match self.logging.level.as_str() {

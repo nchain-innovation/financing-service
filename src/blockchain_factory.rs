@@ -10,12 +10,12 @@ pub fn blockchain_factory(config: &Config) -> Box<dyn BlockchainInterface + Send
             let mut interface = WocInterface::new();
             interface.set_network(&config.get_network().unwrap());
             Box::new(interface) as Box<dyn BlockchainInterface + Send + Sync>
-        },
+        }
         "test" => {
             let mut interface = TestInterface::new();
             interface.set_network(&config.get_network().unwrap());
             Box::new(interface) as Box<dyn BlockchainInterface + Send + Sync>
-        },
+        }
         _ => {
             panic!(
                 "Unknown interface type '{}'",
