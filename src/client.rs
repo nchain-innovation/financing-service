@@ -98,7 +98,9 @@ impl Client {
     /// Return the smallest unspent that is greater than given satoshi
     fn get_smallest_unspent(&self, satoshi: u64) -> Option<&UtxoEntry> {
         // Note unspent is already sorted by value
-        self.unspent.iter().find(|x| x.value > satoshi.try_into().unwrap())
+        self.unspent
+            .iter()
+            .find(|x| x.value > satoshi.try_into().unwrap())
     }
 
     /// Given the tx inputs, determine if there is a suitable Utxo for a funding tx
@@ -135,7 +137,7 @@ impl Client {
         let fee_estimate: u64 =
             (((locking_script_len * no_of_outpoints as u64) / 1000) * 500) + 750;
         let total_cost: u64 = (satoshi * no_of_outpoints as u64) + fee_estimate;
-        // Chreat a locking script for change
+        // Create a locking script for change
         let change_script = create_lock_script(&self.funding_address);
         // Find smallest funding unspent that is big enough for tx
         let unspent = self.get_smallest_unspent(total_cost)?;
@@ -153,7 +155,7 @@ impl Client {
         let change = unspent.value - total_cost as i64;
         assert!(change > 0);
         let mut vouts: Vec<TxOut> = vec![TxOut {
-            satoshis: change as i64,
+            satoshis: change,
             lock_script: change_script.clone(),
         }];
 
@@ -183,7 +185,7 @@ impl Client {
             &tx,
             0,
             &change_script.0,
-            unspent.value.try_into().unwrap(),
+            unspent.value,
             sighash_type,
             &mut cache,
         )
@@ -250,7 +252,6 @@ mod tests {
     };
     use chain_gang::interface::{BlockchainInterface, TestInterface, UtxoEntry};
     use log::debug;
-
 
     async fn setup_blockchain(config: &Config) -> Box<dyn BlockchainInterface + Send + Sync> {
         let mut blockchain_interface = TestInterface::new();
