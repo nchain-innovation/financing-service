@@ -1,8 +1,8 @@
 use crate::service::Service;
 use actix_web::{get, http::header::ContentType, post, web, HttpResponse, Responder};
-use serde::Deserialize;
 use async_mutex::Mutex;
-use log::{info, debug};
+use log::{debug, info};
+use serde::Deserialize;
 
 /// Application State Data
 pub struct AppState {
@@ -79,6 +79,7 @@ pub async fn get_funds(data: web::Data<AppState>, info: web::Path<FundingInfo>) 
     let mutliple_tx = info.mutliple_tx;
     let locking_script = &info.locking_script;
 
+    info!("get_funds!");
     // Request funding outpoints
     // Do all input checks here
     if !service.is_client_id_valid(client_id) {

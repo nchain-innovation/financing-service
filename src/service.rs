@@ -9,7 +9,7 @@ use chain_gang::{
     messages::{OutPoint, Tx},
 };
 
-use log::{warn, debug};
+
 
 use crate::{
     blockchain_factory::blockchain_factory, client::Client, config::Config, util::tx_as_hexstr,
@@ -91,9 +91,9 @@ impl Service {
             {
                 Ok(_) => BlockchainConnectionStatus::Connected,
                 Err(_) => {
-                    warn!("update_balance - failed");
+                    log::warn!("update_balance - failed");
                     BlockchainConnectionStatus::Failed
-                },
+                }
             };
             self.blockchain_update_time = Some(SystemTime::now());
         }
@@ -181,11 +181,10 @@ impl Service {
             for a_tx in txs {
                 // broadcast tx
                 let tx_as_str = tx_as_hexstr(&a_tx);
+                log::info!("tx_as_str = {}", &tx_as_str);
 
-                match self.blockchain_interface.broadcast_tx(&tx_as_str).await {
-                    Ok(_result)
-                    //if result.status() == 200u16 
-                        => {
+                match self.blockchain_interface.broadcast_tx(&a_tx).await {
+                    Ok(_hash) => {
                         // append to the list
                         outpoints.push(OutPoint {
                             hash: a_tx.hash(),
@@ -197,14 +196,13 @@ impl Service {
                             return "{{\"status\": \"Failure\", \"description\": \"Failed to broadcast funding transaction.\"}}".to_string();
                         } else {
                             let outpoints_as_str = self.outpoints_to_string(&outpoints);
-                            // provide the outpoints so far
-
+                            // Provide the outpoints so far
                             return format!("{{\"status\": \"Failure\", \"description\": \"Failed to broadcast funding transaction.\",\"outpoints\": {outpoints_as_str}}}");
                         }
                     }
                 }
             }
-            //provide all the outpoints
+            // Provide all the outpoints
             let outpoints_as_str = self.outpoints_to_string(&outpoints);
             format!("{{\"status\": \"Success\", \"outpoints\": {outpoints_as_str}}}")
         } else {
@@ -214,9 +212,9 @@ impl Service {
                 .unwrap();
             // broadcast tx
             let tx_as_str = tx_as_hexstr(&b_tx);
-            debug!("tx_as_str = {}", &tx_as_str);
-            match self.blockchain_interface.broadcast_tx(&tx_as_str).await {
-                Ok(_) => {
+            log::info!("tx_as_str = {}", &tx_as_str);
+            match self.blockchain_interface.broadcast_tx(&b_tx).await {
+                Ok(hash) => {
                     let outpoints = self.get_outpoints(&b_tx.hash().encode(), no_of_outpoints);
                     format!("{{\"status\": \"Success\", \"outpoints\": {outpoints}}}")
                 },
