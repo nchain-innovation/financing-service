@@ -32,7 +32,7 @@ pub async fn status(data: web::Data<AppState>) -> impl Responder {
 // #[get("/update_clients")]
 pub async fn update_clients(data: web::Data<AppState>) -> impl Responder {
     let mut service = data.service.lock().await;
-    info!("update_clients");
+    // info!("update_clients");
     service.update_balances().await;
 
     HttpResponse::Ok()

@@ -9,8 +9,6 @@ use chain_gang::{
     messages::{OutPoint, Tx},
 };
 
-
-
 use crate::{
     blockchain_factory::blockchain_factory, client::Client, config::Config, util::tx_as_hexstr,
 };
@@ -128,7 +126,7 @@ impl Service {
         let mut retval: String = "[".to_string();
 
         for i in 1..no_of_outpoints + 1 {
-            retval += format!("{{\"hash\": \"{hash}\", \"index\": {i}}}").as_str();
+            retval += format!("{{\"hash\": {hash}, \"index\": {i}}}").as_str();
             if i != no_of_outpoints {
                 retval += ",";
             }
@@ -185,7 +183,8 @@ impl Service {
 
                 match self.blockchain_interface.broadcast_tx(&a_tx).await {
                     Ok(_hash) => {
-                        // append to the list
+                        // Append to the list
+                        // Note the provided hash is a str whereas OutPoint wants a Hash256
                         outpoints.push(OutPoint {
                             hash: a_tx.hash(),
                             index: 1,
@@ -215,7 +214,7 @@ impl Service {
             log::info!("tx_as_str = {}", &tx_as_str);
             match self.blockchain_interface.broadcast_tx(&b_tx).await {
                 Ok(hash) => {
-                    let outpoints = self.get_outpoints(&b_tx.hash().encode(), no_of_outpoints);
+                    let outpoints = self.get_outpoints(&hash, no_of_outpoints);
                     format!("{{\"status\": \"Success\", \"outpoints\": {outpoints}}}")
                 },
                 _ => {
