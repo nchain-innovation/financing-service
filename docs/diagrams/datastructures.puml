@@ -1,0 +1,58 @@
+@startuml
+title Financing Service Data Structures
+
+enum BlockchainConnectionStatus{
+    Unknown
+    Failed
+    Connected
+}
+
+class Service {
+    blockchain_status: BlockchainConnectionStatus
+    blockchain_update_time: Optional<Time>
+    blockchain_interface: BlockchainInterface
+    clients: Vec<Clients>
+    get_status() -> Response
+    get_client_balances()
+}
+
+Service *-- BlockchainConnectionStatus
+class OutPoint {
+    hash: Hash256
+    pos: u32
+}
+
+class SpendableSatoshi {
+    outpoint OutPoint
+    satoshi: u64
+    blockheight: u32
+}
+
+class Client {
+    identifier: String
+    funding_wallet: Wallet
+    balance_update_time: Time
+    avalible_UTXO: Vec<SpendableSatoshi>
+    get_balance() -> Balance
+    update_balance(UTXO)
+}
+
+class Wallet {
+    public_key: PublicKey
+    private_key: PrivateKey
+}
+
+class Balance {
+    confirmed_satoshi: u64
+    unconfirmed_satoshi: u64
+    balance_update_time: Time
+}
+
+Service "1" *-- "many" Client
+Client *-- Wallet
+Client *-- SpendableSatoshi
+Client .. Balance
+
+SpendableSatoshi *-- OutPoint
+
+@enduml

@@ -1,0 +1,44 @@
+@startuml
+title Get Balance
+hide footbox
+actor Client as A
+box "System" #lightblue
+
+    participant FinancingService as FS
+    participant BlockchainInterface as BS
+end box
+
+Collections Blockchain
+
+
+A -> FS: get_balance\n(client_id)
+activate FS
+FS -> FS: client_id_valid(client_id)
+alt Failure case
+    FS --> A: response\n{status: failure, client_id, unknown_client_id}
+end
+
+FS -> FS: check_balance\n(client_id)
+FS --> A: response\n{status: success, client_id, balance}
+deactivate FS
+...
+
+
+alt Periodically
+    'activate FS
+    loop for each client
+        FS --> BS: request UTXO
+        activate FS
+        activate BS
+        BS --> Blockchain
+        Blockchain --> BS
+        BS --> FS: UTXO
+        deactivate BS
+
+        FS --> FS: update_balance()
+    end
+
+end
+deactivate FS
+
+@enduml

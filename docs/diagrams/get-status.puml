@@ -1,0 +1,26 @@
+@startuml
+title Get Status
+hide footbox
+actor Admin as C
+box "System" #lightblue
+
+    participant FinancingService as FS
+    participant BlockchainInterface as BS
+end box
+
+Collections Blockchain
+
+
+C -> FS: get_status()
+activate FS
+FS -> FS: check_blockchain_health()
+
+
+loop for each client
+    FS -> FS: get_balance()
+end
+
+FS --> C: response\n(status: success, blockchain_health, [client_balance])
+deactivate FS
+
+@enduml

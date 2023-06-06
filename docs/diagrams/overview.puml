@@ -1,0 +1,14 @@
+@startuml
+title Financing Service Overview
+
+package "Financing Service" {
+    FS_API - [FinancingService] : provides
+}
+
+cloud "Blockchain" {
+}
+
+[FinancingService] ..> Blockchain: uses
+
+
+@enduml
