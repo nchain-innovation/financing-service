@@ -88,8 +88,8 @@ impl Service {
             self.blockchain_status = match client.update_balance(&*self.blockchain_interface).await
             {
                 Ok(_) => BlockchainConnectionStatus::Connected,
-                Err(_) => {
-                    log::warn!("update_balance - failed");
+                Err(e) => {
+                    log::warn!("update_balance - failed {:?}", e);
                     BlockchainConnectionStatus::Failed
                 }
             };
