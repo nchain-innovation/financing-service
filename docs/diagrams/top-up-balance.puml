@@ -1,0 +1,35 @@
+@startuml
+title Top-Up Balance
+hide footbox
+actor Admin as A
+box "System" #lightblue
+
+    participant FinancingService as FS
+    participant BlockchainInterface as BS
+end box
+
+Collections Blockchain
+
+A -> Blockchain: top_up_balance\n(satoshi)
+
+...
+
+
+alt Periodically
+    'activate FS
+    loop for each client
+        FS --> BS: request UTXO
+        activate FS
+        activate BS
+        BS --> Blockchain
+        Blockchain --> BS
+        BS --> FS: UTXO
+        deactivate BS
+
+        FS --> FS: update_balance()
+    end
+
+end
+deactivate FS
+
+@enduml

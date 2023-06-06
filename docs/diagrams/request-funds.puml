@@ -1,0 +1,56 @@
+@startuml
+title Request Transaction Fund(s)
+hide footbox
+actor Client as C
+box "System" #lightblue
+
+    participant FinancingService as FS
+    participant BlockchainInterface as BS
+end box
+
+Collections Blockchain
+
+
+C -> FS: request_funds\n(client_id, satoshi, no_of_outpoints, multiple_tx, locking_script)
+activate FS
+FS -> FS: client_id_valid(client_id)
+alt Failure case
+    FS --> C: response\n{status: failure, client_id, unknown_client_id}
+end
+
+FS -> FS: check_balance_sufficient\n(client_id, satoshi, no_of_outpoints)
+alt Failure case
+    FS --> C: response\n{status: failure, client_id, insufficient_funds}
+end
+
+alt no_of_outpoints > 1 and multiple_tx == True
+    loop for each tx
+        FS -> FS: create_txs(satoshi, locking_script) -> tx
+        FS -> FS: txs.append(tx)
+    end
+    FS -> BS: broacast_txs(txs)
+    activate BS
+else multiple_tx = False
+    deactivate BS
+    FS -> FS: create_txs(satoshi, locking_script) -> tx
+    FS -> BS: broacast_tx(tx)
+    activate BS
+end
+
+BS -> Blockchain: broadcast
+Blockchain --> BS: [success | failure]
+alt Success case
+    BS --> FS: [txids]
+    deactivate BS
+    FS --> FS: update client UTXO
+    FS --> C: response\n{status: success, client_id, [outpoints]}
+else Failure case
+    activate BS
+    BS --> FS: failure
+    deactivate BS
+    FS --> C: response\n{status: failure, client_id, unable_to_broadcast tx}
+end
+
+deactivate FS
+
+@enduml
