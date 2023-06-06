@@ -5,6 +5,9 @@ Many of the elements of this service are common with the Financing Service writt
 
 https://bitbucket.stressedsharks.com/projects/SDL/repos/financing-service
 
+A overview of the project can be found:
+https://docs.google.com/document/d/159T_RDgf8CnSq3Kd4PaYgfw9OUrX-kwwdZw4qEe4iP0/edit?usp=sharing
+
 
 ## Rust Installation
 This project is build using `Rust`.

@@ -1,14 +1,20 @@
 @startuml
 title Financing Service Overview
 
+interface FS_API
 package "Financing Service" {
     FS_API - [FinancingService] : provides
+    [Chain-Gang\n(BSV library)] 
+    file "configuration\n(financing_service_toml)" as fs_toml
+   
+    [FinancingService] ..> fs_toml: read at startup
+
 }
 
 cloud "Blockchain" {
 }
-
-[FinancingService] ..> Blockchain: uses
+[FinancingService] ..> [Chain-Gang\n(BSV library)]: uses
+[Chain-Gang\n(BSV library)] ..> Blockchain: uses
 
 
 @enduml

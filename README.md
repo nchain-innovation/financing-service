@@ -13,8 +13,9 @@ Diagram 1 - Financing Service Overview
 
 As shown in diagram 1 the FS provides an interface that the other application components interface with and uses the blockchain to create the funding transaction outpoints.
 
-A overview of the project can be found:
-https://docs.google.com/document/d/159T_RDgf8CnSq3Kd4PaYgfw9OUrX-kwwdZw4qEe4iP0/edit?usp=sharing
+The service reads its configuration on startup.
+
+The service uses the `chain-gang` library to interface with the BSV blockchain.
 
 
 ## Use cases
@@ -42,12 +43,29 @@ cd financing-service-rust
 git submodule init
 git submodule update
 ```
+The project can either be run as an executable or in a docker container.
 
-Install the development dependencies as detailed here [here](docs/Development.md) and configure database using instructions [here](Database.md). 
+
+## Docker
+Encapsulating the service in Docker removes the need to install the project dependencies on the host machine.
+Only Docker is required to build and run the service.
+### 1) Build The Docker Image
+To build the docker image associated with the service run the following comand in the project directory.
+```bash
+./build.sh
+```
+This builds the Docker image `financing-service-rust`.
+### 2) To Run the Image
+The to start the Docker container:
+```bash
+./run.sh
+```
+This will provide a REST API at http://localhost:8080
 
 
 ## To Build the Service
 The service is developed in Rust.
+
 The best way to install Rust is to use `rustup`, see https://www.rust-lang.org/tools/install
 
 To build:

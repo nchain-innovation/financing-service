@@ -1,4 +1,7 @@
-use std::time::Duration;
+use std::{
+    time::Duration, net::Ipv4Addr,
+    env,
+};
 use tokio::time;
 
 use actix_web::{web, App, HttpServer};
@@ -13,10 +16,22 @@ mod service;
 mod util;
 
 use crate::{
-    config::get_config,
+    config::{get_config, Config},
     rest_api::{balance, get_funds, index, status, update_clients, AppState},
     service::Service,
 };
+
+
+// Given the config return the websever ip address and port
+fn get_addr(config: &Config) -> (Ipv4Addr, u16) {
+    let port = config.web_interface.port;
+    match env::var_os("APP_ENV") {
+        // Allow all access in docker
+        // (required as otherwise the localmachine can not access the webserver)
+        Some(content) if content == "docker" => (Ipv4Addr::new(0,0,0,0), port),
+        Some(_) | None => (config.web_interface.address, port),
+    }
+}
 
 /// Main - Read config and setup Web server.
 #[actix_web::main]
@@ -36,7 +51,7 @@ async fn main() -> std::io::Result<()> {
 
     let counter2 = counter.clone();
 
-    let addr = (config.web_interface.address, config.web_interface.port);
+    let addr = get_addr(&config);
 
     // Setup periodic task
     tokio::spawn(async move {
