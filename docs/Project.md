@@ -21,6 +21,9 @@ https://docs.rs/reqwest/latest/reqwest/
 * Reorder unspent on insertion
 
 ## To Do
+Add docker container
+
+
 * Periodic event
 * Manage inserted unspent differently?
 

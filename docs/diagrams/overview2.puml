@@ -1,0 +1,35 @@
+@startuml
+title Financing Service Overview with Blockchain interfaces
+top to bottom direction
+
+() FS_API
+package "Financing Service" {
+    FS_API - [FinancingService] : provides
+    () BS_API
+    package "Blockchain Interfaces" {
+        BS_API -down- [mAPI Interface]
+        BS_API - [WoC Interface]
+        BS_API - [RPC Interface]
+        BS_API - [UaaS Interface]
+        BS_API - [Mock Interface]
+    }
+}
+
+cloud "Blockchain" {
+}
+
+[FinancingService] ..> BS_API : uses
+
+[mAPI Interface] ..> [mAPI Service] : uses
+[mAPI Service] ..> Blockchain : uses
+
+[WoC Interface] ..> [WoC Service] : uses
+[WoC Service] ..> Blockchain : uses
+
+[RPC Interface] ..> [SV Node] : uses
+[SV Node] ..> Blockchain : uses
+
+[UaaS Interface] ..> [UaaS] : uses
+[UaaS] ..> Blockchain : uses
+
+@enduml
