@@ -39,6 +39,10 @@ impl Service {
         let mut clients: Vec<Client> = Vec::new();
         let network = config.get_network().unwrap();
         let blockchain_interface = blockchain_factory(config);
+
+        // Check we can connect to blockchain
+        blockchain_interface.status().await.expect("Unable to connect to blockchain");
+
         for client_config in &config.client {
             let new_client = Client::new(client_config, network);
             clients.push(new_client);
