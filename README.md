@@ -40,8 +40,7 @@ The financing service has `chain-gang` as a submodule.
 ```bash
 git clone ssh://git@bitbucket.stressedsharks.com:8443/sdl/financing-service-rust.git
 cd financing-service-rust
-git submodule init
-git submodule update
+git submodule update --init --recursive --remote
 ```
 The project can either be run as an executable or in a docker container.
 
