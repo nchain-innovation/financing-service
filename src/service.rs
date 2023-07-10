@@ -130,7 +130,7 @@ impl Service {
         let mut retval: String = "[".to_string();
 
         for i in 1..no_of_outpoints + 1 {
-            retval += format!("{{\"hash\": {hash}, \"index\": {i}}}").as_str();
+            retval += format!("{{\"hash\": \"{hash}\", \"index\": {i}}}").as_str();
             if i != no_of_outpoints {
                 retval += ",";
             }
