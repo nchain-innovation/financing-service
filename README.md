@@ -148,11 +148,8 @@ In Rust use the `chain-gang` library and the following code:
 ``` rust
     // create the locking script for this wallet keypair
     pub fn locking_script(&self) -> Script {
-        //let address = self.address.payload.as_bytes();
         let address = &hash160(&self.public_key_as_bytes()).0;
 
-        // create_lock_script(&hash160(&self.public_key_as_bytes())).0
-        //create_lock_script(address).0
         let mut script = Script::new();
         script.append(OP_DUP);
         script.append(OP_HASH160);
