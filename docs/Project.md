@@ -16,6 +16,11 @@ https://docs.rs/sv/latest/sv/transaction/sighash/fn.sighash.html
 https://docs.rs/reqwest/latest/reqwest/
 
 
+# 12/03/2024 
+* version = "0.2.0"
+* Added version to status response
+* Added tx to the request for a single tx funding
+
 ## In Progress
 * REST API
 * Reorder unspent on insertion

@@ -69,9 +69,11 @@ impl Service {
             None => "None".to_string(),
         };
 
+        let version = env!("CARGO_PKG_VERSION");
+
         let mut retval = format!(
-            "{{\"blockchain_status\": \"{:?}\", \"blockchain_update_time\": \"{}\", \"clients\":[",
-            self.blockchain_status, update_time
+            "{{\"version\": \"{}\", \"blockchain_status\": \"{:?}\", \"blockchain_update_time\": \"{}\", \"clients\":[",
+            version, self.blockchain_status, update_time
         );
 
         let len = self.clients.len();
@@ -219,7 +221,7 @@ impl Service {
             match self.blockchain_interface.broadcast_tx(&b_tx).await {
                 Ok(hash) => {
                     let outpoints = self.get_outpoints(&hash, no_of_outpoints);
-                    format!("{{\"status\": \"Success\", \"outpoints\": {outpoints}}}")
+                    format!("{{\"status\": \"Success\", \"outpoints\": {outpoints}, \"tx\": \"{tx_as_str}\"}}")
                 },
                 _ => {
                     "{{\"status\": \"Failure\", \"description\": \"Failed to broadcast funding transaction.\"}}".to_string()
