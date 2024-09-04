@@ -1,3 +1,0 @@
-[submodule "chain-gang"]
-	path = chain-gang
-	url = ssh://git@bitbucket.stressedsharks.com:8443/sdl/chain-gang.git
