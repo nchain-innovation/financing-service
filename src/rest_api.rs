@@ -13,7 +13,6 @@ pub struct AppState {
 #[get("/")]
 pub async fn index(_data: web::Data<AppState>) -> String {
     "Financing Service REST API".to_string()
-    //HttpResponse::Ok().body("Hello world!")
 }
 
 /// Get Service Status endpoint

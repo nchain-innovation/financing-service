@@ -48,7 +48,12 @@ pub struct Client {
 impl Client {
     /// Create a new
     pub fn new(config: &ClientConfig, network: SvNetwork) -> Self {
-        let private_key: PrivateKey = PrivateKey::from_wif(&config.wif_key).unwrap();
+        let private_key = PrivateKey::from_wif(&config.wif_key).unwrap_or_else(|_| {
+            panic!(
+                r#"wif_key = "{}" is not a valid WIF key (client_id = "{}")."#,
+                config.wif_key, config.client_id
+            )
+        });
         let secp = Secp256k1::new();
         let public_key: PublicKey = private_key.public_key(&secp);
 
@@ -360,7 +365,17 @@ mod tests {
             hex::decode("76a914b467faf0ef536db106d67f872c448bcaccb878c988ac").unwrap();
         let tx = client.create_funding_tx(123, 1, &locking_script).unwrap();
 
-        debug!("tx = {}", &tx);
+        debug!("tx = {:?}", &tx);
         assert_eq!(tx_as_hexstr(&tx), "0100000001786563262f7e951eea3d9db3e4997daeba748ffa99219e298401dfe99d1033e5000000006b483045022100c59cb6d235e26d32d2efde738aaa2d18c12c7c75a026731ff3c01448162da85c02203e73cdbba595148e7e64b0379bc6fa4205a7978c592bb1f70440a0e312c5f7594121021abeddfe1373942015c1ef7168dc841d86753431932babdeb2f6e2fccdef882fffffffff02c7ec9100000000001976a914b467faf0ef536db106d67f872c448bcaccb878c988ac7b000000000000001976a914b467faf0ef536db106d67f872c448bcaccb878c988ac00000000");
+    }
+
+    #[tokio::test]
+    #[should_panic]
+    async fn test_invalid_wif_key() {
+        let client_config: ClientConfig = ClientConfig {
+            client_id: "id1".to_string(),
+            wif_key: "EGa6cZHpfLZmUzXbkvq72s15rbiUonkrQAhDU4FG".to_string(),
+        };
+        Client::new(&client_config, SvNetwork::BSV_Testnet);
     }
 }

@@ -1,7 +1,4 @@
-use std::{
-    time::Duration, net::Ipv4Addr,
-    env,
-};
+use std::{env, net::Ipv4Addr, time::Duration};
 use tokio::time;
 
 use actix_web::{web, App, HttpServer};
@@ -21,14 +18,13 @@ use crate::{
     service::Service,
 };
 
-
 // Given the config return the websever ip address and port
 fn get_addr(config: &Config) -> (Ipv4Addr, u16) {
     let port = config.web_interface.port;
     match env::var_os("APP_ENV") {
         // Allow all access in docker
         // (required as otherwise the localmachine can not access the webserver)
-        Some(content) if content == "docker" => (Ipv4Addr::new(0,0,0,0), port),
+        Some(content) if content == "docker" => (Ipv4Addr::new(0, 0, 0, 0), port),
         Some(_) | None => (config.web_interface.address, port),
     }
 }
