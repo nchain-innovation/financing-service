@@ -48,7 +48,12 @@ pub struct Client {
 impl Client {
     /// Create a new
     pub fn new(config: &ClientConfig, network: SvNetwork) -> Self {
-        let private_key: PrivateKey = PrivateKey::from_wif(&config.wif_key).unwrap();
+        let private_key = PrivateKey::from_wif(&config.wif_key).unwrap_or_else(|_| {
+            panic!(
+                r#"wif_key = "{}" is not a valid WIF key (client_id = "{}")."#,
+                config.wif_key, config.client_id
+            )
+        });
         let secp = Secp256k1::new();
         let public_key: PublicKey = private_key.public_key(&secp);
 
