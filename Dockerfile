@@ -1,8 +1,7 @@
-FROM rust:bookworm as builder
+FROM rust:bookworm AS builder
 
 COPY ./data /app/data
 COPY . /app/rust
-COPY ./chain-gang /app/chain-gang
 
 WORKDIR /app/rust
 RUN cargo install --path . --root /app
