@@ -1,12 +1,15 @@
 #!/bin/bash
 
 # This build file creates the rust financing service for use with the nchain rnd prototyping projects 
+# For a faster build, you can use the cloud builder (cloud-nchain-rndprototyping).  
+# Please check the allowed build minutes, as exceeding them may affect ability to build.
+# Uncomment the --builder flag to enable the cloud builder, and comment out the --platform flag.
 
 # Project Id:  (financing-service)
 
 # Tags
 BASE_TAG=financing-service
-VERSION=v1.2
+VERSION=v1.3
 PUBLISH_TAG=nchain/rnd-prototyping-$BASE_TAG:$VERSION
 
 # multi build, tag and push base images
