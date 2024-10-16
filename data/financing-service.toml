@@ -1,0 +1,15 @@
+[blockchain_interface]
+# For bsv testnet (default)
+interface_type = "woc"
+network_type = "testnet"
+
+[web_interface]
+address = '127.0.0.1'
+port = 8082
+
+[logging]
+level = "info"
+
+# [[client]]
+# client_id = "id1"
+# wif_key = ""
