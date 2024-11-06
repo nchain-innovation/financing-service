@@ -2,7 +2,7 @@ use std::{env, net::Ipv4Addr};
 
 use chain_gang::network::Network;
 use log::debug;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Blockchain Interface Configuration
 #[derive(Debug, Default, Deserialize, Clone)]
@@ -12,7 +12,7 @@ pub struct BlockchainInterfaceConfig {
 }
 
 /// Client Configuration
-#[derive(Debug, Default, Deserialize, Clone)]
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
 pub struct ClientConfig {
     pub client_id: String,
     pub wif_key: String,
@@ -21,6 +21,11 @@ pub struct ClientConfig {
 #[derive(Debug, Default, Deserialize, Clone)]
 pub struct LoggingConfig {
     pub level: String,
+}
+
+#[derive(Debug, Default, Deserialize, Clone)]
+pub struct DynamicConfigConfig {
+    pub filename: String,
 }
 
 /// Web Interface Configuration
@@ -45,7 +50,8 @@ pub struct Config {
     pub blockchain_interface: BlockchainInterfaceConfig,
     pub web_interface: WebInterfaceConfig,
     pub logging: LoggingConfig,
-    pub client: Vec<ClientConfig>,
+    pub client: Option<Vec<ClientConfig>>,
+    pub dynamic_config: DynamicConfigConfig,
 }
 
 impl Config {

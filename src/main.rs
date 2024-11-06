@@ -1,7 +1,4 @@
-use std::{
-    time::Duration, net::Ipv4Addr,
-    env,
-};
+use std::{env, net::Ipv4Addr, time::Duration};
 use tokio::time;
 
 use actix_web::{web, App, HttpServer};
@@ -11,16 +8,19 @@ use async_mutex::Mutex;
 mod blockchain_factory;
 mod client;
 mod config;
+mod dynamic_config;
 mod rest_api;
 mod service;
 mod util;
 
 use crate::{
     config::{get_config, Config},
-    rest_api::{balance, get_funds, index, status, update_clients, AppState},
+    rest_api::{
+        add_client, balance, delete_client, get_address, get_funds, index, status, update_clients,
+        AppState,
+    },
     service::Service,
 };
-
 
 // Given the config return the websever ip address and port
 fn get_addr(config: &Config) -> (Ipv4Addr, u16) {
@@ -28,7 +28,7 @@ fn get_addr(config: &Config) -> (Ipv4Addr, u16) {
     match env::var_os("APP_ENV") {
         // Allow all access in docker
         // (required as otherwise the localmachine can not access the webserver)
-        Some(content) if content == "docker" => (Ipv4Addr::new(0,0,0,0), port),
+        Some(content) if content == "docker" => (Ipv4Addr::new(0, 0, 0, 0), port),
         Some(_) | None => (config.web_interface.address, port),
     }
 }
@@ -71,6 +71,9 @@ async fn main() -> std::io::Result<()> {
             .service(status)
             .service(balance)
             .service(get_funds)
+            .service(add_client)
+            .service(delete_client)
+            .service(get_address)
     })
     .bind(addr)?
     .run()

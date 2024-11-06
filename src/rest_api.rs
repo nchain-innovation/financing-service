@@ -1,5 +1,5 @@
 use crate::service::Service;
-use actix_web::{get, http::header::ContentType, post, web, HttpResponse, Responder};
+use actix_web::{delete, get, http::header::ContentType, post, web, HttpResponse, Responder};
 use async_mutex::Mutex;
 use log::{debug, info};
 use serde::Deserialize;
@@ -13,47 +13,25 @@ pub struct AppState {
 #[get("/")]
 pub async fn index(_data: web::Data<AppState>) -> String {
     "Financing Service REST API".to_string()
-    //HttpResponse::Ok().body("Hello world!")
 }
 
 /// Get Service Status endpoint
 #[get("/status")]
 pub async fn status(data: web::Data<AppState>) -> impl Responder {
+    log::info!("status");
+
     let service = data.service.lock().await;
-
     let status = service.get_status();
-
     HttpResponse::Ok()
         .content_type(ContentType::json())
         .body(status)
 }
 
-/// Endpoint to update all the clients, aim is to call this periodically
-// #[get("/update_clients")]
+/// Endpoint to update all the clients, called by ticker every minute
 pub async fn update_clients(data: web::Data<AppState>) -> impl Responder {
     let mut service = data.service.lock().await;
-    // info!("update_clients");
     service.update_balances().await;
-
     HttpResponse::Ok()
-}
-
-/// Get Balance for a particular client_id endpoint
-#[get("/balance/{client_id}")]
-pub async fn balance(data: web::Data<AppState>, info: web::Path<String>) -> impl Responder {
-    let client_id: String = info.to_string();
-    let service = data.service.lock().await;
-
-    // Check client_id
-    let response = if !service.is_client_id_valid(&client_id) {
-        format!("{{\"status\": \"Failure\", \"description\": \"Unknown client_id {client_id} \"}}")
-    } else {
-        let balance = service.get_balance(&client_id).unwrap();
-        format!("{{\"status\": \"Success\", \"Balance\": {balance} }}")
-    };
-    HttpResponse::Ok()
-        .content_type(ContentType::json())
-        .body(response)
 }
 
 #[derive(Deserialize, Debug)]
@@ -70,6 +48,8 @@ pub struct FundingInfo {
 ///     curl -X POST http://127.0.0.1:8080/fund/id1/123/1/false/0000
 #[post("/fund/{client_id}/{satoshi}/{no_of_outpoints}/{mutliple_tx}/{locking_script}")]
 pub async fn get_funds(data: web::Data<AppState>, info: web::Path<FundingInfo>) -> impl Responder {
+    log::info!("get_funds");
+
     let mut service = data.service.lock().await;
 
     // These local vars are required as the format! strings don't accept '.` in `{}`
@@ -142,5 +122,118 @@ pub async fn get_funds(data: web::Data<AppState>, info: web::Path<FundingInfo>) 
             .await;
         debug!("outpoints = {:?}", &outpoints);
         HttpResponse::Ok().body(outpoints)
+    }
+}
+
+#[derive(Deserialize, Debug)]
+pub struct ClientInfo {
+    client_id: String,
+    wif: String,
+}
+
+/// Add client
+/// Example:
+///     curl -X POST http://127.0.0.1:8080/client/client_1/
+#[post("/client/{client_id}/{wif}")]
+pub async fn add_client(data: web::Data<AppState>, info: web::Path<ClientInfo>) -> impl Responder {
+    let mut service = data.service.lock().await;
+    // These local vars are required as the format! strings don't accept '.` in `{}`
+    let client_id = &info.client_id;
+    log::info!("add_client {}", &client_id);
+
+    let wif = &info.wif;
+    // check to see if client_id already exists
+    if service.is_client_id_valid(client_id) {
+        //return error we already have this client
+        let response = format!(
+            "{{\"status\": \"Failure\", \"description\": \"Unknown client_id {client_id}\"}}"
+        );
+        HttpResponse::UnprocessableEntity()
+            .content_type(ContentType::json())
+            .body(response)
+    } else {
+        // if not add it
+        service.add_client(client_id, wif);
+
+        let response = "{\"status\": \"Success\"}".to_string();
+        HttpResponse::Ok()
+            .content_type(ContentType::json())
+            .body(response)
+    }
+}
+
+/// Delete client
+/// Example:
+///     curl -X POST http://127.0.0.1:8080/client/client_1/
+#[delete("/client/{client_id}")]
+pub async fn delete_client(data: web::Data<AppState>, info: web::Path<String>) -> impl Responder {
+    let mut service = data.service.lock().await;
+    // These local vars are required as the format! strings don't accept '.` in `{}`
+    let client_id: String = info.to_string();
+    log::info!("delete_client {}", &client_id);
+
+    // check to see if client_id already exists
+    if service.is_client_id_valid(&client_id) {
+        // if so delete it
+        service.delete_client(&client_id);
+
+        let response = "{\"status\": \"Success\"}".to_string();
+        HttpResponse::Ok()
+            .content_type(ContentType::json())
+            .body(response)
+    } else {
+        // return error as we already have this client
+        let response = format!(
+            "{{\"status\": \"Failure\", \"description\": \"Unknown client_id {client_id} \"}}"
+        );
+        HttpResponse::UnprocessableEntity()
+            .content_type(ContentType::json())
+            .body(response)
+    }
+}
+
+/// Get Address for a particular client_id
+#[get("/client/{client_id}/address")]
+pub async fn get_address(data: web::Data<AppState>, info: web::Path<String>) -> impl Responder {
+    let client_id: String = info.to_string();
+    let service = data.service.lock().await;
+
+    // Check client_id
+    if !service.is_client_id_valid(&client_id) {
+        let response = format!(
+            "{{\"status\": \"Failure\", \"description\": \"Unknown client_id {client_id} \"}}"
+        );
+        HttpResponse::UnprocessableEntity()
+            .content_type(ContentType::json())
+            .body(response)
+    } else {
+        let address = service.get_address(&client_id).unwrap();
+        let response = format!("{{\"status\": \"Success\", \"Balance\": {address} \"}}");
+        HttpResponse::Ok()
+            .content_type(ContentType::json())
+            .body(response)
+    }
+}
+
+/// Get Balance for a particular client_id endpoint
+#[get("/client/{client_id}/balance")]
+pub async fn balance(data: web::Data<AppState>, info: web::Path<String>) -> impl Responder {
+    let client_id: String = info.to_string();
+    let service = data.service.lock().await;
+
+    // Check client_id
+    if !service.is_client_id_valid(&client_id) {
+        let response = format!(
+            "{{\"status\": \"Failure\", \"description\": \"Unknown client_id {client_id} \"}}"
+        );
+        HttpResponse::UnprocessableEntity()
+            .content_type(ContentType::json())
+            .body(response)
+    } else {
+        let balance = service.get_balance(&client_id).unwrap();
+        let response = format!("{{\"status\": \"Success\", \"Balance\": {balance} }}");
+        HttpResponse::Ok()
+            .content_type(ContentType::json())
+            .body(response)
     }
 }
