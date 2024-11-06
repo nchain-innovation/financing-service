@@ -98,7 +98,7 @@ impl Client {
     pub fn get_address(&self) -> String {
         let client_id = self.client_id.clone();
         let address = self.address.to_string();
-        format!("{{\"client_id\": \"{client_id}\", \"address\":{address}}}")
+        format!("{{\"client_id\": \"{client_id}\", \"address\": \"{address}\"}}")
     }
 
     /// Return the value of the largest unspent UTXO

@@ -24,10 +24,14 @@ Returns one or more funding transactions based on the request, where the paramet
 * `locking_script` - the locking script to be associated with these outpoints
 ```JSON
 curl -X POST http://127.0.0.1:8080/fund/id1/123/1/false/0000
+
 {
     "status": "Success", 
-    "outpoints": [{"hash": ecac3322ae8ef945b8e3c4faeb690b9482f3f047b63f9f9b612e02735086b8a2, "index": 1}]
-}  
+    "outpoints": [{
+        "hash": "24ecfdb46cc82fdbc708db3995572eb9fc920863c80856f39bcbf03ba0257fb6", 
+        "index": 1}], 
+    "tx": "0100000001a2b8865073022e619b9f3fb647f0f382940b69ebfac4e3b845f98eae2233acec000000006b483045022100f5c7334c33280d9ea2c762d50b10ca977ce32b1d109969ef578ec19baa0e801f02203a387744f766e18dada69b88eca50c8573bb35c8720b7214ccd2ec33a039e914412102b02cc8307d68c174135fc320a7af3cb4748e14b1701b76f9498ccaf3ffac55efffffffff026e7f0100000000001976a91404e044fb084b497e20a635bbad95b18506666cbf88ac7b0000000000000002000000000000"
+}
 
 ```
 
@@ -53,10 +57,14 @@ Get Address for a particular client_id.
 
 ```JSON
 curl http://127.0.0.1:8080/client/client1/address
+
 {
     "status": "Success", 
-    "Balance": {"client_id": "client1", "address":mfxjfLTXLUcCxMDojqRejpfKnF9WhRG5BK} 
-}                                                                                                                          
+    "info": {
+        "client_id": "client1", 
+        "address": "mfxjfLTXLUcCxMDojqRejpfKnF9WhRG5BK"
+    } 
+}
 ```
 
 
