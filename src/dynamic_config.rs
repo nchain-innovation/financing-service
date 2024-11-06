@@ -12,7 +12,6 @@ pub struct FileContents {
 pub struct DynamicConfig {
     filename: String,
     pub contents: FileContents,
-
 }
 
 fn read_dynamic_config(filename: &str) -> std::io::Result<FileContents> {
@@ -38,10 +37,7 @@ impl DynamicConfig {
             }
         };
 
-        DynamicConfig { 
-            filename, 
-            contents,
-        }
+        DynamicConfig { filename, contents }
     }
 
     pub fn add(&mut self, new_client: &ClientConfig) {
@@ -50,7 +46,12 @@ impl DynamicConfig {
     }
 
     pub fn remove(&mut self, client_id: &str) {
-        if let Some(index) = self.contents.clients.iter().position(|c| c.client_id == client_id) {
+        if let Some(index) = self
+            .contents
+            .clients
+            .iter()
+            .position(|c| c.client_id == client_id)
+        {
             self.contents.clients.remove(index);
             self.save();
         }

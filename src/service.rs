@@ -181,7 +181,7 @@ impl Service {
         let mut retval: String = "[".to_string();
 
         for i in 1..no_of_outpoints + 1 {
-            retval += format!("{{\"hash\": {hash}, \"index\": {i}}}").as_str();
+            retval += format!("{{\"hash\": \"{hash}\", \"index\": {i}}}").as_str();
             if i != no_of_outpoints {
                 retval += ",";
             }
@@ -272,7 +272,7 @@ impl Service {
                 Ok(hash)//if result.status() == 200u16 => {
                     => {
                     let outpoints = self.get_outpoints(&hash, no_of_outpoints);
-                    format!("{{\"status\": \"Success\", \"outpoints\": {outpoints}}}")
+                    format!("{{\"status\": \"Success\", \"outpoints\": {outpoints}, \"tx\": \"{tx_as_str}\"}}")
                 },
                 _ => {
                     "{{\"status\": \"Failure\", \"description\": \"Failed to broadcast funding transaction.\"}}".to_string()

@@ -208,7 +208,7 @@ pub async fn get_address(data: web::Data<AppState>, info: web::Path<String>) -> 
             .body(response)
     } else {
         let address = service.get_address(&client_id).unwrap();
-        let response = format!("{{\"status\": \"Success\", \"Balance\": {address} \"}}");
+        let response = format!("{{\"status\": \"Success\", \"info\": {address} }}");
         HttpResponse::Ok()
             .content_type(ContentType::json())
             .body(response)

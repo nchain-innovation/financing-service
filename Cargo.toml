@@ -18,6 +18,6 @@ hex = "0.4.3"
 async-mutex = "1.4.0"
 async-trait = "0.1.77"
 http = "1.1.0"
-chain-gang = { git = "https://github.com/nchain-innovation/chain-gang.git", features = ["interface"]}
+chain-gang = { git = "https://github.com/nchain-innovation/chain-gang.git", features = ["interface"] }
 log = { version = "0.4.21", features = ["max_level_trace", "release_max_level_warn"] }
 simple_logger = "5.0.0"
