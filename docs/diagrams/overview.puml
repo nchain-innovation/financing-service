@@ -14,7 +14,10 @@ package "Financing Service" {
 cloud "Blockchain" {
 }
 [FinancingService] ..> [Chain-Gang\n(BSV library)]: uses
-[Chain-Gang\n(BSV library)] ..> Blockchain: uses
+
+[Chain-Gang\n(BSV library)] ..> [WhatsOnChain] : uses WoCInterface
+
+[WhatsOnChain] ..> Blockchain
 
 
 @enduml
