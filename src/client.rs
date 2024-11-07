@@ -95,6 +95,12 @@ impl Client {
         format!("{{\"client_id\": \"{client_id}\", \"confirmed\":{confirmed}, \"unconfirmed\": {unconfirmed}}}")
     }
 
+    pub fn get_address(&self) -> String {
+        let client_id = self.client_id.clone();
+        let address = self.address.to_string();
+        format!("{{\"client_id\": \"{client_id}\", \"address\": \"{address}\"}}")
+    }
+
     /// Return the value of the largest unspent UTXO
     fn get_largest_unspent(&self) -> Option<i64> {
         self.unspent.iter().max_by_key(|x| x.value).map(|x| x.value)
@@ -348,15 +354,17 @@ mod tests {
             client: vec![ClientConfig {
                 client_id: "id1".to_string(),
                 wif_key: "cTYmKQzX3CvHJAxe2sctsQaHG8ktiEnpXgyyycVXGg5pRcLJEeLd".to_string(),
-            }],
+            }]
+            .into(),
             ..Default::default()
         };
 
         // Set up test blockchain
-
         let blockchain_interface = setup_blockchain(&config).await;
 
-        let mut client = Client::new(&config.client[0], config.get_network().unwrap());
+        let network = config.get_network().unwrap();
+        let client_config = config.client.unwrap();
+        let mut client = Client::new(&client_config[0], network);
 
         let result = client.update_balance(&*blockchain_interface).await;
         assert!(&result.is_ok());
@@ -365,7 +373,17 @@ mod tests {
             hex::decode("76a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac").unwrap();
         let tx = client.create_funding_tx(123, 1, &locking_script).unwrap();
 
-        debug!("tx = {}", &tx);
+        debug!("tx = {:?}", &tx);
         assert_eq!(tx_as_hexstr(&tx), "0100000001786563262f7e951eea3d9db3e4997daeba748ffa99219e298401dfe99d1033e5000000006b483045022100c7a22fbf24470b2c96b82ce1bfd5896f515e3f0f509f307e94f699baefe0f8c3022044ddbb29952769c67ba117762ee628d299846039a6d90bc59618c770b226bfc2412103a8ae071ddd8690b94755c7112ca304bcac45c15904cc013f0ad6c2ea0b1019b2ffffffff02c7ec9100000000001976a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac7b000000000000001976a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac00000000");
+    }
+
+    #[tokio::test]
+    #[should_panic]
+    async fn test_invalid_wif_key() {
+        let client_config: ClientConfig = ClientConfig {
+            client_id: "id1".to_string(),
+            wif_key: "EGa6cZHpfLZmUzXbkvq72s15rbiUonkrQAhDU4FG".to_string(),
+        };
+        Client::new(&client_config, SvNetwork::BSV_Testnet);
     }
 }

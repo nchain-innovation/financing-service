@@ -52,8 +52,6 @@ cargo clippy
 
 ## Source code documentation
 
-
-
 To generate source code documentation
 ```bash
 cargo doc
