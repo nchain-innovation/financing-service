@@ -8,10 +8,16 @@ actor Admin as A
 package "Financing Service" {
     C --> (Request Transaction Fund)
     C --> (Request Multiple Transaction Funds)
+    C --> (Get Address)
     C --> (Get Balance)
 
+    A --> (Get Status) 
+    A --> (Add Client)
+    A --> (Delete Client)
+}
+
+package "Blockchain" {
     A --> (Top-up Balance)
-    A --> (Get Status)
 }
 
 @enduml

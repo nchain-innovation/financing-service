@@ -10,6 +10,9 @@ port = 8082
 [logging]
 level = "info"
 
+[dynamic_config]
+filename = "./data/dynamic.toml"
+
 # [[client]]
 # client_id = "id1"
 # wif_key = ""

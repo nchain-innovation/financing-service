@@ -1,41 +1,72 @@
 # Financing Service - Rust
 
-This is a version of the Financing Service written in Rust.
+The Financing Service (FS) creates Bitcoin SV transaction outpoint(s) of the correct satoshi value to fund client transactions, on request by a client application.
 
-The Financing Service (FS) creates Bitcoin SV transaction outpoint(s) of the correct satoshi value to fund particular transactions, on request.
+The FS is a component that can be used in different applications. Initially these will be Research applications. The component should be flexible, robust, clearly documented and maintainable, so that it is capable of supporting nChain release products.
 
-The FS is a component that can be used in different applications. Initially these will be R&D applications. The component should be flexible, robust, clearly documented and maintainable, so that it is capable of supporting nChain release products.
+The initial concept of this service was captured in the document:
+https://docs.google.com/document/d/159T_RDgf8CnSq3Kd4PaYgfw9OUrX-kwwdZw4qEe4iP0/edit?usp=sharing
 
 
-![Diagram 1](docs/diagrams/overview.png)
+The FS is designed to be as simple as possible, in that light it:
 
-Diagram 1 - Financing Service Overview
+* One FS can serve multiple clients.
+* FS provides REST API for clients to interact with.
+* FS supports the dynamic addition and removal of clients from the sytem (via REST API).
+
+* FS can provide any satoshi amount (subject to sufficent funds).
+* FS can provide any number of outpoints, in any number of transactions.
+
+* FS only accesses the funding key required to sign the transaction that provides the funds the client wishes to spend.
+* FS does not access the client's key, instead the client provides the locking script (script_pubkey).
+
+* FS (currently) uses WhatsOnChain interface to access the blockchain.
+* FS is stateless, that is to say it determines its state by reading the blockchain, it stores no state.
+* FS is configurable, it reads its configuration on startup.
+
+* FS does not cache funding transactions. That is a task better performed by the requesting application, which has much better oversight to determine how many funding transactions to cache, and when to request them.
+
+* FS is written in Rust.
+* FS build dependencies are all freely avalible open-source Rust crates.
+
+* FS does not support Hierarchical Deterministic (HD) Keys (BIP-32).
+* FS does not provide security in of itself. That is to say there is nothing insecure about the design. However we have avoided second guessing security measures which would be better provided by the deployed system VPS/Firewalls/Access Controls etc.
+
+## Use cases
+
+![Diagram 1](docs/diagrams/use-case.png)
+
+Diagram 1 - Financing Service Use Cases
+
+The Financing Service Client use cases are:
+* `Request Transaction Fund` - the FS receives a request for a satoshi value, it creates a funding transaction and provides the outpoint to the requestor so that they can fund their transaction.
+* `Request Transaction Funds` - the FS receives a request for multiple outpoints for  a satoshi value, it creates a funding transaction and returns the outpoints.
+* `Get Balance` - the FS returns the current level of funding associated with a particular client.
+* `Get Address` - the FS returns the address of particular client, this can be used for providing additional funds.
+
+The Financing Service Admin use cases are:
+* `Get Status` - the FS will return the current status of the component.
+* `Add Client` - Dynamically add the client whist the service is running.
+* `Delete Client` - Dynamically delete the client whist the service is running.
+* `Top-up Balance` - The Admin will provide a funding transaction to increase the satoshi that the FS can use for funding. This is done outside the Financing Service.
+
+
+## Overview
+
+![Diagram 2](docs/diagrams/overview.png)
+
+Diagram 2 - Financing Service Overview
 
 As shown in diagram 1 the FS provides an interface that the other application components interface with and uses the blockchain to create the funding transaction outpoints.
 
 The service reads its configuration on startup.
 
-The service uses the `chain-gang` library to interface with the BSV blockchain.
-
-
-## Use cases
-
-![Diagram 2](docs/diagrams/use-case.png)
-
-Diagram 2 - Financing Service Use Cases
-
-The Financing Service use cases are:
-* `Request Transaction Fund` - the FS receives a request for a satoshi value, it creates a funding transaction and provides the outpoint to the requestor so that they can fund their transaction.
-* `Request Transaction Funds` - the FS receives a request for multiple outpoints for  a satoshi value, it creates a funding transaction and returns the outpoints.
-* `Get Balance` - the FS returns the current level of funding associated with a particular client.
-`Top-up Balance` - The Admin will provide a funding transaction to increase the satoshi that the FS can use for funding.
-* `Get Status` - the FS will return the current status of the component.
-
+The service uses the `chain-gang` library's WoCInterface to interact with the BSV blockchain.
 
 
 ## Geting Started
 
-The project can either be run as an executable or in a docker container.
+The project can either be run as an executable or as a docker container (smallish 100MB).
 
 
 ## Docker
@@ -70,97 +101,6 @@ To run:
 ```bash
 cargo run
 ```
-## Supported endpoints
-The service provides the following endpoints:
-### Service status
-/status
-
-Returns a JSON service status report
-```JSON
-curl http://127.0.0.1:8080/status
-{
-    "blockchain_status": "Connected",
-    "blockchain_update_time": "2022-10-12 10:20:41",
-    "clients":[
-        {"client_id": "id1", "confirmed":9565721, "unconfirmed": 0},
-        {"client_id": "id2", "confirmed":4713, "unconfirmed": 0}
-    ]
-}
-```
-
-### Client Balance
-/balance/{client_id}
-```JSON
-curl http://127.0.0.1:8080/balance/id1
-{
-    "status": "Success",
-    "Balance": {"client_id": "id1", "confirmed":9565721, "unconfirmed": 0}
-}
-```
-
-### Fund Transactions
-/fund/{client_id}/{satoshi}/{no_of_outpoints}/{multiple_tx}/{locking_script}
-```JSON
-curl -X POST http://127.0.0.1:8080/fund/id1/123/1/false/0000
-{
-    "status": "Success",
-    "outpoints": [
-        {
-            "hash": "e6d71bb86e514c75921a032a0c7783bc1fab4b1b19fd675cfb3f0b918a3460a8",
-            "index": 1
-        }
-    ]
-}
-```
-
-### Locking scripts
-This section contains notes on generating locking scripts for the `fund` call.
-
-A pay to public key hash (P2PKH) unlocking script has the following form
-```
-OP_DUP OP_HASH160 b467faf0ef536db106d67f872c448bcaccb878c9 OP_EQUALVERIFY OP_CHECKSIG
-```
-This when encoded into hex has the form
-```
-76 A9 xxx 88 AC -> 76a9b467faf0ef536db106d67f872c448bcaccb878c988ac
-```
-So the fund call is expecting the script as a hex string, in this case `76a9b467faf0ef536db106d67f872c448bcaccb878c988ac`. 
-
-### Locking scripts - Python 
-In the MOPEngine code we have:
-*  `engine/standard_scripts.py` is `p2pkh_script()` - this creates a P2PKH unlocking script for the given public key
-* `script.raw_serialize()` method returns the script as bytes, without the prepended length.
-* There is a `bytes.hex()` method which converts bytes to hex string.
-
-
-So the call to setup the unlocking script is `p2pkh_script(public_key_cert).raw_serialize().hex()`
-
-
-### Locking scripts - Rust
-In Rust use the `chain-gang` library and the following code: 
-``` rust
-    // create the locking script for this wallet keypair
-    pub fn locking_script(&self) -> Script {
-        let address = &hash160(&self.public_key_as_bytes()).0;
-
-        let mut script = Script::new();
-        script.append(OP_DUP);
-        script.append(OP_HASH160);
-        script.append_data(address);
-        script.append(OP_EQUALVERIFY);
-        script.append(OP_CHECKSIG);
-        script
-    }
-
-    pub fn locking_script_as_bytes(&self) -> Vec<u8> {
-        self.locking_script().0
-    }
-
-    pub fn locking_script_as_hexstr(&self) -> String {
-        let bytes = self.locking_script_as_bytes();
-        hex::encode(bytes)
-    }
-```
 
 ## Building and Publishing Docker Images
 
@@ -178,5 +118,9 @@ To build and publish the image to Docker Hub, run the following command:
 - **Publishing Permissions:** Only members of the ```rndprototyping``` team within the ```nChain``` Docker Hub organisation are authorised to publish images with the appropriate tags. Ensure you are logged in with the necessary permissions before running the script, else this will fail.
 
 
+## Supported endpoints
+For details of the REST API endpoints provided by this service see [here](docs/SupportedEndpoints.md)
 
+## Locking scripts
+For details on generating locking scripts for the `fund` call see [here](docs/LockingScripts.md)
 

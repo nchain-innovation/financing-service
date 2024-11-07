@@ -2,7 +2,9 @@
 # Project Status
 This section contains project status related notes.
 
-
+* Document - September 2022
+* Python implementation - October 2022
+* Rust implementation - October 2022..October 2023 - Certificate On Chain
 
 ## Done
 Required to write in Rust
@@ -21,22 +23,29 @@ https://docs.rs/reqwest/latest/reqwest/
 * Added version to status response
 * Added tx to the request for a single tx funding
 
+
+# 02/10/2024
+Updates for Overlay Network
+* FS - no longer returns the names of clients in status message.
+* FS - update version number
+
 ## In Progress
 * REST API
 * Reorder unspent on insertion
+* Should use REST error codes for failures
 
 ## To Do
-Add docker container
 
+* Issue NCH-11485 Unable to build docker images with WARP enabled
+https://jira.stressedsharks.com/servicedesk/customer/portal/6/NCH-11485
 
 * Periodic event
 * Manage inserted unspent differently?
 
-* Should use REST error codes for failures
 * Should use ? in requests...
 * Grep for unwraps
 
-* Need to think about UTXO management,
+* Need to think about UTXO management
 
 
 
