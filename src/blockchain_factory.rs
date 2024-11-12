@@ -1,4 +1,4 @@
-use chain_gang::interface::{BlockchainInterface, TestInterface, WocInterface};
+use chain_gang::interface::{BlockchainInterface, TestInterface, UaaSInterface, WocInterface};
 
 use crate::config::Config;
 
@@ -16,6 +16,16 @@ pub fn blockchain_factory(config: &Config) -> Box<dyn BlockchainInterface + Send
             interface.set_network(&config.get_network().unwrap());
             Box::new(interface) as Box<dyn BlockchainInterface + Send + Sync>
         }
+        "uaas" => {
+            if let Some(uaas_url) = &config.blockchain_interface.url {
+                let mut interface = UaaSInterface::new(uaas_url).unwrap();
+                interface.set_network(&config.get_network().unwrap());
+                Box::new(interface) as Box<dyn BlockchainInterface + Send + Sync>
+            } else {
+                panic!("Config blockchain interface url not found.");
+            }
+        }
+
         _ => {
             panic!(
                 "Unknown interface type '{}'",

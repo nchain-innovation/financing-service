@@ -21,7 +21,6 @@ use crate::{
 #[derive(Debug, Serialize, Clone, Copy)]
 pub enum BlockchainConnectionStatus {
     /// Unknown - Starting state of the service
-    /// Unknown - Starting state of the service
     Unknown,
     /// Failed - The service has failed to connect to the blockchain
     Failed,
