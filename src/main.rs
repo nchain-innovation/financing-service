@@ -4,7 +4,6 @@ use tokio::time;
 use actix_web::{web, App, HttpServer};
 use async_mutex::Mutex;
 
-// mod blockchain_interface;
 mod blockchain_factory;
 mod client;
 mod config;
