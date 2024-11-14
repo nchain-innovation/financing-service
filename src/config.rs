@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 pub struct BlockchainInterfaceConfig {
     pub interface_type: String,
     pub network_type: String,
+    pub url: Option<String>,
 }
 
 /// Client Configuration

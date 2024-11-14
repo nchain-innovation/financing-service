@@ -349,6 +349,7 @@ mod tests {
             blockchain_interface: BlockchainInterfaceConfig {
                 interface_type: "test".to_string(),
                 network_type: "testnet".to_string(),
+                url: None,
             },
 
             client: vec![ClientConfig {

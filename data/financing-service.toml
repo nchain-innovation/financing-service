@@ -1,7 +1,8 @@
 [blockchain_interface]
 # For bsv testnet (default)
-interface_type = "woc"
+interface_type = "uaas"
 network_type = "testnet"
+url = "http://localhost:5010"
 
 [web_interface]
 address = '127.0.0.1'

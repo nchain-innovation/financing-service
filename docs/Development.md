@@ -22,6 +22,7 @@ rustup home:  /Users/a.gordon/.rustup
 installed toolchains
 --------------------
 
+stable-2022-09-22-x86_64-apple-darwin
 stable-x86_64-apple-darwin (default)
 nightly-x86_64-apple-darwin
 
@@ -35,7 +36,7 @@ active toolchain
 ----------------
 
 stable-x86_64-apple-darwin (default)
-rustc 1.68.2 (9eb3afe9e 2023-03-27)
+rustc 1.82.0 (f6e511eec 2024-10-15)
 ```
 This code was developed using rustc `1.68.2` (27/03/2023).
 

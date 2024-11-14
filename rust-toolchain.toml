@@ -1,6 +1,0 @@
-[toolchain]
-channel = "1.79.0"
-# This forces the build process to to use rustc 1.79.0
-# This because dependent crates are broken by rustc 1.80.0
-# https://internals.rust-lang.org/t/type-inference-breakage-in-1-80-has-not-been-handled-well/21374/4
-# This needs to remain in place until crates are all updated.
