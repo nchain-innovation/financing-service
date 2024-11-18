@@ -204,6 +204,8 @@ pub async fn delete_client(data: web::Data<AppState>, info: web::Path<String>) -
 #[get("/client/{client_id}/address")]
 pub async fn get_address(data: web::Data<AppState>, info: web::Path<String>) -> impl Responder {
     let client_id: String = info.to_string();
+    log::info!("get address {}", &client_id);
+
     let service = data.service.lock().await;
 
     // Check client_id
@@ -214,7 +216,7 @@ pub async fn get_address(data: web::Data<AppState>, info: web::Path<String>) -> 
             .body(response)
     } else {
         let address = service.get_address(&client_id).unwrap();
-        let response = format!("{{\"info\": {address} }}");
+        let response = format!("{{\"address\": \"{address}\"}}");
         HttpResponse::Ok()
             .content_type(ContentType::json())
             .body(response)
@@ -225,17 +227,22 @@ pub async fn get_address(data: web::Data<AppState>, info: web::Path<String>) -> 
 #[get("/client/{client_id}/balance")]
 pub async fn balance(data: web::Data<AppState>, info: web::Path<String>) -> impl Responder {
     let client_id: String = info.to_string();
+    log::info!("get balance {}", &client_id);
+
     let service = data.service.lock().await;
 
     // Check client_id
     if !service.is_client_id_valid(&client_id) {
-        let response = format!("{{\"description\": \"Unknown client_id {client_id} \"}}");
+        let response = format!("{{\"description\": \"Unknown client_id {client_id}\"}}");
         HttpResponse::UnprocessableEntity()
             .content_type(ContentType::json())
             .body(response)
     } else {
         let balance = service.get_balance(&client_id).unwrap();
-        let response = format!("{{\"balance\": {balance} }}");
+        let confirmed = balance.confirmed;
+        let unconfirmed = balance.unconfirmed;
+
+        let response = format!("{{\"confirmed\": {confirmed}, \"unconfirmed\": {unconfirmed}}}");
         HttpResponse::Ok()
             .content_type(ContentType::json())
             .body(response)

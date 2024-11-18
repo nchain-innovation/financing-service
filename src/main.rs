@@ -44,12 +44,10 @@ async fn main() -> std::io::Result<()> {
 
     let service = Service::new(&config).await;
 
-    let counter = web::Data::new(AppState {
+    let app_state = web::Data::new(AppState {
         service: Mutex::new(service),
     });
-
-    let counter2 = counter.clone();
-
+    let app_state2 = app_state.clone();
     let addr = get_addr(&config);
 
     // Setup periodic task
@@ -59,13 +57,13 @@ async fn main() -> std::io::Result<()> {
         loop {
             interval.tick().await;
             // Refresh the utxo for clients
-            update_clients(counter2.clone()).await;
+            update_clients(app_state2.clone()).await;
         }
     });
 
     HttpServer::new(move || {
         App::new()
-            .app_data(counter.clone())
+            .app_data(app_state.clone())
             .service(index)
             .service(status)
             .service(balance)

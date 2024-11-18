@@ -2,7 +2,7 @@ use serde::Serialize;
 use std::time::SystemTime;
 
 use chain_gang::{
-    interface::BlockchainInterface,
+    interface::{BlockchainInterface, Balance},
     messages::{OutPoint, Tx},
     network::Network,
 };
@@ -152,7 +152,7 @@ impl Service {
     }
 
     /// Given a client_id return the associated balance as JSON string
-    pub fn get_balance(&self, client_id: &str) -> Option<String> {
+    pub fn get_balance(&self, client_id: &str) -> Option<Balance> {
         let client = self.clients.iter().find(|x| x.client_id == client_id)?;
         Some(client.get_balance())
     }
