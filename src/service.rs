@@ -50,7 +50,7 @@ impl Service {
         blockchain_interface
             .status()
             .await
-            .expect("Unable to connect to blockchain");
+            .expect("Unable to connect to blockchain, ensure that the service is running.");
 
         if let Some(clients_config) = &config.client {
             for client_config in clients_config {
@@ -239,35 +239,35 @@ impl Service {
                     _ => {
                         if outpoints.is_empty() {
                             log::info!("Failed to broadcast funding transaction");
-                            return Err("{\"status\": \"Failure\", \"description\": \"Failed to broadcast funding transaction.\"}".to_string());
+                            return Err(
+                                "{\"description\": \"Failed to broadcast funding transaction.\"}"
+                                    .to_string(),
+                            );
                         } else {
                             let outpoints_as_str = self.outpoints_to_string(&outpoints);
                             // Provide the outpoints so far
-                            return Err(format!("{{\"status\": \"Failure\", \"description\": \"Failed to broadcast funding transaction.\",\"outpoints\": {outpoints_as_str}}}"));
+                            return Err(format!("{{\"description\": \"Failed to broadcast funding transaction.\",\"outpoints\": {outpoints_as_str}}}"));
                         }
                     }
                 }
             }
             // Provide all the outpoints
             let outpoints_as_str = self.outpoints_to_string(&outpoints);
-            Ok(format!(
-                "{{\"status\": \"Success\", \"outpoints\": {outpoints_as_str}}}"
-            ))
+            Ok(format!("{{\"outpoints\": {outpoints_as_str}}}"))
         } else {
             // Create one tx
             let b_tx: Tx = client.create_funding_tx(fund_request).unwrap();
             // broadcast tx
             let tx_as_str = tx_as_hexstr(&b_tx);
-            log::info!("tx_as_str = {}", &tx_as_str);
             match self.blockchain_interface.broadcast_tx(&b_tx).await {
                 Ok(hash)//if result.status() == 200u16 => {
                     => {
                     let outpoints = self.get_outpoints(&hash, fund_request.no_of_outpoints);
-                    Ok(format!("{{\"status\": \"Success\", \"outpoints\": {outpoints}, \"tx\": \"{tx_as_str}\"}}"))
+                    Ok(format!("{{\"outpoints\": {outpoints}, \"tx\": \"{tx_as_str}\"}}"))
                 },
                 _ => {
                     log::info!("Failed to broadcast funding transaction");
-                    Err("{\"status\": \"Failure\", \"description\": \"Failed to broadcast funding transaction.\"}".to_string())
+                    Err("{\"description\": \"Failed to broadcast funding transaction.\"}".to_string())
                 },
             }
         }
