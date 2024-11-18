@@ -96,17 +96,12 @@ impl Client {
     }
 
     /// Return balance as JSON string
-    pub fn get_balance(&self) -> String {
-        let client_id = self.client_id.clone();
-        let confirmed = self.balance.confirmed;
-        let unconfirmed = self.balance.unconfirmed;
-        format!("{{\"client_id\": \"{client_id}\", \"confirmed\":{confirmed}, \"unconfirmed\": {unconfirmed}}}")
+    pub fn get_balance(&self) -> Balance {
+        self.balance
     }
 
     pub fn get_address(&self) -> String {
-        let client_id = self.client_id.clone();
-        let address = self.address.to_string();
-        format!("{{\"client_id\": \"{client_id}\", \"address\": \"{address}\"}}")
+        self.address.to_string()
     }
 
     /// Return the value of the largest unspent UTXO

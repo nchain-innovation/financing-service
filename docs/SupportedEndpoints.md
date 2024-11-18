@@ -61,12 +61,8 @@ Get Address for a particular client_id.
 curl http://127.0.0.1:8080/client/client1/address
 
 {
-    "status": "Success", 
-    "info": {
-        "client_id": "client1", 
-        "address": "mfxjfLTXLUcCxMDojqRejpfKnF9WhRG5BK"
-    } 
-}
+    "address": "mfxjfLTXLUcCxMDojqRejpfKnF9WhRG5BK" 
+}   
 ```
 
 
@@ -77,12 +73,8 @@ This returns the current satoshi balance associated with this `client_id`.
 ```JSON
 curl http://127.0.0.1:8082/client/client1/balance      
 {   
-    "status": "Success", 
-    "Balance": {
-        "client_id": "client1", 
-        "confirmed":0, 
-        "unconfirmed": 0
-    } 
+    "confirmed": 99904,
+    "unconfirmed": 95162
 }
 ```
 
