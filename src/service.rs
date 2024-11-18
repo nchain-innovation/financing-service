@@ -2,9 +2,10 @@ use serde::Serialize;
 use std::time::SystemTime;
 
 use chain_gang::{
-    interface::{BlockchainInterface, Balance},
+    interface::{Balance, BlockchainInterface},
     messages::{OutPoint, Tx},
     network::Network,
+    util::Hash256,
 };
 use chrono::prelude::DateTime;
 use chrono::Utc;
@@ -26,6 +27,55 @@ pub enum BlockchainConnectionStatus {
     Failed,
     /// Connected - The service has connected to the blockchain
     Connected,
+}
+
+#[derive(Clone, Default)]
+pub struct FundingResponse {
+    pub outpoints: Vec<OutPoint>,
+    pub txs: Vec<Tx>,
+}
+
+impl FundingResponse {
+    /// Given outpoints return them as a string
+    fn outpoints_to_json(&self) -> String {
+        let mut retval: String = "[".to_string();
+
+        for (i, op) in self.outpoints.iter().enumerate() {
+            retval += format!(
+                "{{\"hash\": \"{}\", \"index\": {}}}",
+                op.hash.encode(),
+                op.index
+            )
+            .as_str();
+            if i + 1 != self.outpoints.len() {
+                retval += ",";
+            }
+        }
+        retval += "]";
+        retval
+    }
+
+    fn txs_to_json(&self) -> String {
+        //                 let tx_as_str = tx_as_hexstr(&a_tx);
+        let mut retval: String = "[".to_string();
+
+        for (i, tx) in self.txs.iter().enumerate() {
+            retval += format!("{{\"tx\": \"{}\"}}", tx_as_hexstr(tx)).as_str();
+            if i + 1 != self.txs.len() {
+                retval += ",";
+            }
+        }
+        retval += "]";
+        retval
+    }
+
+    pub fn to_json(&self) -> String {
+        format!(
+            "{{\"outpoints\":  {}, \"txs\": {}}}",
+            self.outpoints_to_json(),
+            self.txs_to_json()
+        )
+    }
 }
 
 /// Service data
@@ -172,103 +222,75 @@ impl Service {
     }
 
     /// Given txid and no_of_outpoints return the outpoints as JSON string
-    fn get_outpoints(&self, hash: &str, no_of_outpoints: u32) -> String {
-        let mut retval: String = "[".to_string();
-
-        for i in 1..no_of_outpoints + 1 {
-            retval += format!("{{\"hash\": \"{hash}\", \"index\": {i}}}").as_str();
-            if i != no_of_outpoints {
-                retval += ",";
-            }
-        }
-        retval += "]";
-        retval
-    }
-
-    /// Given outpoints return them as a string
-    /// Given outpoints return them as a string
-    fn outpoints_to_string(&self, outpoints: &[OutPoint]) -> String {
-        let mut retval: String = "[".to_string();
-
-        for (i, op) in outpoints.iter().enumerate() {
-            retval += format!(
-                "{{\"hash\": \"{}\", \"index\": {}}}",
-                op.hash.encode(),
-                op.index
-            )
-            .as_str();
-            if i != outpoints.len() {
-                retval += ",";
-            }
-        }
-        retval += "]";
-        retval
+    fn get_outpoints(&self, hash: Hash256, no_of_outpoints: u32) -> Vec<OutPoint> {
+        (1..no_of_outpoints + 1)
+            .map(|index| OutPoint { hash, index })
+            .collect()
     }
 
     /// Create funding outpoints based on the provided arguments
     pub async fn create_funding_outpoints(
         &mut self,
         fund_request: &FundRequest,
-    ) -> Result<String, String> {
+    ) -> Result<FundingResponse, String> {
         let client: &mut Client = self
             .clients
             .iter_mut()
             .find(|x| x.client_id == fund_request.client_id)
             .unwrap();
 
+        let mut response = FundingResponse::default();
         // Check balance
         if fund_request.no_of_outpoints > 1 && fund_request.multiple_tx {
             // Create multiple tx
-            let txs: Vec<Tx> = client.create_multiple_funding_txs(fund_request);
-            let mut outpoints: Vec<OutPoint> = Vec::new();
+            response.txs = client.create_multiple_funding_txs(fund_request);
+
             // broadcast multiple txs
-            for a_tx in txs {
+            for a_tx in &response.txs {
                 // broadcast tx
-                let tx_as_str = tx_as_hexstr(&a_tx);
+                let tx_as_str = tx_as_hexstr(a_tx);
                 log::info!("tx_as_str = {}", &tx_as_str);
 
-                match self.blockchain_interface.broadcast_tx(&a_tx).await {
+                match self.blockchain_interface.broadcast_tx(a_tx).await {
                     Ok(_hash) => {
                         // Append to the list
                         // Note the provided hash is a str whereas OutPoint wants a Hash256
-                        outpoints.push(OutPoint {
+                        response.outpoints.push(OutPoint {
                             hash: a_tx.hash(),
                             index: 1,
                         });
                     }
                     _ => {
-                        if outpoints.is_empty() {
-                            log::info!("Failed to broadcast funding transaction");
-                            return Err(
-                                "{\"description\": \"Failed to broadcast funding transaction.\"}"
-                                    .to_string(),
-                            );
-                        } else {
-                            let outpoints_as_str = self.outpoints_to_string(&outpoints);
-                            // Provide the outpoints so far
-                            return Err(format!("{{\"description\": \"Failed to broadcast funding transaction.\",\"outpoints\": {outpoints_as_str}}}"));
-                        }
+                        log::info!("Failed to broadcast funding transaction");
+                        return Err(
+                            "{\"description\": \"Failed to broadcast funding transaction.\"}"
+                                .to_string(),
+                        );
                     }
                 }
             }
             // Provide all the outpoints
-            let outpoints_as_str = self.outpoints_to_string(&outpoints);
-            Ok(format!("{{\"outpoints\": {outpoints_as_str}}}"))
+            Ok(response)
         } else {
             // Create one tx
             let b_tx: Tx = client.create_funding_tx(fund_request).unwrap();
             // broadcast tx
-            let tx_as_str = tx_as_hexstr(&b_tx);
+            //let tx_as_str = tx_as_hexstr(&b_tx);
+            response.txs.push(b_tx.clone());
+
             match self.blockchain_interface.broadcast_tx(&b_tx).await {
-                Ok(hash)//if result.status() == 200u16 => {
-                    => {
-                    let outpoints = self.get_outpoints(&hash, fund_request.no_of_outpoints);
-                    Ok(format!("{{\"outpoints\": {outpoints}, \"tx\": \"{tx_as_str}\"}}"))
-                },
+                Ok(_hash) => {
+                    let hash = b_tx.hash();
+                    response.outpoints = self.get_outpoints(hash, fund_request.no_of_outpoints);
+                    Ok(response)
+                }
                 _ => {
                     log::info!("Failed to broadcast funding transaction");
-                    Err("{\"description\": \"Failed to broadcast funding transaction.\"}".to_string())
-                },
+                    Err(
+                        "{\"description\": \"Failed to broadcast funding transaction.\"}"
+                            .to_string(),
+                    )
+                }
             }
         }
     }
