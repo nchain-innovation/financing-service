@@ -15,7 +15,7 @@ curl http://127.0.0.1:8080/status
 
 
 ## Fund Transactions
-`/fund/{client_id}/{satoshi}/{no_of_outpoints}/{multiple_tx}/{locking_script}`
+`/fund`
 Returns one or more funding transactions based on the request, where the parameters are 
 * `client_id` - the client id from which these funds will come
 * `satoshi` - the value in satoshi to be funded
@@ -23,10 +23,12 @@ Returns one or more funding transactions based on the request, where the paramet
 * `multiple_tx` - whether if there are more than one outpoint they should be in separate txs (true|false)
 * `locking_script` - the locking script to be associated with these outpoints
 ```JSON
-curl -X POST http://127.0.0.1:8080/fund/id1/123/1/false/0000
 
+curl -H "Content-Type: application/json" \
+     --request POST \
+     --data '{"client_id":"client1","satoshi":123,"no_of_outpoints":1,"multiple_tx":false,"locking_script":"000000"}' \
+    http://127.0.0.1:8080/fund
 {
-    "status": "Success", 
     "outpoints": [{
         "hash": "24ecfdb46cc82fdbc708db3995572eb9fc920863c80856f39bcbf03ba0257fb6", 
         "index": 1}], 
