@@ -83,7 +83,6 @@ pub async fn get_funds(
             .content_type(ContentType::json())
             .body(response);
     }
-
     if no_of_outpoints == 0 {
         let response =
             format!("{{\"description\": \"Invalid no_of_outpoints value '{no_of_outpoints}'}}");
@@ -125,13 +124,14 @@ pub async fn get_funds(
             .body(response);
     } else {
         match service.create_funding_outpoints(&fund_request).await {
-            Ok(outpoints) => {
-                debug!("outpoints = {:?}", &outpoints);
-                HttpResponse::Ok().body(outpoints)
-            }
-            Err(outpoints) => {
-                debug!("outpoints = {:?}", &outpoints);
-                HttpResponse::UnprocessableEntity().body(outpoints)
+            Ok(funding_response) => HttpResponse::Ok()
+                .content_type(ContentType::json())
+                .body(funding_response.to_json()),
+            Err(err_str) => {
+                debug!("err_str = {:?}", &err_str);
+                HttpResponse::UnprocessableEntity()
+                .content_type(ContentType::json())
+                .body(err_str)
             }
         }
     }
