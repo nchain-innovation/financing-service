@@ -1,8 +1,9 @@
-use crate::service::Service;
 use actix_web::{delete, get, http::header::ContentType, post, web, HttpResponse, Responder};
 use async_mutex::Mutex;
 use log::{debug, info};
 use serde::Deserialize;
+
+use crate::{client::FundRequest, service::Service};
 
 /// Application State Data
 pub struct AppState {
@@ -39,14 +40,14 @@ pub struct FundingInfo {
     client_id: String,
     satoshi: u64,
     no_of_outpoints: u32,
-    mutliple_tx: bool,
+    multiple_tx: bool,
     locking_script: String,
 }
 
 /// Post Fund endpoint
 /// Example:
 ///     curl -X POST http://127.0.0.1:8080/fund/id1/123/1/false/0000
-#[post("/fund/{client_id}/{satoshi}/{no_of_outpoints}/{mutliple_tx}/{locking_script}")]
+#[post("/fund/{client_id}/{satoshi}/{no_of_outpoints}/{multiple_tx}/{locking_script}")]
 pub async fn get_funds(data: web::Data<AppState>, info: web::Path<FundingInfo>) -> impl Responder {
     log::info!("get_funds");
 
@@ -56,7 +57,7 @@ pub async fn get_funds(data: web::Data<AppState>, info: web::Path<FundingInfo>) 
     let client_id = &info.client_id;
     let satoshi = info.satoshi;
     let no_of_outpoints = info.no_of_outpoints;
-    let mutliple_tx = info.mutliple_tx;
+    let multiple_tx = info.multiple_tx;
     let locking_script = &info.locking_script;
 
     info!("get_funds!");
@@ -66,7 +67,7 @@ pub async fn get_funds(data: web::Data<AppState>, info: web::Path<FundingInfo>) 
         let response = format!(
             "{{\"status\": \"Failure\", \"description\": \"Unknown client_id {client_id}\"}}"
         );
-        return HttpResponse::Ok()
+        return HttpResponse::UnprocessableEntity()
             .content_type(ContentType::json())
             .body(response);
     }
@@ -74,14 +75,14 @@ pub async fn get_funds(data: web::Data<AppState>, info: web::Path<FundingInfo>) 
         let response = format!(
             "{{\"status\": \"Failure\", \"description\": \"Invalid satoshi value '{satoshi}'\"}}"
         );
-        return HttpResponse::Ok()
+        return HttpResponse::UnprocessableEntity()
             .content_type(ContentType::json())
             .body(response);
     }
 
     if no_of_outpoints == 0 {
         let response = format!("{{\"status\": \"Failure\", \"description\": \"Invalid no_of_outpoints value '{no_of_outpoints}'}}");
-        return HttpResponse::Ok()
+        return HttpResponse::UnprocessableEntity()
             .content_type(ContentType::json())
             .body(response);
     }
@@ -89,7 +90,7 @@ pub async fn get_funds(data: web::Data<AppState>, info: web::Path<FundingInfo>) 
     let decode_locking_script = hex::decode(locking_script);
     if decode_locking_script.is_err() {
         let response = format!("{{\"status\": \"Failure\", \"description\": \"Unable to convert locking_script to bytes '{locking_script}'\"}}");
-        return HttpResponse::Ok()
+        return HttpResponse::UnprocessableEntity()
             .content_type(ContentType::json())
             .body(response);
     }
@@ -97,31 +98,33 @@ pub async fn get_funds(data: web::Data<AppState>, info: web::Path<FundingInfo>) 
     let locking_script_as_bytes = decode_locking_script.unwrap();
     debug!("locking_script_as_bytes = {:?}", &locking_script_as_bytes);
 
-    let has_sufficent = service.has_sufficent_balance(
-        client_id,
+    let fund_request = FundRequest {
+        client_id: client_id.to_string(),
         satoshi,
         no_of_outpoints,
-        mutliple_tx,
-        &locking_script_as_bytes,
-    );
+        multiple_tx,
+        locking_script: locking_script_as_bytes,
+    };
+
+    let has_sufficent = service.has_sufficent_balance(&fund_request);
 
     if has_sufficent.is_none() || !has_sufficent.unwrap() {
-        let response = "{{\"status\": \"Failure\", \"description\": \"Insufficent client balance to create funding transactions.\"}}".to_string();
-        return HttpResponse::Ok()
+        log::info!("insufficient funds!");
+        let response = "{\"status\": \"Failure\", \"description\": \"Insufficent client balance to create funding transactions.\"}".to_string();
+        return HttpResponse::UnprocessableEntity()
             .content_type(ContentType::json())
             .body(response);
     } else {
-        let outpoints = service
-            .create_funding_outpoints(
-                client_id,
-                satoshi,
-                no_of_outpoints,
-                mutliple_tx,
-                &locking_script_as_bytes,
-            )
-            .await;
-        debug!("outpoints = {:?}", &outpoints);
-        HttpResponse::Ok().body(outpoints)
+        match service.create_funding_outpoints(&fund_request).await {
+            Ok(outpoints) => {
+                debug!("outpoints = {:?}", &outpoints);
+                HttpResponse::Ok().body(outpoints)
+            }
+            Err(outpoints) => {
+                debug!("outpoints = {:?}", &outpoints);
+                HttpResponse::UnprocessableEntity().body(outpoints)
+            }
+        }
     }
 }
 
