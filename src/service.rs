@@ -11,7 +11,7 @@ use chrono::Utc;
 
 use crate::{
     blockchain_factory::blockchain_factory,
-    client::Client,
+    client::{Client, FundRequest},
     config::{ClientConfig, Config},
     dynamic_config::DynamicConfig,
     util::tx_as_hexstr,
@@ -118,7 +118,7 @@ impl Service {
         self.blockchain_status = match self.blockchain_interface.get_block_headers().await {
             Ok(_) => BlockchainConnectionStatus::Connected,
             Err(e) => {
-                log::warn!("update_balance - failed {:?}", e);
+                log::warn!("get_block_headers - failed {:?}", e);
                 BlockchainConnectionStatus::Failed
             }
         };
@@ -163,16 +163,12 @@ impl Service {
     }
 
     /// Return true if the client has sufficient balance for this transaction
-    pub fn has_sufficent_balance(
-        &self,
-        client_id: &str,
-        satoshi: u64,
-        no_of_outpoints: u32,
-        multiple_tx: bool,
-        locking_script: &[u8],
-    ) -> Option<bool> {
-        let client = self.clients.iter().find(|x| x.client_id == client_id)?;
-        client.has_sufficent_balance(satoshi, no_of_outpoints, multiple_tx, locking_script)
+    pub fn has_sufficent_balance(&self, fund_request: &FundRequest) -> Option<bool> {
+        let client = self
+            .clients
+            .iter()
+            .find(|x| x.client_id == fund_request.client_id)?;
+        client.has_sufficent_balance(fund_request)
     }
 
     /// Given txid and no_of_outpoints return the outpoints as JSON string
@@ -212,23 +208,18 @@ impl Service {
     /// Create funding outpoints based on the provided arguments
     pub async fn create_funding_outpoints(
         &mut self,
-        client_id: &str,
-        satoshi: u64,
-        no_of_outpoints: u32,
-        multiple_tx: bool,
-        locking_script: &[u8],
-    ) -> String {
+        fund_request: &FundRequest,
+    ) -> Result<String, String> {
         let client: &mut Client = self
             .clients
             .iter_mut()
-            .find(|x| x.client_id == client_id)
+            .find(|x| x.client_id == fund_request.client_id)
             .unwrap();
 
         // Check balance
-        if no_of_outpoints > 1 && multiple_tx {
+        if fund_request.no_of_outpoints > 1 && fund_request.multiple_tx {
             // Create multiple tx
-            let txs: Vec<Tx> =
-                client.create_multiple_funding_txs(satoshi, no_of_outpoints, locking_script);
+            let txs: Vec<Tx> = client.create_multiple_funding_txs(fund_request);
             let mut outpoints: Vec<OutPoint> = Vec::new();
             // broadcast multiple txs
             for a_tx in txs {
@@ -247,34 +238,36 @@ impl Service {
                     }
                     _ => {
                         if outpoints.is_empty() {
-                            return "{{\"status\": \"Failure\", \"description\": \"Failed to broadcast funding transaction.\"}}".to_string();
+                            log::info!("Failed to broadcast funding transaction");
+                            return Err("{\"status\": \"Failure\", \"description\": \"Failed to broadcast funding transaction.\"}".to_string());
                         } else {
                             let outpoints_as_str = self.outpoints_to_string(&outpoints);
                             // Provide the outpoints so far
-                            return format!("{{\"status\": \"Failure\", \"description\": \"Failed to broadcast funding transaction.\",\"outpoints\": {outpoints_as_str}}}");
+                            return Err(format!("{{\"status\": \"Failure\", \"description\": \"Failed to broadcast funding transaction.\",\"outpoints\": {outpoints_as_str}}}"));
                         }
                     }
                 }
             }
             // Provide all the outpoints
             let outpoints_as_str = self.outpoints_to_string(&outpoints);
-            format!("{{\"status\": \"Success\", \"outpoints\": {outpoints_as_str}}}")
+            Ok(format!(
+                "{{\"status\": \"Success\", \"outpoints\": {outpoints_as_str}}}"
+            ))
         } else {
             // Create one tx
-            let b_tx: Tx = client
-                .create_funding_tx(satoshi, no_of_outpoints, locking_script)
-                .unwrap();
+            let b_tx: Tx = client.create_funding_tx(fund_request).unwrap();
             // broadcast tx
             let tx_as_str = tx_as_hexstr(&b_tx);
             log::info!("tx_as_str = {}", &tx_as_str);
             match self.blockchain_interface.broadcast_tx(&b_tx).await {
                 Ok(hash)//if result.status() == 200u16 => {
                     => {
-                    let outpoints = self.get_outpoints(&hash, no_of_outpoints);
-                    format!("{{\"status\": \"Success\", \"outpoints\": {outpoints}, \"tx\": \"{tx_as_str}\"}}")
+                    let outpoints = self.get_outpoints(&hash, fund_request.no_of_outpoints);
+                    Ok(format!("{{\"status\": \"Success\", \"outpoints\": {outpoints}, \"tx\": \"{tx_as_str}\"}}"))
                 },
                 _ => {
-                    "{{\"status\": \"Failure\", \"description\": \"Failed to broadcast funding transaction.\"}}".to_string()
+                    log::info!("Failed to broadcast funding transaction");
+                    Err("{\"status\": \"Failure\", \"description\": \"Failed to broadcast funding transaction.\"}".to_string())
                 },
             }
         }
