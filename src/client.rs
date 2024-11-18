@@ -26,6 +26,14 @@ pub fn as_bitcoin_network(network: &SvNetwork) -> bitcoin::Network {
     }
 }
 
+pub struct FundRequest {
+    pub client_id: String,
+    pub satoshi: u64,
+    pub no_of_outpoints: u32,
+    pub multiple_tx: bool,
+    pub locking_script: Vec<u8>,
+}
+
 /// Represents a Client of the service
 #[derive(Debug, Clone)]
 pub struct Client {
@@ -88,17 +96,12 @@ impl Client {
     }
 
     /// Return balance as JSON string
-    pub fn get_balance(&self) -> String {
-        let client_id = self.client_id.clone();
-        let confirmed = self.balance.confirmed;
-        let unconfirmed = self.balance.unconfirmed;
-        format!("{{\"client_id\": \"{client_id}\", \"confirmed\":{confirmed}, \"unconfirmed\": {unconfirmed}}}")
+    pub fn get_balance(&self) -> Balance {
+        self.balance
     }
 
     pub fn get_address(&self) -> String {
-        let client_id = self.client_id.clone();
-        let address = self.address.to_string();
-        format!("{{\"client_id\": \"{client_id}\", \"address\": \"{address}\"}}")
+        self.address.to_string()
     }
 
     /// Return the value of the largest unspent UTXO
@@ -115,39 +118,32 @@ impl Client {
     }
 
     /// Given the tx inputs, determine if there is a suitable Utxo for a funding tx
-    pub fn has_sufficent_balance(
-        &self,
-        satoshi: u64,
-        no_of_outpoints: u32,
-        multiple_tx: bool,
-        locking_script: &[u8],
-    ) -> Option<bool> {
+    pub fn has_sufficent_balance(&self, fund_request: &FundRequest) -> Option<bool> {
         let largest_unspent = self.get_largest_unspent()?;
-        let locking_script_len: u64 = locking_script.len() as u64;
-        let total_cost: u64 = if no_of_outpoints > 1 && multiple_tx {
+        let locking_script_len: u64 = fund_request.locking_script.len() as u64;
+
+        let total_cost: u64 = if fund_request.no_of_outpoints > 1 && fund_request.multiple_tx {
             let fee_estimate: u64 = ((locking_script_len / 1000) * 500) + 750;
-            (satoshi * no_of_outpoints as u64) + (fee_estimate * no_of_outpoints as u64)
+            (fund_request.satoshi * fund_request.no_of_outpoints as u64)
+                + (fee_estimate * fund_request.no_of_outpoints as u64)
         } else {
             // One tx
-            let fee_estimate = (((locking_script_len * no_of_outpoints as u64) / 1000) * 500) + 750;
-            (satoshi * no_of_outpoints as u64) + fee_estimate
+            let fee_estimate =
+                (((locking_script_len * fund_request.no_of_outpoints as u64) / 1000) * 500) + 750;
+            (fund_request.satoshi * fund_request.no_of_outpoints as u64) + fee_estimate
         };
 
         Some(total_cost < largest_unspent.try_into().unwrap())
     }
 
     /// Create one funding transaction
-    pub fn create_funding_tx(
-        &mut self,
-        satoshi: u64,
-        no_of_outpoints: u32,
-        locking_script: &[u8],
-    ) -> Option<Tx> {
+    pub fn create_funding_tx(&mut self, fund_request: &FundRequest) -> Option<Tx> {
         // Calculate fee...
-        let locking_script_len: u64 = locking_script.len() as u64;
+        let locking_script_len: u64 = fund_request.locking_script.len() as u64;
         let fee_estimate: u64 =
-            (((locking_script_len * no_of_outpoints as u64) / 1000) * 500) + 750;
-        let total_cost: u64 = (satoshi * no_of_outpoints as u64) + fee_estimate;
+            (((locking_script_len * fund_request.no_of_outpoints as u64) / 1000) * 500) + 750;
+        let total_cost: u64 =
+            (fund_request.satoshi * fund_request.no_of_outpoints as u64) + fee_estimate;
         // Create a locking script for change
         let change_script = create_lock_script(&self.funding_address);
         // Find smallest funding unspent that is big enough for tx
@@ -172,13 +168,13 @@ impl Client {
 
         // Append the provided script
         let mut script_pubkey: Script = Script::new();
-        script_pubkey.append_slice(locking_script);
+        script_pubkey.append_slice(&fund_request.locking_script);
 
         let txout = TxOut {
-            satoshis: satoshi as i64,
+            satoshis: fund_request.satoshi as i64,
             lock_script: script_pubkey,
         };
-        for _ in 0..no_of_outpoints {
+        for _ in 0..fund_request.no_of_outpoints {
             vouts.push(txout.clone());
         }
 
@@ -233,15 +229,10 @@ impl Client {
     }
 
     /// Create no_of_outpoints funding txs each with one outpoint
-    pub fn create_multiple_funding_txs(
-        &mut self,
-        satoshi: u64,
-        no_of_outpoints: u32,
-        locking_script: &[u8],
-    ) -> Vec<Tx> {
+    pub fn create_multiple_funding_txs(&mut self, fund_request: &FundRequest) -> Vec<Tx> {
         let mut txs: Vec<Tx> = Vec::new();
-        for _i in 0..no_of_outpoints {
-            match self.create_funding_tx(satoshi, 1, locking_script) {
+        for _i in 0..fund_request.no_of_outpoints {
+            match self.create_funding_tx(fund_request) {
                 Some(tx) => txs.push(tx),
                 None => {
                     print!("create_funding_tx failed");
@@ -372,7 +363,15 @@ mod tests {
 
         let locking_script =
             hex::decode("76a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac").unwrap();
-        let tx = client.create_funding_tx(123, 1, &locking_script).unwrap();
+
+        let fund_request = FundRequest {
+            client_id: "client1".to_string(),
+            satoshi: 123,
+            no_of_outpoints: 1,
+            multiple_tx: false,
+            locking_script: locking_script,
+        };
+        let tx = client.create_funding_tx(&fund_request).unwrap();
 
         debug!("tx = {:?}", &tx);
         assert_eq!(tx_as_hexstr(&tx), "0100000001786563262f7e951eea3d9db3e4997daeba748ffa99219e298401dfe99d1033e5000000006b483045022100c7a22fbf24470b2c96b82ce1bfd5896f515e3f0f509f307e94f699baefe0f8c3022044ddbb29952769c67ba117762ee628d299846039a6d90bc59618c770b226bfc2412103a8ae071ddd8690b94755c7112ca304bcac45c15904cc013f0ad6c2ea0b1019b2ffffffff02c7ec9100000000001976a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac7b000000000000001976a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac00000000");
