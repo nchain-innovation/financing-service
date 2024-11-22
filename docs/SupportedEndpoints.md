@@ -37,10 +37,17 @@ curl -H "Content-Type: application/json" \
 ```
 
 ## Add Client
-`/client/{client_id}/{wif}`
+`/client`
+
 Add a dynamic client.
+
 ```JSON
-curl -X POST http://127.0.0.1:8080/client/client1/cVLcPuZMfnNNca....PUZ4LtnC3MjoLh3piTnX9WCndRqWh
+
+curl -H "Content-Type: application/json" \
+     --request POST \
+     --data '{"client_id":"client15","wif":"cVLcPuZMfnNNcaU...................oLh3piTnX9WCndRqWh"}' \
+    http://127.0.0.1:8080/client
+
 {"status": "Success"}
 ```
 
@@ -49,7 +56,9 @@ curl -X POST http://127.0.0.1:8080/client/client1/cVLcPuZMfnNNca....PUZ4LtnC3Mjo
 Delete a dynamic client.
 
 ```JSON
-///     curl -X DELETE http://127.0.0.1:8080/client/client1
+curl -X DELETE http://127.0.0.1:8080/client/client1
+
+{"status": "Success"}
 ```
 
 ## Get Address
