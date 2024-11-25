@@ -130,40 +130,47 @@ pub async fn get_funds(
             Err(err_str) => {
                 debug!("err_str = {:?}", &err_str);
                 HttpResponse::UnprocessableEntity()
-                .content_type(ContentType::json())
-                .body(err_str)
+                    .content_type(ContentType::json())
+                    .body(err_str)
             }
         }
     }
 }
 
 #[derive(Deserialize, Debug)]
-pub struct ClientInfo {
+pub struct ClienAddRequest {
     client_id: String,
     wif: String,
 }
 
 /// Add client
 /// Example:
-///     curl -X POST http://127.0.0.1:8080/client/client_1/
-#[post("/client/{client_id}/{wif}")]
-pub async fn add_client(data: web::Data<AppState>, info: web::Path<ClientInfo>) -> impl Responder {
+///     curl -H "Content-Type: application/json" \
+///     --request POST \
+///     --data '{"client_id":"client15","wif":"cVL...............qWh"}' \
+///   http://127.0.0.1:8082/client
+
+{"status": "Success"}
+#[post("/client")]
+pub async fn add_client(
+    data: web::Data<AppState>,
+    info: web::Json<ClienAddRequest>,
+) -> impl Responder {
     let mut service = data.service.lock().await;
     // These local vars are required as the format! strings don't accept '.` in `{}`
     let client_id = &info.client_id;
     log::info!("add_client {}", &client_id);
 
-    let wif = &info.wif;
     // check to see if client_id already exists
     if service.is_client_id_valid(client_id) {
-        //return error we already have this client
+        // Return error we already have this client
         let response = format!("{{\"description\": \"Unknown client_id {client_id}\"}}");
         HttpResponse::UnprocessableEntity()
             .content_type(ContentType::json())
             .body(response)
     } else {
         // if not add it
-        service.add_client(client_id, wif);
+        service.add_client(client_id, &info.wif);
 
         let response: String = "{\"status\": \"Success\"}".to_string();
         HttpResponse::Ok()
