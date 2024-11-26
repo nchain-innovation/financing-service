@@ -149,8 +149,7 @@ pub struct ClienAddRequest {
 ///     --request POST \
 ///     --data '{"client_id":"client15","wif":"cVL...............qWh"}' \
 ///   http://127.0.0.1:8082/client
-
-{"status": "Success"}
+/// {"status": "Success"}
 #[post("/client")]
 pub async fn add_client(
     data: web::Data<AppState>,
