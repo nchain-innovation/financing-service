@@ -1,5 +1,4 @@
 [blockchain_interface]
-# For bsv testnet (default)
 interface_type = "uaas"
 network_type = "testnet"
 url = "http://localhost:5010"
@@ -10,6 +9,9 @@ port = 8082
 
 [logging]
 level = "info"
+
+[service]
+utxo_refresh_period = 60
 
 [dynamic_config]
 filename = "./data/dynamic.toml"

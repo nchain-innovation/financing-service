@@ -34,8 +34,20 @@ The logging level can be one of:
 * `"trace"` - Designates very low priority, often extremely verbose, information.
 
 
+## [service]
+
+This configures the period between requests for the latest UTXO from the blockchain. 
+
+In this case it is set to refresh every 60 seconds.
+```TOML
+[service]
+utxo_refresh_period = 60
+```
+
 ## [[client]]
 Configures each of the clients that the service supports.
+
+Note that these can also be configured using the dynamic config.
 
 ```TOML
 [[client]]

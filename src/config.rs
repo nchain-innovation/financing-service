@@ -25,6 +25,12 @@ pub struct LoggingConfig {
 }
 
 #[derive(Debug, Default, Deserialize, Clone)]
+pub struct ServiceConfig {
+    pub utxo_refresh_period: u64,
+}
+
+
+#[derive(Debug, Default, Deserialize, Clone)]
 pub struct DynamicConfigConfig {
     pub filename: String,
 }
@@ -51,6 +57,7 @@ pub struct Config {
     pub blockchain_interface: BlockchainInterfaceConfig,
     pub web_interface: WebInterfaceConfig,
     pub logging: LoggingConfig,
+    pub service: ServiceConfig,
     pub client: Option<Vec<ClientConfig>>,
     pub dynamic_config: DynamicConfigConfig,
 }
