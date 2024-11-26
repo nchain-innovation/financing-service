@@ -4,7 +4,6 @@ use std::time::SystemTime;
 use chain_gang::{
     interface::{Balance, BlockchainInterface},
     messages::{OutPoint, Tx},
-    network::Network,
     util::Hash256,
 };
 use chrono::prelude::DateTime;
@@ -85,7 +84,6 @@ pub struct Service {
     blockchain_update_time: Option<SystemTime>,
     blockchain_interface: Box<dyn BlockchainInterface>,
     clients: Vec<Client>,
-    network: Network,
     dynamic_config: DynamicConfig,
 }
 
@@ -93,7 +91,6 @@ impl Service {
     /// Create a new Service from the provided config
     pub async fn new(config: &Config) -> Service {
         let mut clients: Vec<Client> = Vec::new();
-        let network = config.get_network().unwrap();
         let blockchain_interface = blockchain_factory(config);
 
         // Check we can connect to blockchain
@@ -104,7 +101,7 @@ impl Service {
 
         if let Some(clients_config) = &config.client {
             for client_config in clients_config {
-                let new_client = Client::new(client_config, network);
+                let new_client = Client::new(client_config);
                 clients.push(new_client);
             }
         }
@@ -112,7 +109,7 @@ impl Service {
         // Add the dynamic clients
         let dynamic_config = DynamicConfig::new(config);
         for client_config in &dynamic_config.contents.clients {
-            let new_client = Client::new(client_config, network);
+            let new_client = Client::new(client_config);
             clients.push(new_client);
         }
 
@@ -121,7 +118,6 @@ impl Service {
             blockchain_update_time: None,
             blockchain_interface,
             clients,
-            network,
             dynamic_config,
         };
         service.update_balances().await;
@@ -133,7 +129,7 @@ impl Service {
             client_id: client_id.to_string(),
             wif_key: wif.to_string(),
         };
-        let new_client = Client::new(&client_config, self.network);
+        let new_client = Client::new(&client_config);
         self.clients.push(new_client);
         // save dynamic info
         self.dynamic_config.add(&client_config);
