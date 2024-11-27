@@ -51,9 +51,10 @@ async fn main() -> std::io::Result<()> {
     let addr = get_addr(&config);
 
     // Setup periodic task
+    let utxo_refresh_period = config.service.utxo_refresh_period;
     tokio::spawn(async move {
         // Every minute
-        let mut interval = time::interval(Duration::from_secs(60));
+        let mut interval = time::interval(Duration::from_secs(utxo_refresh_period));
         loop {
             interval.tick().await;
             // Refresh the utxo for clients
