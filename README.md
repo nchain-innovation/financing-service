@@ -20,7 +20,7 @@ The FS is designed to be as simple as possible, in that light it:
 * FS only accesses the funding key required to sign the transaction that provides the funds the client wishes to spend.
 * FS does not access the client's key, instead the client provides the locking script (script_pubkey).
 
-* FS (currently) uses WhatsOnChain interface to access the blockchain.
+* FS uses WhatsOnChain or UTXO as a Service (UaaS) interfaces to access the blockchain.
 * FS is stateless, that is to say it determines its state by reading the blockchain, it stores no state.
 * FS is configurable, it reads its configuration on startup.
 

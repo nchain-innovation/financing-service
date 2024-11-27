@@ -1,30 +1,21 @@
-use bitcoin::{secp256k1::Secp256k1, util::key::PrivateKey, Address, PublicKey};
+// use bitcoin::{secp256k1::Secp256k1, util::key::PrivateKey, Address, PublicKey};
+// use k256::ecdsa::{SigningKey, VerifyingKey};
 
 use chain_gang::{
-    address::addr_decode,
     interface::{Balance, BlockchainInterface, Utxo, UtxoEntry},
     messages::{OutPoint, Tx, TxIn, TxOut},
-    network::Network as SvNetwork,
     script::Script,
     transaction::{
-        generate_signature,
-        p2pkh::{create_lock_script, create_unlock_script},
-        sighash::{sighash, SigHashCache, SIGHASH_ALL, SIGHASH_FORKID},
+        //generate_signature,
+        //p2pkh::{create_unlock_script},
+        //sighash::{sighash, SigHashCache, SIGHASH_ALL, SIGHASH_FORKID},
+        sighash::{SIGHASH_ALL, SIGHASH_FORKID},
     },
-    util::{Hash160, Hash256},
+    util::Hash256,
+    wallet::{create_sighash, Wallet},
 };
 
 use crate::config::ClientConfig;
-
-/// Convert network to bitcoin network type
-pub fn as_bitcoin_network(network: &SvNetwork) -> bitcoin::Network {
-    match network {
-        SvNetwork::BSV_Mainnet => bitcoin::Network::Bitcoin,
-        SvNetwork::BSV_Testnet => bitcoin::Network::Testnet,
-        SvNetwork::BSV_STN => bitcoin::Network::Signet,
-        _ => panic!("unknown network {}", &network),
-    }
-}
 
 pub struct FundRequest {
     pub client_id: String,
@@ -39,14 +30,9 @@ pub struct FundRequest {
 pub struct Client {
     /// Used to identify the client
     pub client_id: String,
-    /// Funding Private key
-    private_key: PrivateKey,
-    /// Funding Public key,
-    public_key: PublicKey,
-    /// Funding Address
-    address: Address,
-    // Funding Address as Hash
-    funding_address: Hash160,
+    /// Funding Wallet
+    wallet: Wallet,
+    address: String,
     /// Current funding balance
     balance: Balance,
     /// Current funding UTXO
@@ -55,25 +41,23 @@ pub struct Client {
 
 impl Client {
     /// Create a new
-    pub fn new(config: &ClientConfig, network: SvNetwork) -> Self {
-        let private_key = PrivateKey::from_wif(&config.wif_key).unwrap_or_else(|_| {
+    pub fn new(config: &ClientConfig) -> Self {
+        let wallet = Wallet::from_wif(&config.wif_key).unwrap_or_else(|_| {
             panic!(
                 r#"wif_key = "{}" is not a valid WIF key (client_id = "{}")."#,
                 config.wif_key, config.client_id
             )
         });
-        let secp = Secp256k1::new();
-        let public_key: PublicKey = private_key.public_key(&secp);
-
-        let address: Address = Address::p2pkh(&public_key, as_bitcoin_network(&network));
-        let (funding_address, _addr_type) = addr_decode(&address.to_string(), network).unwrap();
-
+        let address = wallet.get_address().unwrap_or_else(|_| {
+            panic!(
+                r#"wif_key = "{}" is not a valid WIF key - issues with address (client_id = "{}")."#,
+                config.wif_key, config.client_id
+            )
+        });
         Client {
             client_id: config.client_id.clone(),
-            private_key,
-            public_key,
+            wallet,
             address,
-            funding_address,
             balance: Balance::default(),
             unspent: Vec::new(),
         }
@@ -145,7 +129,7 @@ impl Client {
         let total_cost: u64 =
             (fund_request.satoshi * fund_request.no_of_outpoints as u64) + fee_estimate;
         // Create a locking script for change
-        let change_script = create_lock_script(&self.funding_address);
+        let change_script = self.wallet.get_locking_script();
         // Find smallest funding unspent that is big enough for tx
         let unspent = self.get_smallest_unspent(total_cost)?;
         // Create vin
@@ -185,28 +169,13 @@ impl Client {
             lock_time: 0,
         };
         // Sign transaction
-        let mut cache = SigHashCache::new();
-        let sighash_type = SIGHASH_ALL | SIGHASH_FORKID;
+        let sighash_flags = SIGHASH_ALL | SIGHASH_FORKID;
 
-        let sighash = sighash(
-            &tx,
-            0,
-            &change_script.0,
-            unspent.value,
-            sighash_type,
-            &mut cache,
-        )
-        .unwrap();
-        //let sighash = sighash(&tx, 0, &change_script.0, total_cost.try_into().unwrap(), sighash_type, &mut cache).unwrap();
-        let signature = generate_signature(
-            &self.private_key.to_bytes().try_into().unwrap(),
-            &sighash,
-            sighash_type,
-        )
-        .unwrap();
+        let sighash = create_sighash(&tx, 0, &change_script, unspent.value, sighash_flags).unwrap();
+        let signature = self.wallet.sign_sighash(sighash, sighash_flags).unwrap();
+
         // insert the ScriptSig (unlock_script)
-        tx.inputs[0].unlock_script =
-            create_unlock_script(&signature, &self.public_key.to_bytes().try_into().unwrap());
+        tx.inputs[0].unlock_script = self.wallet.create_unlock_script(&signature);
 
         // find unspent index
         let index = self.unspent.iter().position(|x| x == unspent).unwrap();
@@ -354,9 +323,8 @@ mod tests {
         // Set up test blockchain
         let blockchain_interface = setup_blockchain(&config).await;
 
-        let network = config.get_network().unwrap();
         let client_config = config.client.unwrap();
-        let mut client = Client::new(&client_config[0], network);
+        let mut client = Client::new(&client_config[0]);
 
         let result = client.update_balance(&*blockchain_interface).await;
         assert!(&result.is_ok());
@@ -384,6 +352,6 @@ mod tests {
             client_id: "id1".to_string(),
             wif_key: "EGa6cZHpfLZmUzXbkvq72s15rbiUonkrQAhDU4FG".to_string(),
         };
-        Client::new(&client_config, SvNetwork::BSV_Testnet);
+        Client::new(&client_config);
     }
 }
