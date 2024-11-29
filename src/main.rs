@@ -41,9 +41,7 @@ async fn main() -> std::io::Result<()> {
     };
 
     simple_logger::init_with_level(config.get_log_level()).unwrap();
-
     let service = Service::new(&config).await;
-
     let app_state = web::Data::new(AppState {
         service: Mutex::new(service),
     });
@@ -73,7 +71,13 @@ async fn main() -> std::io::Result<()> {
             .service(delete_client)
             .service(get_address)
     })
-    .bind(addr)?
+    .bind(addr)
+    .unwrap_or_else(|e| {
+        panic!(
+            r#"Unable to connect to address/port "{:?}". Error = {:?}"#,
+            addr, e
+        )
+    })
     .run()
     .await
 }

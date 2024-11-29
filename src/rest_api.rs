@@ -119,9 +119,9 @@ pub async fn get_funds(
         let response =
             "{\"description\": \"Insufficent client balance to create funding transactions.\"}"
                 .to_string();
-        return HttpResponse::UnprocessableEntity()
+        HttpResponse::UnprocessableEntity()
             .content_type(ContentType::json())
-            .body(response);
+            .body(response)
     } else {
         match service.create_funding_outpoints(&fund_request).await {
             Ok(funding_response) => HttpResponse::Ok()
