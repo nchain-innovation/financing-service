@@ -3,7 +3,6 @@ use chain_gang::interface::{BlockchainInterface, TestInterface, UaaSInterface, W
 use crate::config::Config;
 
 /// Takes a config and returns the appropriate configured object that implements BlockchainInterface
-
 pub fn blockchain_factory(config: &Config) -> Box<dyn BlockchainInterface + Send + Sync> {
     match config.blockchain_interface.interface_type.as_str() {
         "woc" => {
