@@ -29,7 +29,6 @@ pub struct ServiceConfig {
     pub utxo_refresh_period: u64,
 }
 
-
 #[derive(Debug, Default, Deserialize, Clone)]
 pub struct DynamicConfigConfig {
     pub filename: String,
