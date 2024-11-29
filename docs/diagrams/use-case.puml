@@ -6,12 +6,11 @@ actor Client as C
 actor Admin as A
 
 package "Financing Service" {
+    C --> (Get Status) 
     C --> (Request Transaction Fund)
-    C --> (Request Multiple Transaction Funds)
     C --> (Get Address)
     C --> (Get Balance)
 
-    A --> (Get Status) 
     A --> (Add Client)
     A --> (Delete Client)
 }

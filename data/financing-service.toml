@@ -1,11 +1,11 @@
 [blockchain_interface]
-interface_type = "uaas"
+interface_type = "woc"
 network_type = "testnet"
-url = "http://localhost:5010"
+# url = "http://localhost:5010"
 
 [web_interface]
-address = '127.0.0.1'
-port = 8082
+address = "127.0.0.1"
+port = 8080
 
 [logging]
 level = "info"

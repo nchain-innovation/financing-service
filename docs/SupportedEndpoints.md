@@ -13,6 +13,11 @@ curl http://127.0.0.1:8080/status
 }
 ```
 
+The `blockchain_status` can be in one of three states: 
+* `Unknown` - the service has just started and has not connected to the Blockchain yet
+* `Failed` - the Service has failed to connect to the blockchain
+* `Connected` - the Service is connected to the blockchain
+
 
 ## Fund Transactions
 `/fund`
