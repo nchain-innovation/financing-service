@@ -9,8 +9,8 @@
 
 # Tags
 BASE_TAG=financing-service
-VERSION=v1.3
-PUBLISH_TAG=nchain/rnd-prototyping-$BASE_TAG:$VERSION
+VERSION=v2.0
+PUBLISH_TAG=nchain/innovation-$BASE_TAG:$VERSION
 
 # multi build, tag and push base images
 # docker buildx build --builder cloud-nchain-rndprototyping --platform linux/amd64,linux/arm64 --push -t $PUBLISH_TAG .
