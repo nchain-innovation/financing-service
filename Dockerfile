@@ -14,10 +14,10 @@ RUN apt-get update && apt-get install -y \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/bin/financing-service-rust /app/bin/financing-service-rust
+COPY --from=builder /app/bin/financing-service /app/bin/financing-service
 COPY --from=builder /app/data /app/bin/data
 WORKDIR /app/bin
 
 # env var to detect we are in a docker instance
 ENV APP_ENV=docker
-CMD [ "/app/bin/financing-service-rust"]
+CMD [ "/app/bin/financing-service"]

@@ -1,0 +1,38 @@
+@startuml
+title Bitcoin Transaction Spending and Change
+
+database FundingUTXO {
+    
+    json FundingUTXO_1 {
+        "outputs": ["0", "Satoshi: 999_450" ]
+    }
+
+    json FundingUTXO_0 {
+        "outputs": ["0", "Satoshi: 1_000_000" ]
+    }
+
+}
+
+
+json FundingTx {
+    "inputs": ["0", "FundingUTXO_0"],
+    "outputs": ["0", "Satoshi: 500" , "1", "Satoshi: 999_450"]
+}
+
+
+FundingTx -down-> FundingUTXO_0: FundingTx::input[0]\nSpends 1_000_000 Satoshi\n -50 Satoshi fee
+
+json ApplicationTx {
+    "inputs": "",
+    "outputs": ""
+}
+
+ApplicationTx -left-> FundingTx: ApplicationTx::input[0]\n Spends 500 Satoshi from FundingTx::output[0]
+
+
+
+FundingUTXO_1 -up-> FundingTx: FundingTx::output[1]\n Creates 999_450 Satoshi change
+
+FundingUTXO_0 .right.> FundingUTXO_1
+
+@enduml
