@@ -104,7 +104,7 @@ cargo run
 
 ## Building and Publishing Docker Images
 
-This project creates the Docker image: ```financing-service-rust``` which is published to Docker Hub.  This makes it accessible for use by other projects and applications within the ecosystem.
+This project creates the Docker image: `financing-service` which is published to Docker Hub.  This makes it accessible for use by other projects and applications within the ecosystem.
 
 To build and publish the image to Docker Hub, run the following command:
 ```
@@ -115,7 +115,7 @@ To build and publish the image to Docker Hub, run the following command:
 
 - **Docker Buildx:** The script requires Docker's Buildx extension to be set as the active builder. Ensure Buildx is properly installed and selected as the current Docker engine. For help, see [Docker Buildx](https://docs.docker.com/build/builders/)  
 
-- **Publishing Permissions:** Only members of the ```rndprototyping``` team within the ```nChain``` Docker Hub organisation are authorised to publish images with the appropriate tags. Ensure you are logged in with the necessary permissions before running the script, else this will fail.
+- **Publishing Permissions:** Only members of the `rndprototyping` team within the `nChain` Docker Hub organisation are authorised to publish images with the appropriate tags. Ensure you are logged in with the necessary permissions before running the script, else this will fail.
 
 
 ## Supported endpoints
