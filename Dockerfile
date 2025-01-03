@@ -15,7 +15,8 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/bin/financing-service /app/bin/financing-service
-COPY --from=builder /app/data /app/bin/data
+# COPY --from=builder /app/data /app/bin/data
+RUN mkdir /app/bin/data
 WORKDIR /app/bin
 
 # env var to detect we are in a docker instance
