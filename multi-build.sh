@@ -9,7 +9,7 @@
 
 # Tags
 BASE_TAG=financing-service
-VERSION=v2.0
+VERSION=v2.1
 PUBLISH_TAG=nchain/innovation-$BASE_TAG:$VERSION
 
 # multi build, tag and push base images
