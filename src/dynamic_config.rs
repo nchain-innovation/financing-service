@@ -14,9 +14,10 @@ pub struct DynamicConfig {
     pub contents: FileContents,
 }
 
-fn read_dynamic_config(filename: &str) -> std::io::Result<FileContents> {
-    let content = std::fs::read_to_string(filename)?;
-    Ok(toml::from_str(&content)?)
+fn read_dynamic_config(filename: &str) -> Result<FileContents, String> {
+    let content = std::fs::read_to_string(filename).map_err(|e| e.to_string())?;
+    let config = toml::from_str(&content).map_err(|e| e.to_string())?;
+    Ok(config)
 }
 
 fn save_dynamic_config(filename: &str, file_contents: &FileContents) -> std::io::Result<()> {
