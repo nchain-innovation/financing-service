@@ -262,7 +262,7 @@ impl Service {
         *service.blockchain_update_time.write().await = Some(SystemTime::now());
     }
 
-    /// Refresh one client's balance and UTXO set from the blockchain before funding.
+    /// Refresh one client's balance and UTXO set from the blockchain.
     pub async fn refresh_client_chain_state(
         service: &Arc<Service>,
         client_id: &str,
@@ -531,7 +531,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_client_chain_state_restores_stale_utxo_cache() {
+    async fn refresh_client_chain_state_restores_stale_balance_and_utxo_cache() {
         let config = test_config(&unique_dynamic_config_path());
         let blockchain = test_blockchain_interface(&config).await;
         let service = Arc::new(Service::new_for_test(&config, blockchain).await);

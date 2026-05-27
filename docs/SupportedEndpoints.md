@@ -202,6 +202,8 @@ curl -H "Authorization: Bearer your-client-api-key" \
 
 Return the satoshi balance for a client. Requires the target client's `api_key` when configured.
 
+The service refreshes balance and UTXO state from the blockchain on each request before responding.
+
 ```bash
 curl -H "Authorization: Bearer your-client-api-key" \
      http://127.0.0.1:8080/client/client1/balance

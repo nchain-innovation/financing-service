@@ -295,6 +295,11 @@ pub async fn balance(
         return response;
     }
 
+    if let Err(description) = Service::refresh_client_chain_state(&data.service, &client_id).await {
+        log::warn!("refresh_client_chain_state failed: {}", description);
+        return error_response(description);
+    }
+
     match data.service.get_balance(&client_id).await {
         Some(balance) => json_ok(&BalanceResponse {
             confirmed: balance.confirmed,
