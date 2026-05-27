@@ -1,57 +1,11 @@
-use std::{
-    future::{ready, Ready},
-    sync::Arc,
-};
+use actix_web::{http::header, HttpRequest, HttpResponse};
 
-use actix_web::{
-    body::EitherBody,
-    dev::{forward_ready, Service, ServiceRequest, ServiceResponse, Transform},
-    http::header,
-    Error,
-};
-use futures_util::future::LocalBoxFuture;
-
-use crate::responses::unauthorized_response;
+use crate::{responses::unauthorized_response, service::Service};
 
 const BEARER_PREFIX: &str = "Bearer ";
 const API_KEY_HEADER: &str = "X-API-Key";
 
-#[derive(Clone)]
-pub struct ApiKeyAuth {
-    api_key: Option<Arc<String>>,
-}
-
-impl ApiKeyAuth {
-    pub fn new(api_key: Option<String>) -> Self {
-        Self {
-            api_key: api_key.filter(|key| !key.is_empty()).map(Arc::new),
-        }
-    }
-
-    pub fn is_enabled(&self) -> bool {
-        self.api_key.is_some()
-    }
-}
-
-fn extract_api_key(req: &ServiceRequest, expected: &str) -> bool {
-    if let Some(auth_header) = req.headers().get(header::AUTHORIZATION) {
-        if let Ok(auth_str) = auth_header.to_str() {
-            if let Some(token) = auth_str.strip_prefix(BEARER_PREFIX) {
-                return constant_time_eq(token, expected);
-            }
-        }
-    }
-
-    if let Some(key_header) = req.headers().get(API_KEY_HEADER) {
-        if let Ok(key_str) = key_header.to_str() {
-            return constant_time_eq(key_str, expected);
-        }
-    }
-
-    false
-}
-
-fn constant_time_eq(a: &str, b: &str) -> bool {
+pub fn constant_time_eq(a: &str, b: &str) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -61,72 +15,47 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
         == 0
 }
 
-impl<S, B> Transform<S, ServiceRequest> for ApiKeyAuth
-where
-    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
-    S::Future: 'static,
-    B: 'static,
-{
-    type Response = ServiceResponse<EitherBody<B>>;
-    type Error = Error;
-    type InitError = ();
-    type Transform = ApiKeyAuthMiddleware<S>;
-    type Future = Ready<Result<Self::Transform, Self::InitError>>;
-
-    fn new_transform(&self, service: S) -> Self::Future {
-        ready(Ok(ApiKeyAuthMiddleware {
-            service,
-            api_key: self.api_key.clone(),
-        }))
-    }
-}
-
-pub struct ApiKeyAuthMiddleware<S> {
-    service: S,
-    api_key: Option<Arc<String>>,
-}
-
-impl<S, B> Service<ServiceRequest> for ApiKeyAuthMiddleware<S>
-where
-    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
-    S::Future: 'static,
-    B: 'static,
-{
-    type Response = ServiceResponse<EitherBody<B>>;
-    type Error = Error;
-    type Future = LocalBoxFuture<'static, Result<Self::Response, Self::Error>>;
-
-    forward_ready!(service);
-
-    fn call(&self, req: ServiceRequest) -> Self::Future {
-        if let Some(expected) = self.api_key.as_ref() {
-            if !extract_api_key(&req, expected) {
-                let response = unauthorized_response();
-                return Box::pin(
-                    async move { Ok(req.into_response(response.map_into_right_body())) },
-                );
+pub fn extract_api_key(req: &HttpRequest) -> Option<String> {
+    if let Some(auth_header) = req.headers().get(header::AUTHORIZATION) {
+        if let Ok(auth_str) = auth_header.to_str() {
+            if let Some(token) = auth_str.strip_prefix(BEARER_PREFIX) {
+                if !token.is_empty() {
+                    return Some(token.to_string());
+                }
             }
         }
+    }
 
-        let fut = self.service.call(req);
-        Box::pin(async move {
-            let res = fut.await?;
-            Ok(res.map_into_left_body())
-        })
+    if let Some(key_header) = req.headers().get(API_KEY_HEADER) {
+        if let Ok(key_str) = key_header.to_str() {
+            if !key_str.is_empty() {
+                return Some(key_str.to_string());
+            }
+        }
+    }
+
+    None
+}
+
+/// Returns `Some(HttpResponse)` when the request is unauthorized.
+pub fn authorize_client(
+    req: &HttpRequest,
+    client_id: &str,
+    service: &Service,
+) -> Option<HttpResponse> {
+    if !service.client_auth_required(client_id) {
+        return None;
+    }
+
+    match extract_api_key(req) {
+        Some(key) if service.verify_client_api_key(client_id, &key) => None,
+        _ => Some(unauthorized_response()),
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{constant_time_eq, ApiKeyAuth, BEARER_PREFIX};
-    use actix_web::{
-        test::{self, TestRequest},
-        web, App, HttpResponse,
-    };
-
-    async fn ok_handler() -> HttpResponse {
-        HttpResponse::Ok().finish()
-    }
+mod unit_tests {
+    use super::constant_time_eq;
 
     #[test]
     fn constant_time_eq_matches_equal_strings() {
@@ -138,70 +67,80 @@ mod tests {
         assert!(!constant_time_eq("secret", "other"));
         assert!(!constant_time_eq("secret", "secre"));
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{authorize_client, extract_api_key, BEARER_PREFIX};
+    use actix_web::{http::StatusCode, test};
+
+    use crate::{
+        service::Service,
+        test_support::{
+            test_blockchain_interface, test_config_with_api_key, unique_dynamic_config_path,
+            TEST_CLIENT_ID,
+        },
+    };
 
     #[actix_web::test]
-    async fn middleware_allows_request_when_auth_disabled() {
-        let app = test::init_service(
-            App::new()
-                .wrap(ApiKeyAuth::new(None))
-                .route("/", web::get().to(ok_handler)),
-        )
-        .await;
-
-        let resp = test::call_service(&app, TestRequest::get().uri("/").to_request()).await;
-        assert!(resp.status().is_success());
+    async fn extract_api_key_from_bearer_header() {
+        let req = test::TestRequest::get()
+            .insert_header(("Authorization", format!("{BEARER_PREFIX}secret")))
+            .to_http_request();
+        assert_eq!(extract_api_key(&req).as_deref(), Some("secret"));
     }
 
     #[actix_web::test]
-    async fn middleware_rejects_missing_api_key() {
-        let app = test::init_service(
-            App::new()
-                .wrap(ApiKeyAuth::new(Some("secret".to_string())))
-                .route("/", web::get().to(ok_handler)),
-        )
-        .await;
-
-        let resp = test::call_service(&app, TestRequest::get().uri("/").to_request()).await;
-        assert_eq!(resp.status(), 401);
+    async fn extract_api_key_from_x_api_key_header() {
+        let req = test::TestRequest::get()
+            .insert_header(("X-API-Key", "secret"))
+            .to_http_request();
+        assert_eq!(extract_api_key(&req).as_deref(), Some("secret"));
     }
 
     #[actix_web::test]
-    async fn middleware_accepts_bearer_token() {
-        let app = test::init_service(
-            App::new()
-                .wrap(ApiKeyAuth::new(Some("secret".to_string())))
-                .route("/", web::get().to(ok_handler)),
-        )
-        .await;
+    async fn authorize_client_allows_when_no_key_configured() {
+        let config = test_config_with_api_key(&unique_dynamic_config_path(), None);
+        let blockchain = test_blockchain_interface(&config).await;
+        let service = Service::new_for_test(&config, blockchain).await;
+        let req = test::TestRequest::get().to_http_request();
 
-        let resp = test::call_service(
-            &app,
-            TestRequest::get()
-                .uri("/")
-                .insert_header(("Authorization", format!("{BEARER_PREFIX}secret")))
-                .to_request(),
-        )
-        .await;
-        assert!(resp.status().is_success());
+        assert!(authorize_client(&req, TEST_CLIENT_ID, &service).is_none());
     }
 
     #[actix_web::test]
-    async fn middleware_accepts_x_api_key_header() {
-        let app = test::init_service(
-            App::new()
-                .wrap(ApiKeyAuth::new(Some("secret".to_string())))
-                .route("/", web::get().to(ok_handler)),
-        )
-        .await;
+    async fn authorize_client_rejects_missing_key() {
+        let config = test_config_with_api_key(&unique_dynamic_config_path(), Some("secret"));
+        let blockchain = test_blockchain_interface(&config).await;
+        let service = Service::new_for_test(&config, blockchain).await;
+        let req = test::TestRequest::get().to_http_request();
 
-        let resp = test::call_service(
-            &app,
-            TestRequest::get()
-                .uri("/")
-                .insert_header(("X-API-Key", "secret"))
-                .to_request(),
-        )
-        .await;
-        assert!(resp.status().is_success());
+        let resp = authorize_client(&req, TEST_CLIENT_ID, &service).unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[actix_web::test]
+    async fn authorize_client_accepts_matching_key() {
+        let config = test_config_with_api_key(&unique_dynamic_config_path(), Some("secret"));
+        let blockchain = test_blockchain_interface(&config).await;
+        let service = Service::new_for_test(&config, blockchain).await;
+        let req = test::TestRequest::get()
+            .insert_header(("X-API-Key", "secret"))
+            .to_http_request();
+
+        assert!(authorize_client(&req, TEST_CLIENT_ID, &service).is_none());
+    }
+
+    #[actix_web::test]
+    async fn authorize_client_rejects_wrong_client_key() {
+        let config = test_config_with_api_key(&unique_dynamic_config_path(), Some("secret-a"));
+        let blockchain = test_blockchain_interface(&config).await;
+        let service = Service::new_for_test(&config, blockchain).await;
+        let req = test::TestRequest::get()
+            .insert_header(("X-API-Key", "secret-b"))
+            .to_http_request();
+
+        let resp = authorize_client(&req, TEST_CLIENT_ID, &service).unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 }

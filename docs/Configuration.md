@@ -27,19 +27,11 @@ Configures the REST API endpoint for the service.
 [web_interface]
 address = "127.0.0.1"
 port = 8080
-# api_key = "your-secret-key"
 ```
 
 When `APP_ENV=docker`, the service listens on `0.0.0.0` regardless of `address`.
 
-### Authentication
-
-Set `api_key` to require a shared secret on all endpoints except `/` and `/health`. Clients must send either:
-
-* `Authorization: Bearer <api_key>`
-* `X-API-Key: <api_key>`
-
-When `api_key` is omitted, authentication is disabled. In that case, restrict access with network isolation (for example, bind to `127.0.0.1` and place the service behind a reverse proxy or private network). The service logs a warning at startup when authentication is disabled.
+Bind to `127.0.0.1` or place the service behind a reverse proxy on a private network when exposing funding endpoints.
 
 ## [logging]
 
@@ -69,7 +61,7 @@ utxo_refresh_period = 60
 
 ## [dynamic_config]
 
-Path to the file used to persist clients added at runtime via `POST /client`.
+Path to the file used to persist clients added at runtime via `POST /client`. Dynamically added clients may include an `api_key` field in the same format as static `[[client]]` entries.
 
 ```toml
 [dynamic_config]
@@ -84,7 +76,11 @@ Static client configuration. Clients can also be added at runtime via the REST A
 [[client]]
 client_id = "id1"
 wif_key = "cW1ciwAgTLs2EGa6cZHpf...kvq72s15rbiUonkrQAhDU4FG"
+api_key = "your-client-secret"
 ```
 
 * `client_id` — identifier used in API requests
 * `wif_key` — WIF private key for the client's funding wallet
+* `api_key` — optional shared secret for this client's API endpoints
+
+When `api_key` is set for a client, requests for that client must include either `Authorization: Bearer <api_key>` or `X-API-Key: <api_key>`. Clients without an `api_key` remain unauthenticated; restrict them via network isolation. The service logs a warning at startup listing clients without an `api_key`.

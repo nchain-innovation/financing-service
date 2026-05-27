@@ -112,10 +112,16 @@ impl Service {
         service
     }
 
-    pub fn add_client(&mut self, client_id: &str, wif: &str) -> Result<(), String> {
+    pub fn add_client(
+        &mut self,
+        client_id: &str,
+        wif: &str,
+        api_key: Option<&str>,
+    ) -> Result<(), String> {
         let client_config = ClientConfig {
             client_id: client_id.to_string(),
             wif_key: wif.to_string(),
+            api_key: api_key.map(str::to_string),
         };
         let new_client = Client::try_new(&client_config)?;
         self.clients.push(new_client);
@@ -184,6 +190,40 @@ impl Service {
     /// Given a client_id return true if it is valid
     pub fn is_client_id_valid(&self, client_id: &str) -> bool {
         self.clients.iter().any(|x| x.client_id == client_id)
+    }
+
+    pub fn client_auth_required(&self, client_id: &str) -> bool {
+        self.clients
+            .iter()
+            .find(|client| client.client_id == client_id)
+            .and_then(|client| client.api_key())
+            .is_some()
+    }
+
+    pub fn verify_client_api_key(&self, client_id: &str, provided: &str) -> bool {
+        match self
+            .clients
+            .iter()
+            .find(|client| client.client_id == client_id)
+        {
+            Some(client) => match client.api_key() {
+                Some(expected) => crate::auth::constant_time_eq(provided, expected),
+                None => true,
+            },
+            None => false,
+        }
+    }
+
+    pub fn clients_without_api_key(&self) -> Vec<&str> {
+        self.clients
+            .iter()
+            .filter(|client| client.api_key().is_none())
+            .map(|client| client.client_id.as_str())
+            .collect()
+    }
+
+    pub fn client_count(&self) -> usize {
+        self.clients.len()
     }
 
     /// Given a client_id return the associated balance as JSON string

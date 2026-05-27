@@ -30,6 +30,7 @@ pub struct FundRequest {
 pub struct Client {
     /// Used to identify the client
     pub client_id: String,
+    api_key: Option<String>,
     /// Funding Wallet
     wallet: Wallet,
     address: String,
@@ -59,11 +60,16 @@ impl Client {
         })?;
         Ok(Client {
             client_id: config.client_id.clone(),
+            api_key: config.api_key.clone().filter(|key| !key.is_empty()),
             wallet,
             address,
             balance: Balance::default(),
             unspent: Vec::new(),
         })
+    }
+
+    pub fn api_key(&self) -> Option<&str> {
+        self.api_key.as_deref()
     }
 
     /// Given an interface query it for the latest balance
@@ -297,6 +303,7 @@ mod tests {
         let client_config = ClientConfig {
             client_id: TEST_CLIENT_ID.to_string(),
             wif_key: "EGa6cZHpfLZmUzXbkvq72s15rbiUonkrQAhDU4FG".to_string(),
+            api_key: None,
         };
         assert!(Client::try_new(&client_config).is_err());
     }
@@ -306,6 +313,7 @@ mod tests {
         let client_config = ClientConfig {
             client_id: TEST_CLIENT_ID.to_string(),
             wif_key: crate::test_support::TEST_WIF.to_string(),
+            api_key: None,
         };
         let mut client = Client::new(&client_config);
         let fund_request = FundRequest {
@@ -327,6 +335,7 @@ mod tests {
         let client_config = ClientConfig {
             client_id: TEST_CLIENT_ID.to_string(),
             wif_key: crate::test_support::TEST_WIF.to_string(),
+            api_key: None,
         };
         let mut client = Client::new(&client_config);
         client.unspent = values

@@ -18,7 +18,6 @@ mod util;
 mod test_support;
 
 use crate::{
-    auth::ApiKeyAuth,
     config::{get_config, Config},
     rest_api::{
         add_client, balance, delete_client, get_address, get_funds, health, index, status,
@@ -47,15 +46,16 @@ async fn main() -> std::io::Result<()> {
     };
 
     simple_logger::init_with_level(config.get_log_level()).unwrap();
-    let auth = ApiKeyAuth::new(config.web_interface.api_key.clone());
-    if auth.is_enabled() {
-        log::info!("API key authentication enabled");
-    } else {
+    let service = Service::new(&config).await;
+    let clients_without_api_key = service.clients_without_api_key();
+    if service.client_count() > 0 && clients_without_api_key.is_empty() {
+        log::info!("Per-client API key authentication enabled for all clients");
+    } else if !clients_without_api_key.is_empty() {
         log::warn!(
-            "API key authentication disabled; protect /fund and /client via network isolation or set web_interface.api_key"
+            "Clients without api_key configured: {}. Protect these via network isolation or set api_key per client.",
+            clients_without_api_key.join(", ")
         );
     }
-    let service = Service::new(&config).await;
     let app_state = web::Data::new(AppState {
         service: Mutex::new(service),
     });
@@ -74,22 +74,17 @@ async fn main() -> std::io::Result<()> {
         }
     });
 
-    let auth = auth.clone();
     HttpServer::new(move || {
         App::new()
             .app_data(app_state.clone())
             .service(index)
             .service(health)
-            .service(
-                web::scope("")
-                    .wrap(auth.clone())
-                    .service(status)
-                    .service(balance)
-                    .service(get_funds)
-                    .service(add_client)
-                    .service(delete_client)
-                    .service(get_address),
-            )
+            .service(status)
+            .service(balance)
+            .service(get_funds)
+            .service(add_client)
+            .service(delete_client)
+            .service(get_address)
     })
     .bind(addr)
     .unwrap_or_else(|e| {

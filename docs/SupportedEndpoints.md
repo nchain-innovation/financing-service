@@ -2,10 +2,16 @@
 
 The service listens on the port configured in `data/financing-service.toml` (default `8080`).
 
-When `web_interface.api_key` is set, all endpoints except `/` and `/health` require authentication via either:
+When a client has an `api_key` configured, that client's endpoints require authentication via either:
 
 * `Authorization: Bearer <api_key>`
 * `X-API-Key: <api_key>`
+
+The key must match the `client_id` being accessed. Using another client's key returns `401`.
+
+This applies to `POST /fund`, `GET /client/{client_id}/balance`, `GET /client/{client_id}/address`, and `DELETE /client/{client_id}` when that client has an `api_key`. `/`, `/health`, and `/status` remain unauthenticated.
+
+`POST /client` is not authenticated. It accepts an optional `api_key` field that is stored for the new client. Restrict this endpoint via network isolation. See [Configuration](Configuration.md) for setting `api_key` in static and dynamic client config.
 
 Missing or invalid credentials return HTTP `401`:
 
@@ -91,8 +97,10 @@ Creates one or more funding transactions. Request body (JSON):
 | `multiple_tx` | boolean | If true and `no_of_outpoints` > 1, create separate transactions |
 | `locking_script` | string | Hex-encoded locking script for the funding outputs |
 
+Requires the `client_id` client's `api_key` when configured.
+
 ```bash
-curl -H "Authorization: Bearer your-api-key" \
+curl -H "Authorization: Bearer your-client-api-key" \
      -H "Content-Type: application/json" \
      --request POST \
      --data '{"client_id":"client1","satoshi":123,"no_of_outpoints":1,"multiple_tx":false,"locking_script":"76a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac"}' \
@@ -108,6 +116,7 @@ curl -H "Authorization: Bearer your-api-key" \
 
 Common error responses:
 
+* Unauthorized — `{"description": "Unauthorized"}` (missing or invalid `api_key` for the client)
 * Unknown client — `{"description": "Unknown client_id client1"}`
 * Insufficient total balance — `{"description": "Insufficent client balance: 900 satoshi available, 873 required."}`
 * No single UTXO large enough — `{"description": "No single UTXO large enough for funding transaction: largest UTXO is 300 satoshi, 873 required. Consolidation may be needed."}`
@@ -119,13 +128,20 @@ Funding requires a single UTXO large enough to cover each transaction. The servi
 
 `POST /client`
 
-Add a client at runtime. The client is persisted to the dynamic config file.
+Add a client at runtime. The client is persisted to the dynamic config file. This endpoint is not authenticated — restrict access via network isolation.
+
+Request body (JSON):
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `client_id` | string | Identifier for the new client |
+| `wif` | string | WIF private key for the client's funding wallet |
+| `api_key` | string | Optional shared secret for this client's API endpoints |
 
 ```bash
-curl -H "Authorization: Bearer your-api-key" \
-     -H "Content-Type: application/json" \
+curl -H "Content-Type: application/json" \
      --request POST \
-     --data '{"client_id":"client15","wif":"cVLcPuZMfnNNcaU...................oLh3piTnX9WCndRqWh"}' \
+     --data '{"client_id":"client15","wif":"cVLcPuZMfnNNcaU...................oLh3piTnX9WCndRqWh","api_key":"your-client-api-key"}' \
      http://127.0.0.1:8080/client
 ```
 
@@ -137,10 +153,11 @@ curl -H "Authorization: Bearer your-api-key" \
 
 `DELETE /client/{client_id}`
 
-Remove a dynamically added client.
+Remove a dynamically added client. Requires the target client's `api_key` when configured.
 
 ```bash
-curl -X DELETE http://127.0.0.1:8080/client/client1
+curl -H "Authorization: Bearer your-client-api-key" \
+     -X DELETE http://127.0.0.1:8080/client/client1
 ```
 
 ```json
@@ -151,10 +168,11 @@ curl -X DELETE http://127.0.0.1:8080/client/client1
 
 `GET /client/{client_id}/address`
 
-Return the funding address for a client.
+Return the funding address for a client. Requires the target client's `api_key` when configured.
 
 ```bash
-curl http://127.0.0.1:8080/client/client1/address
+curl -H "Authorization: Bearer your-client-api-key" \
+     http://127.0.0.1:8080/client/client1/address
 ```
 
 ```json
@@ -167,10 +185,11 @@ curl http://127.0.0.1:8080/client/client1/address
 
 `GET /client/{client_id}/balance`
 
-Return the satoshi balance for a client.
+Return the satoshi balance for a client. Requires the target client's `api_key` when configured.
 
 ```bash
-curl http://127.0.0.1:8080/client/client1/balance
+curl -H "Authorization: Bearer your-client-api-key" \
+     http://127.0.0.1:8080/client/client1/balance
 ```
 
 ```json

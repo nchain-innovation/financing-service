@@ -1,9 +1,10 @@
-use actix_web::{delete, get, post, web, HttpResponse, Responder};
+use actix_web::{delete, get, post, web, HttpRequest, HttpResponse, Responder};
 use async_mutex::Mutex;
 use log::debug;
 use serde::Deserialize;
 
 use crate::{
+    auth::authorize_client,
     client::FundRequest,
     responses::{
         error_response, json_ok, AddressResponse, BalanceResponse, HealthResponse, SuccessResponse,
@@ -24,6 +25,8 @@ pub struct FundingRequest {
 pub struct ClientAddRequest {
     client_id: String,
     wif: String,
+    #[serde(default)]
+    api_key: Option<String>,
 }
 
 /// Application State Data
@@ -68,6 +71,7 @@ pub async fn update_clients(data: web::Data<AppState>) -> impl Responder {
 
 #[post("/fund")]
 pub async fn get_funds(
+    req: HttpRequest,
     data: web::Data<AppState>,
     info: web::Json<FundingRequest>,
 ) -> impl Responder {
@@ -83,6 +87,9 @@ pub async fn get_funds(
 
     if !service.is_client_id_valid(client_id) {
         return error_response(format!("Unknown client_id {client_id}"));
+    }
+    if let Some(response) = authorize_client(&req, client_id, &service) {
+        return response;
     }
     if satoshi == 0 {
         return error_response(format!("Invalid satoshi value '{satoshi}'"));
@@ -146,7 +153,7 @@ pub async fn add_client(
         return error_response(format!("Client already exists: {client_id}"));
     }
 
-    match service.add_client(client_id, &info.wif) {
+    match service.add_client(client_id, &info.wif, info.api_key.as_deref()) {
         Ok(()) => json_ok(&SuccessResponse::new()),
         Err(description) => error_response(description),
     }
@@ -156,13 +163,20 @@ pub async fn add_client(
 /// Example:
 ///     curl -X POST http://127.0.0.1:8080/client/client_1/
 #[delete("/client/{client_id}")]
-pub async fn delete_client(data: web::Data<AppState>, info: web::Path<String>) -> impl Responder {
+pub async fn delete_client(
+    req: HttpRequest,
+    data: web::Data<AppState>,
+    info: web::Path<String>,
+) -> impl Responder {
     let mut service = data.service.lock().await;
     let client_id: String = info.to_string();
     log::info!("delete_client {}", &client_id);
 
     if !service.is_client_id_valid(&client_id) {
         return error_response(format!("Unknown client_id {client_id}"));
+    }
+    if let Some(response) = authorize_client(&req, &client_id, &service) {
+        return response;
     }
 
     match service.delete_client(&client_id) {
@@ -173,7 +187,11 @@ pub async fn delete_client(data: web::Data<AppState>, info: web::Path<String>) -
 
 /// Get Address for a particular client_id
 #[get("/client/{client_id}/address")]
-pub async fn get_address(data: web::Data<AppState>, info: web::Path<String>) -> impl Responder {
+pub async fn get_address(
+    req: HttpRequest,
+    data: web::Data<AppState>,
+    info: web::Path<String>,
+) -> impl Responder {
     let client_id: String = info.to_string();
     log::info!("get address {}", &client_id);
 
@@ -181,6 +199,9 @@ pub async fn get_address(data: web::Data<AppState>, info: web::Path<String>) -> 
 
     if !service.is_client_id_valid(&client_id) {
         return error_response(format!("Unknown client_id {client_id}"));
+    }
+    if let Some(response) = authorize_client(&req, &client_id, &service) {
+        return response;
     }
 
     match service.get_address(&client_id) {
@@ -191,7 +212,11 @@ pub async fn get_address(data: web::Data<AppState>, info: web::Path<String>) -> 
 
 /// Get Balance for a particular client_id endpoint
 #[get("/client/{client_id}/balance")]
-pub async fn balance(data: web::Data<AppState>, info: web::Path<String>) -> impl Responder {
+pub async fn balance(
+    req: HttpRequest,
+    data: web::Data<AppState>,
+    info: web::Path<String>,
+) -> impl Responder {
     let client_id: String = info.to_string();
     log::info!("get balance {}", &client_id);
 
@@ -199,6 +224,9 @@ pub async fn balance(data: web::Data<AppState>, info: web::Path<String>) -> impl
 
     if !service.is_client_id_valid(&client_id) {
         return error_response(format!("Unknown client_id {client_id}"));
+    }
+    if let Some(response) = authorize_client(&req, &client_id, &service) {
+        return response;
     }
 
     match service.get_balance(&client_id) {
@@ -219,7 +247,6 @@ mod tests {
     use serde_json::{json, Value};
 
     use crate::{
-        auth::ApiKeyAuth,
         rest_api::{
             add_client, balance, delete_client, get_address, get_funds, health, index, status,
             AppState,
@@ -248,16 +275,12 @@ mod tests {
                 .app_data(app_state)
                 .service(index)
                 .service(health)
-                .service(
-                    web::scope("")
-                        .wrap(ApiKeyAuth::new(api_key.map(str::to_string)))
-                        .service(status)
-                        .service(balance)
-                        .service(get_funds)
-                        .service(add_client)
-                        .service(delete_client)
-                        .service(get_address),
-                ),
+                .service(status)
+                .service(balance)
+                .service(get_funds)
+                .service(add_client)
+                .service(delete_client)
+                .service(get_address),
         )
         .await
     }
@@ -658,13 +681,35 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn test_status_rejects_invalid_api_key() {
+    async fn test_status_unauthenticated_when_client_api_key_enabled() {
+        let app = build_app_with_api_key(Some(TEST_API_KEY)).await;
+        let resp =
+            test::call_service(&app, test::TestRequest::get().uri("/status").to_request()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[actix_web::test]
+    async fn test_balance_requires_client_api_key_when_enabled() {
         let app = build_app_with_api_key(Some(TEST_API_KEY)).await;
         let resp = test::call_service(
             &app,
             test::TestRequest::get()
-                .uri("/status")
+                .uri(&format!("/client/{TEST_CLIENT_ID}/balance"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[actix_web::test]
+    async fn test_fund_rejects_wrong_client_api_key() {
+        let app = build_app_with_api_key(Some(TEST_API_KEY)).await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/fund")
                 .insert_header(("X-API-Key", "wrong-key"))
+                .set_json(fund_body(TEST_CLIENT_ID, 123, 1, LOCKING_SCRIPT_HEX))
                 .to_request(),
         )
         .await;

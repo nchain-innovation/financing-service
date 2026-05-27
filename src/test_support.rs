@@ -21,11 +21,11 @@ pub fn test_config_with_api_key(dynamic_filename: &str, api_key: Option<&str>) -
         web_interface: crate::config::WebInterfaceConfig {
             address: std::net::Ipv4Addr::LOCALHOST,
             port: 8080,
-            api_key: api_key.map(str::to_string),
         },
         client: Some(vec![ClientConfig {
             client_id: TEST_CLIENT_ID.to_string(),
             wif_key: TEST_WIF.to_string(),
+            api_key: api_key.map(str::to_string),
         }]),
         dynamic_config: DynamicConfigConfig {
             filename: dynamic_filename.to_string(),
