@@ -1,94 +1,168 @@
 # Supported endpoints
-The service provides the following endpoints:
-## Service status
-`/status`
 
-This returns the current service status.
-```JSON
+The service listens on the port configured in `data/financing-service.toml` (default `8080`).
+
+All JSON error responses use HTTP status `422` with this shape:
+
+```json
+{"description": "Error message"}
+```
+
+Successful JSON responses use HTTP status `200`.
+
+## Index
+
+`GET /`
+
+Returns a plain-text service identifier.
+
+```bash
+curl http://127.0.0.1:8080/
+```
+
+```
+Financing Service REST API
+```
+
+## Health check
+
+`GET /health`
+
+Liveness probe for Docker and orchestrators. Does not check blockchain connectivity.
+
+```bash
+curl http://127.0.0.1:8080/health
+```
+
+```json
+{"status": "ok"}
+```
+
+The Docker image includes a `HEALTHCHECK` that calls this endpoint.
+
+## Service status
+
+`GET /status`
+
+Returns the current service status.
+
+```bash
 curl http://127.0.0.1:8080/status
+```
+
+```json
 {
-    "version": "1.4.0", 
-    "blockchain_status": "Connected", 
+    "version": "2.1.0",
+    "blockchain_status": "Connected",
     "blockchain_update_time": "2024-11-05 14:42:29"
 }
 ```
 
-The `blockchain_status` can be in one of three states: 
-* `Unknown` - the service has just started and has not connected to the Blockchain yet
-* `Failed` - the Service has failed to connect to the blockchain
-* `Connected` - the Service is connected to the blockchain
+`blockchain_status` can be one of:
 
+* `Unknown` — the service has started but not yet connected to the blockchain
+* `Failed` — the service failed to connect to the blockchain
+* `Connected` — the service is connected to the blockchain
 
-## Fund Transactions
-`/fund`
-Returns one or more funding transactions based on the request, where the parameters are 
-* `client_id` - the client id from which these funds will come
-* `satoshi` - the value in satoshi to be funded
-* `no_of_outpoints` - the number of funding outpoints to be provided
-* `multiple_tx` - whether if there are more than one outpoint they should be in separate txs (true|false)
-* `locking_script` - the locking script to be associated with these outpoints
-```JSON
+When no update has occurred yet, `blockchain_update_time` is `"None"`.
 
+## Fund transactions
+
+`POST /fund`
+
+Creates one or more funding transactions. Request body (JSON):
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `client_id` | string | Client whose wallet funds the transaction |
+| `satoshi` | number | Value in satoshis for each funding output |
+| `no_of_outpoints` | number | Number of funding outpoints to provide |
+| `multiple_tx` | boolean | If true and `no_of_outpoints` > 1, create separate transactions |
+| `locking_script` | string | Hex-encoded locking script for the funding outputs |
+
+```bash
 curl -H "Content-Type: application/json" \
      --request POST \
-     --data '{"client_id":"client1","satoshi":123,"no_of_outpoints":1,"multiple_tx":false,"locking_script":"000000"}' \
-    http://127.0.0.1:8080/fund
-
-{
-    "outpoints":  [{"hash": "11e1128551854896dba1af5ebd75f7fb712ae88684cae59e86f89b158de86697", "index": 1}], 
-    "txs": [{"tx": "010000000137c36dacc941196a9f773def6e74bc92c8b2952a79178f48b31e4074831c295d000000006a47304402204dde2fda0af07d1c0dc2a22473d1b54065f714405723fdf4a05f27048dc87b770220402ef74c2cc718d83f95a9940f4d489a9931dbbb3eb8d884a38d059e8a63fb2e412102b02cc8307d68c174135fc320a7af3cb4748e14b1701b76f9498ccaf3ffac55efffffffff027f690100000000001976a91404e044fb084b497e20a635bbad95b18506666cbf88ac7b000000000000000300000000000000"}]
-    
-}   
+     --data '{"client_id":"client1","satoshi":123,"no_of_outpoints":1,"multiple_tx":false,"locking_script":"76a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac"}' \
+     http://127.0.0.1:8080/fund
 ```
 
-## Add Client
-`/client`
+```json
+{
+    "outpoints": [{"hash": "11e1128551854896dba1af5ebd75f7fb712ae88684cae59e86f89b158de86697", "index": 1}],
+    "txs": [{"tx": "0100000001..."}]
+}
+```
 
-Add a dynamic client.
+Common error responses:
 
-```JSON
+* Unknown client — `{"description": "Unknown client_id client1"}`
+* Insufficient total balance — `{"description": "Insufficent client balance: 900 satoshi available, 873 required."}`
+* No single UTXO large enough — `{"description": "No single UTXO large enough for funding transaction: largest UTXO is 300 satoshi, 873 required. Consolidation may be needed."}`
+* Invalid input — `{"description": "Invalid satoshi value '0'"}`
 
+Funding requires a single UTXO large enough to cover each transaction. The service does not combine multiple small UTXOs into one input.
+
+## Add client
+
+`POST /client`
+
+Add a client at runtime. The client is persisted to the dynamic config file.
+
+```bash
 curl -H "Content-Type: application/json" \
      --request POST \
      --data '{"client_id":"client15","wif":"cVLcPuZMfnNNcaU...................oLh3piTnX9WCndRqWh"}' \
-    http://127.0.0.1:8080/client
+     http://127.0.0.1:8080/client
+```
 
+```json
 {"status": "Success"}
 ```
 
-## Delete Client
-`/client/{client_id}`
-Delete a dynamic client.
+## Delete client
 
-```JSON
+`DELETE /client/{client_id}`
+
+Remove a dynamically added client.
+
+```bash
 curl -X DELETE http://127.0.0.1:8080/client/client1
+```
 
+```json
 {"status": "Success"}
 ```
 
-## Get Address
-`/client/{client_id}/address`
-Get Address for a particular client_id.
+## Get address
 
-```JSON
+`GET /client/{client_id}/address`
+
+Return the funding address for a client.
+
+```bash
 curl http://127.0.0.1:8080/client/client1/address
-
-{
-    "address": "mfxjfLTXLUcCxMDojqRejpfKnF9WhRG5BK" 
-}   
 ```
 
+```json
+{
+    "address": "mfxjfLTXLUcCxMDojqRejpfKnF9WhRG5BK"
+}
+```
 
-## Client Balance
-`/client/{client_id}/balance`
+## Client balance
 
-This returns the current satoshi balance associated with this `client_id`.
-```JSON
-curl http://127.0.0.1:8082/client/client1/balance      
-{   
+`GET /client/{client_id}/balance`
+
+Return the satoshi balance for a client.
+
+```bash
+curl http://127.0.0.1:8080/client/client1/balance
+```
+
+```json
+{
     "confirmed": 99904,
     "unconfirmed": 95162
 }
 ```
-
-

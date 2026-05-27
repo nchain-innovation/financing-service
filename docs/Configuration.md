@@ -1,62 +1,80 @@
 # Financing Service - Configuration
 
-Configuration for this service can be found in the `data\financing-service.toml` toml file.
-The toml file is read when the service starts.
+Configuration for this service can be found in `data/financing-service.toml`. The file is read when the service starts.
+
+Alternatively, set the `FS_CONFIG` environment variable to a JSON-encoded config object.
 
 The file is composed of the following sections:
 
 ## [blockchain_interface]
-Configures the blockchain interface to use (in this case WhatsOnChain, connection to testnet).
-```TOML
+
+Configures the blockchain interface. Supported `interface_type` values: `woc`, `uaas`, `test`.
+
+```toml
 [blockchain_interface]
-# For bsv testnet (default)
 interface_type = "woc"
-network_type = "test"
+network_type = "testnet"
+# url = "http://localhost:5010"  # required for uaas
 ```
+
+Supported `network_type` values: `mainnet`, `testnet`, `stn`.
+
 ## [web_interface]
+
 Configures the REST API endpoint for the service.
-```TOML
+
+```toml
 [web_interface]
-address = '127.0.0.1'
+address = "127.0.0.1"
 port = 8080
 ```
-## [logging]
-Configures the log level for the service.
-```TOML
-[logging]
-log_level = 'info'
-```
-The logging level can be one of:
-* `"error"` - Designates very serious errors.
-* `"warn"` - Designates hazardous situations.
-* `"info"` - Designates useful information.
-* `"debug"` - Designates useful information.
-* `"trace"` - Designates very low priority, often extremely verbose, information.
 
+When `APP_ENV=docker`, the service listens on `0.0.0.0` regardless of `address`.
+
+## [logging]
+
+Configures the log level for the service.
+
+```toml
+[logging]
+level = "info"
+```
+
+The logging level can be one of:
+
+* `error` — very serious errors
+* `warn` or `warning` — hazardous situations
+* `info` or `information` — useful information
+* `debug` — detailed information
+* `trace` — very verbose information
 
 ## [service]
 
-This configures the period between requests for the latest UTXO from the blockchain. 
+Configures the period between UTXO refresh requests from the blockchain (in seconds).
 
-In this case it is set to refresh every 60 seconds.
-```TOML
+```toml
 [service]
 utxo_refresh_period = 60
 ```
 
+## [dynamic_config]
+
+Path to the file used to persist clients added at runtime via `POST /client`.
+
+```toml
+[dynamic_config]
+filename = "./data/dynamic.toml"
+```
+
 ## [[client]]
-Configures each of the clients that the service supports.
 
-Note that these can also be configured using the dynamic config.
+Static client configuration. Clients can also be added at runtime via the REST API.
 
-```TOML
+```toml
 [[client]]
 client_id = "id1"
 wif_key = "cW1ciwAgTLs2EGa6cZHpf...kvq72s15rbiUonkrQAhDU4FG"
-
-[[client]]
-client_id = "id2"
-wif_key = "cRJukFhMkntAdZctwcW6.....GTaBTYwcwStRcwh1rqgJdayZa2"
 ```
-* `client_id` - is how we identify this client
-* `wif_key` - is the wallet independent format of the key used to fund this client's transactions.
+
+* `client_id` — identifier used in API requests
+* `wif_key` — WIF private key for the client's funding wallet

@@ -46,8 +46,9 @@ The Financing Service Client use cases are:
 
 The Financing Service Admin use cases are:
 * `Get Status` - the FS will return the current status of the component.
-* `Add Client` - Dynamically add the client whist the service is running.
-* `Delete Client` - Dynamically delete the client whist the service is running.
+* `Health Check` - the FS exposes a liveness endpoint for container deployments.
+* `Add Client` - Dynamically add the client while the service is running.
+* `Delete Client` - Dynamically delete the client while the service is running.
 * `Top-up Balance` - The Admin will provide a funding transaction to increase the satoshi that the FS can use for funding. This is done outside the Financing Service.
 
 
@@ -64,7 +65,7 @@ The service reads its configuration on startup.
 The service uses the `chain-gang` library's WoCInterface to interact with the BSV blockchain.
 
 
-## Geting Started
+## Getting Started
 
 The project can either be run as an executable or as a docker container (smallish 100MB).
 
@@ -77,9 +78,9 @@ To build the docker image associated with the service run the following comand i
 ```bash
 ./build.sh
 ```
-This builds the Docker image `financing-service-rust`.
+This builds the Docker image `financing-service-rust`. The image includes a health check against `GET /health`.
 ### 2) To Run the Image
-The to start the Docker container:
+To start the Docker container:
 ```bash
 ./run.sh
 ```
@@ -97,10 +98,21 @@ cargo build
 ```
 
 ## To Run the Service
-To run:
+To run locally:
+
 ```bash
 cargo run
 ```
+
+Run tests, formatting, and lint checks:
+
+```bash
+cargo test
+cargo fmt --all -- --check
+cargo clippy -- -D warnings
+```
+
+These checks also run in GitHub Actions on push and pull request.
 
 ## Building and Publishing Docker Images
 
