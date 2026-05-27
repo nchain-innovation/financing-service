@@ -1,100 +1,77 @@
+# Project status
 
-# Project Status
-This section contains project status related notes.
+High-level status and known limitations for the Financing Service Rust implementation (v2.1.0).
 
-* Document - September 2022
-* Python implementation - October 2022
-* Rust implementation - October 2022..October 2023 - Certificate On Chain
+For API details see [SupportedEndpoints.md](SupportedEndpoints.md). For configuration see [Configuration.md](Configuration.md). For build and test instructions see [Development.md](Development.md).
 
-## Done
-Required to write in Rust
-* Need to find WIF library
-https://docs.rs/bitcoin/latest/bitcoin/util/key/struct.PrivateKey.html#method.from_wif
+## History
 
-* Assume rust-sv does transaction signing - it appears to do so
-https://docs.rs/sv/latest/sv/transaction/sighash/fn.sighash.html
+| Milestone | Date |
+|-----------|------|
+| Initial design document | September 2022 |
+| Python implementation | October 2022 |
+| Rust implementation | October 2022 – October 2023 |
+| Overlay network updates (client names removed from status) | October 2024 |
+| REST API with JSON body for `/fund` | 2024 |
+| Per-client API key authentication | 2026 |
 
-* Write Woc interface
-https://docs.rs/reqwest/latest/reqwest/
+The Rust service uses the [`chain-gang`](https://github.com/nchain-innovation/chain-gang) library for blockchain access (WhatsOnChain, UaaS, or test interface) and wallet operations.
 
+## Current architecture
 
-# 12/03/2024 
-* version = "0.2.0"
-* Added version to status response
-* Added tx to the request for a single tx funding
+```
+Client App  ──REST──▶  Actix Web API  ──▶  Service  ──▶  BlockchainInterface
+Admin       ──REST──▶       │                │
+                            │                ├── Client wallets (WIF keys)
+                            │                └── dynamic.toml (runtime clients)
+                            └── /health (liveness, no auth)
+```
 
+| Module | Role |
+|--------|------|
+| `main.rs` | Config load, HTTP server, periodic UTXO refresh |
+| `rest_api.rs` | REST handlers |
+| `service.rs` | Orchestration, broadcast, client management |
+| `client.rs` | UTXO selection, transaction construction and signing |
+| `auth.rs` | Per-client API key verification |
+| `blockchain_factory.rs` | Pluggable blockchain backends |
+| `dynamic_config.rs` | Persist runtime-added clients |
 
-# 02/10/2024
-Updates for Overlay Network
-* FS - no longer returns the names of clients in status message.
-* FS - update version number
+## Implemented
 
-## In Progress
-* REST API
-* Reorder unspent on insertion
-* Should use REST error codes for failures
+* REST API for funding, balance, address, client management, status, and health
+* JSON request/response bodies with typed serde DTOs
+* Dynamic client add/remove via `POST /client` and `DELETE /client/{id}`
+* Optional per-client `api_key` authentication
+* Balance checks against total wallet balance and single-UTXO availability
+* Docker image with `/health` liveness check
+* CI: build, test, `cargo fmt --check`, `cargo clippy -- -D warnings`
+* Pinned `chain-gang` git dependency for reproducible builds
+* 41 automated tests (unit, integration, REST API)
 
-## To Do
+## Known limitations
 
-* Issue NCH-11485 Unable to build docker images with WARP enabled
-https://jira.stressedsharks.com/servicedesk/customer/portal/6/NCH-11485
+* **Single-UTXO funding** — each funding transaction requires one UTXO large enough to cover outputs and fees. The service does not combine multiple small UTXOs.
+* **UTXO cache staleness** — balances refresh on a configurable interval (default 60 seconds). A fund request between refreshes may fail if UTXOs were spent on-chain.
+* **Multi-tx partial failure** — in `multiple_tx` mode, earlier transactions may broadcast successfully before a later one fails.
+* **Request serialization** — all endpoints share a single `Mutex<Service>`. Fund requests hold the lock through blockchain broadcast.
+* **Plaintext secrets** — WIF keys and optional `api_key` values are stored in TOML config files.
+* **Unauthenticated admin endpoint** — `POST /client` has no auth; restrict via network isolation.
+* **No rate limiting or HTTPS** — expected to be handled at the deployment layer (reverse proxy, firewall).
 
-* Periodic event
-* Manage inserted unspent differently?
+## Open items
 
-* Should use ? in requests...
-* Grep for unwraps
+* UTXO consolidation (multi-input funding transactions)
+* Commit `Cargo.lock` for fully reproducible dependency resolution
+* Add `cargo audit` to CI
+* Protect `POST /client` (e.g. admin key or existing-client auth)
+* Reduce sensitive data in logs (full tx hex at `info` level)
+* Clean up remaining startup-path panics (`Client::new`, config parse failures)
 
-* Need to think about UTXO management
+## Related documentation
 
-
-
-curl --location --request POST "https://api.whatsonchain.com/v1/bsv/main/tx/raw" \
-  --header "Content-Type: application/json" \
-  --data "{\"txhex\":\"01000000010bb539b357b85ce468b86a34fa0d6c3587b99a5b68f74159134351dd586ae083000000006a47304402207230d534f77c1fd0953ed20bd5bb6292100e8670860201e245f187cc829cd1da022050e540a76890212a39514f52b0a93ddc60db27640f8b20ea635d938c0d732695422103a8ae071ddd8690b94755c7112ca304bcac45c15904cc013f0ad6c2ea0b1019b2000000000230f09100000000001976a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac7b000000000000001876a9ddc574807c3035ab43553a22c0b9df1f55737fae88ac00000000\" }"
-
-76 a9 b467faf0ef536db106d67f872c448bcaccb878c 988 ac
-
-76 a9 b467faf0ef536db106d67f872c448bcaccb878c 988 ac
-
-
-
-01000000010bb539b357b85ce468b86a34fa0d6c3587b99a5b68f74159134351dd586ae083000000006a47304402207230d534f77c1fd0953ed20bd5bb6292100e8670860201e245f187cc829cd1da022050e540a76890212a39514f52b0a93ddc60db27640f8b20ea635d938c0d732695422103a8ae071ddd8690b94755c7112ca304bcac45c15904cc013f0ad6c2ea0b1019b2000000000230f0910000000000
-19 76 a9 14 b4 67 faf0ef536db106d67f872c448bcaccb878c988ac 7b00000000000000
-18 76 a9    b4 67 faf0ef536db106d67f872c448bcaccb878c988ac 00000000
-
-a.gordon@8-lm-00250 financing-service-rust % curl -X POST http://127.0.0.1:8080/fund/id1/123/1/false/76a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac
-
-
-Python code produces this as tx with input
-
-76a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac
-
-client_id: id1
-satoshi: 123
-no_of_outpoints: 1
-multiple_tx: false
-locking script: 76a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac
-
-01000000010bb539b357b85ce468b86a34fa0d6c3587b99a5b68f74159134351dd586ae083000000006a47304402205837e2ac79cf5bb2cc9a8aff606de121adc6f12df51c818be3439b643774b1fc02202606a4dadfee1aed6ada6c3bfa1a69e235858a81a6943539b291486736dfe7b9412103a8ae071ddd8690b94755c7112ca304bcac45c15904cc013f0ad6c2ea0b1019b2ffffffff0224f09100000000001976a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac7b000000000000001976a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac00000000
-
-
-From rust we get
-
-rust - with unspent satoshi
-
-01000000
-01
-0bb539b357b85ce468b86a34fa0d6c3587b99a5b68f74159134351dd586ae083
-00000000
-6a
-47
-304402206cced183a928447f4f7c71c2e9e4ce5bf269b69d713f23f2f6aa8b6145b5456202204071c4b055739725d6fed5547f972703db8bc3e3a5501d2c21046ddcffa4ee5b41
-2103a8ae071ddd8690b94755c7112ca304bcac45c15904cc013f0ad6c2ea0b1019b2
-ffff ffff
-02
-30f0910000000000
-1976a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac
-7b00000000000000
-1976a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac
-00000000
+* [SupportedEndpoints.md](SupportedEndpoints.md) — REST API reference
+* [Configuration.md](Configuration.md) — service and client configuration
+* [LockingScripts.md](LockingScripts.md) — generating locking scripts for `/fund`
+* [Development.md](Development.md) — build, test, and CI
+* [README.md](../README.md) — overview and getting started
