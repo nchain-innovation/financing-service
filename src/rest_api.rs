@@ -186,22 +186,13 @@ pub async fn get_funds(
         return error_response(description);
     }
 
-    let (blockchain, prepared) =
-        match Service::prepare_funding_outpoints(&data.service, &fund_request).await {
-            Ok(prepared) => prepared,
-            Err(description) => {
-                debug!("prepare_funding_outpoints error = {:?}", &description);
-                return error_response(description);
-            }
-        };
-
-    match Service::broadcast_prepared_funding(blockchain, prepared).await {
+    match Service::execute_funding(&data.service, &fund_request).await {
         Ok(funding_response) => match funding_response.to_response() {
             Ok(response) => json_ok(&response),
             Err(description) => error_response(description),
         },
         Err(description) => {
-            debug!("broadcast_prepared_funding error = {:?}", &description);
+            debug!("execute_funding error = {:?}", &description);
             error_response(description)
         }
     }

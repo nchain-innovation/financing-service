@@ -17,6 +17,12 @@ use chain_gang::{
 
 use crate::config::ClientConfig;
 
+#[derive(Clone, Debug)]
+pub struct FundingSpendPlan {
+    spent_indices: Vec<usize>,
+    change_entry: UtxoEntry,
+}
+
 #[derive(Clone)]
 pub struct FundRequest {
     pub client_id: String,
@@ -268,11 +274,11 @@ impl Client {
     }
 
     fn create_funding_tx_single_input(
-        &mut self,
+        &self,
         fund_request: &FundRequest,
         unspent: &UtxoEntry,
         total_cost: u64,
-    ) -> Result<Tx, String> {
+    ) -> Result<(Tx, FundingSpendPlan), String> {
         let change_script = self.wallet.get_locking_script();
         let change = unspent.value - total_cost as i64;
         if change <= 0 {
@@ -304,16 +310,21 @@ impl Client {
             tx_hash: tx.hash().encode(),
             value: change,
         };
-        self.spend_utxos(&[index], change_entry);
 
-        Ok(tx)
+        Ok((
+            tx,
+            FundingSpendPlan {
+                spent_indices: vec![index],
+                change_entry,
+            },
+        ))
     }
 
     fn create_funding_tx_multi_input(
-        &mut self,
+        &self,
         fund_request: &FundRequest,
         selected_indices: &[usize],
-    ) -> Result<Tx, String> {
+    ) -> Result<(Tx, FundingSpendPlan), String> {
         let change_script = self.wallet.get_locking_script();
         let input_amounts: Vec<i64> = selected_indices
             .iter()
@@ -354,13 +365,21 @@ impl Client {
             tx_hash: tx.hash().encode(),
             value: change,
         };
-        self.spend_utxos(selected_indices, change_entry);
 
-        Ok(tx)
+        Ok((
+            tx,
+            FundingSpendPlan {
+                spent_indices: selected_indices.to_vec(),
+                change_entry,
+            },
+        ))
     }
 
-    /// Create one funding transaction
-    pub fn create_funding_tx(&mut self, fund_request: &FundRequest) -> Result<Tx, String> {
+    /// Plan a funding transaction without updating the local UTXO cache.
+    pub fn plan_funding_tx(
+        &self,
+        fund_request: &FundRequest,
+    ) -> Result<(Tx, FundingSpendPlan), String> {
         let total_cost_single = Self::estimate_total_cost(fund_request, 1);
         if let Some(unspent) = self.get_smallest_unspent(total_cost_single) {
             let unspent = unspent.clone();
@@ -371,6 +390,18 @@ impl Client {
             .select_utxo_indices(fund_request)
             .ok_or_else(|| "No suitable UTXO set available for funding transaction.".to_string())?;
         self.create_funding_tx_multi_input(fund_request, &selected_indices)
+    }
+
+    pub fn commit_funding_spend(&mut self, plan: FundingSpendPlan) {
+        self.spend_utxos(&plan.spent_indices, plan.change_entry);
+    }
+
+    /// Create one funding transaction and update the local UTXO cache.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn create_funding_tx(&mut self, fund_request: &FundRequest) -> Result<Tx, String> {
+        let (tx, plan) = self.plan_funding_tx(fund_request)?;
+        self.commit_funding_spend(plan);
+        Ok(tx)
     }
 }
 

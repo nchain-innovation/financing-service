@@ -47,16 +47,15 @@ Admin       ──REST──▶       │                │
 * Optional `admin_api_key` for `POST /client`
 * Secret references via `env:VAR`, environment overrides, and `wif_env` / `api_key_env` on `POST /client`
 * Configurable per-IP HTTP rate limiting with `/health` exempt
-* Balance checks against total wallet balance; funding combines multiple UTXOs when needed; balance endpoint refreshes from chain on each request; `multiple_tx` partial failures return structured successful transaction data
+* Balance checks against total wallet balance; funding combines multiple UTXOs when needed; balance endpoint refreshes from chain on each request; `multiple_tx` partial failures return structured successful transaction data; concurrent fund requests for the same client use read-only planning and commit UTXO updates only after broadcast
 * Docker image with `/health` liveness check
 * CI: build, test, `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo audit`
 * Pinned `chain-gang` git dependency and committed `Cargo.lock` for reproducible builds
-* 66 automated tests (unit, integration, REST API)
+* 67 automated tests (unit, integration, REST API)
 
 ## Known limitations
 
 * **Multi-tx partial failure** — in `multiple_tx` mode, earlier successful broadcasts remain on-chain if a later step fails. The service resyncs UTXO state and returns HTTP 422 with `description`, plus `outpoints` and `txs` for any transactions that were broadcast successfully.
-* **Concurrent fund requests for the same client** — funding for a given `client_id` still serializes on that client's UTXO lock. Different clients can fund concurrently.
 * **No HTTPS** — expected to be handled at the deployment layer (reverse proxy, firewall).
 
 ## Open items

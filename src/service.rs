@@ -10,7 +10,7 @@ use tokio::sync::{Mutex, RwLock};
 
 use crate::{
     blockchain_factory::blockchain_factory,
-    client::{Client, FundRequest},
+    client::{Client, FundRequest, FundingSpendPlan},
     config::{ClientConfig, Config},
     dynamic_config::DynamicConfig,
     responses::{
@@ -68,10 +68,12 @@ impl FundingResponse {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct PreparedFunding {
+    pub client_id: String,
     pub txs: Vec<Tx>,
     pub no_of_outpoints: u32,
+    pub spend_plan: FundingSpendPlan,
 }
 
 /// Service data
@@ -382,7 +384,7 @@ impl Service {
         guard.funding_balance_error(fund_request)
     }
 
-    /// Build and sign a funding transaction, updating only the target client's UTXO state.
+    /// Build and sign a funding transaction without updating the local UTXO cache.
     pub async fn prepare_funding_outpoints(
         service: &Arc<Service>,
         fund_request: &FundRequest,
@@ -391,14 +393,57 @@ impl Service {
             .client_handle(&fund_request.client_id)
             .await
             .ok_or_else(|| format!("Unknown client_id {}", fund_request.client_id))?;
-        let tx = client.write().await.create_funding_tx(fund_request)?;
+        let (tx, spend_plan) = client.read().await.plan_funding_tx(fund_request)?;
         Ok((
             service.blockchain_interface(),
             PreparedFunding {
+                client_id: fund_request.client_id.clone(),
                 txs: vec![tx],
                 no_of_outpoints: fund_request.no_of_outpoints,
+                spend_plan,
             },
         ))
+    }
+
+    pub async fn commit_prepared_funding(
+        service: &Arc<Service>,
+        prepared: &PreparedFunding,
+    ) -> Result<(), String> {
+        let client = service
+            .client_handle(&prepared.client_id)
+            .await
+            .ok_or_else(|| format!("Unknown client_id {}", prepared.client_id))?;
+        client
+            .write()
+            .await
+            .commit_funding_spend(prepared.spend_plan.clone());
+        Ok(())
+    }
+
+    pub async fn execute_funding(
+        service: &Arc<Service>,
+        fund_request: &FundRequest,
+    ) -> Result<FundingResponse, String> {
+        if let Some(description) = service.funding_balance_error(fund_request).await {
+            return Err(description);
+        }
+
+        let (blockchain, prepared) = Self::prepare_funding_outpoints(service, fund_request).await?;
+        match Self::broadcast_prepared_funding(blockchain, &prepared).await {
+            Ok(response) => {
+                if let Err(description) = Self::commit_prepared_funding(service, &prepared).await {
+                    log::warn!("commit_prepared_funding failed: {}", description);
+                    let _ =
+                        Self::refresh_client_chain_state(service, &fund_request.client_id).await;
+                    return Err(description);
+                }
+                Ok(response)
+            }
+            Err(description) => {
+                let _ = Self::refresh_client_chain_state(service, &fund_request.client_id).await;
+                Err(description)
+            }
+        }
     }
 
     /// Fund a request with separate transactions, preparing and broadcasting one at a time.
@@ -424,8 +469,14 @@ impl Service {
         for tx_index in 0..total {
             match Self::prepare_funding_outpoints(service, &per_tx_request).await {
                 Ok((blockchain, prepared)) => {
-                    match Self::broadcast_prepared_funding(blockchain, prepared).await {
+                    match Self::broadcast_prepared_funding(blockchain, &prepared).await {
                         Ok(partial) => {
+                            if let Err(description) =
+                                Self::commit_prepared_funding(service, &prepared).await
+                            {
+                                resync_after_multiple_tx_failure(service, fund_request).await;
+                                return Err(MultipleTxFundError::complete(description));
+                            }
                             combined.outpoints.extend(partial.outpoints);
                             combined.txs.extend(partial.txs);
                         }
@@ -465,12 +516,12 @@ impl Service {
     /// Broadcast prepared funding transactions without holding client locks.
     pub async fn broadcast_prepared_funding(
         blockchain: Arc<dyn BlockchainInterface + Send + Sync>,
-        prepared: PreparedFunding,
+        prepared: &PreparedFunding,
     ) -> Result<FundingResponse, String> {
         let tx = prepared
             .txs
-            .into_iter()
-            .next()
+            .first()
+            .cloned()
             .ok_or_else(|| "No funding transaction prepared.".to_string())?;
         let mut response = FundingResponse::default();
         response.txs.push(tx.clone());
@@ -668,16 +719,32 @@ mod tests {
         result_b.expect("client2 funding should succeed");
     }
 
+    #[tokio::test]
+    async fn concurrent_fund_requests_for_same_client_do_not_block() {
+        let config = test_config(&unique_dynamic_config_path());
+        let blockchain = test_blockchain_interface(&config).await;
+        let service = Arc::new(Service::new_for_test(&config, blockchain).await);
+
+        let service_a = Arc::clone(&service);
+        let service_b = Arc::clone(&service);
+        let request_a = sample_fund_request(TEST_CLIENT_ID);
+        let mut request_b = sample_fund_request(TEST_CLIENT_ID);
+        request_b.satoshi = 456;
+
+        let (result_a, result_b) = tokio::join!(
+            fund_single_transaction(&service_a, &request_a),
+            fund_single_transaction(&service_b, &request_b),
+        );
+
+        result_a.expect("first same-client funding should succeed");
+        result_b.expect("second same-client funding should succeed");
+    }
+
     async fn fund_single_transaction(
         service: &Arc<Service>,
         fund_request: &FundRequest,
     ) -> Result<FundingResponse, String> {
         Service::refresh_client_chain_state(service, &fund_request.client_id).await?;
-        if let Some(description) = service.funding_balance_error(fund_request).await {
-            return Err(description);
-        }
-        let (blockchain, prepared) =
-            Service::prepare_funding_outpoints(service, fund_request).await?;
-        Service::broadcast_prepared_funding(blockchain, prepared).await
+        Service::execute_funding(service, fund_request).await
     }
 }
