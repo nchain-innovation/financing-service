@@ -98,38 +98,80 @@ impl Client {
 
     /// Return the smallest unspent that is greater than given satoshi
     fn get_smallest_unspent(&self, satoshi: u64) -> Option<&UtxoEntry> {
-        // Note unspent is already sorted by value
         self.unspent
             .iter()
-            .find(|x| x.value > satoshi as i64)
+            .find(|utxo| utxo.value > satoshi as i64)
     }
 
-    /// Given the tx inputs, determine if there is a suitable Utxo for a funding tx
-    pub fn has_sufficent_balance(&self, fund_request: &FundRequest) -> Option<bool> {
-        let largest_unspent = self.get_largest_unspent()?;
-        let locking_script_len: u64 = fund_request.locking_script.len() as u64;
+    fn total_unspent(&self) -> i64 {
+        self.unspent.iter().map(|utxo| utxo.value).sum()
+    }
 
-        let total_cost: u64 = if fund_request.no_of_outpoints > 1 && fund_request.multiple_tx {
-            let fee_estimate: u64 = ((locking_script_len / 1000) * 500) + 750;
-            (fund_request.satoshi * fund_request.no_of_outpoints as u64)
-                + (fee_estimate * fund_request.no_of_outpoints as u64)
+    fn estimate_fee(locking_script_len: u64, no_of_outpoints: u32) -> u64 {
+        (((locking_script_len * no_of_outpoints as u64) / 1000) * 500) + 750
+    }
+
+    fn estimate_total_cost(fund_request: &FundRequest) -> u64 {
+        let locking_script_len = fund_request.locking_script.len() as u64;
+        if fund_request.no_of_outpoints > 1 && fund_request.multiple_tx {
+            let fee_estimate = Self::estimate_fee(locking_script_len, 1);
+            fund_request.no_of_outpoints as u64 * (fund_request.satoshi + fee_estimate)
         } else {
-            // One tx
-            let fee_estimate =
-                (((locking_script_len * fund_request.no_of_outpoints as u64) / 1000) * 500) + 750;
-            (fund_request.satoshi * fund_request.no_of_outpoints as u64) + fee_estimate
-        };
+            fund_request.satoshi * fund_request.no_of_outpoints as u64
+                + Self::estimate_fee(locking_script_len, fund_request.no_of_outpoints)
+        }
+    }
 
-        Some(total_cost < largest_unspent as u64)
+    fn count_utxos_above(&self, amount: u64) -> usize {
+        self.unspent
+            .iter()
+            .filter(|utxo| utxo.value > amount as i64)
+            .count()
+    }
+
+    /// Return a description when the client cannot fund the request.
+    pub fn funding_balance_error(&self, fund_request: &FundRequest) -> Option<String> {
+        if self.unspent.is_empty() {
+            return Some("No UTXOs available for funding.".to_string());
+        }
+
+        let total_cost = Self::estimate_total_cost(fund_request);
+        let total_available = self.total_unspent();
+
+        if total_available <= total_cost as i64 {
+            return Some(format!(
+                "Insufficent client balance: {total_available} satoshi available, {total_cost} required."
+            ));
+        }
+
+        if fund_request.no_of_outpoints > 1 && fund_request.multiple_tx {
+            let per_tx_cost = fund_request.satoshi
+                + Self::estimate_fee(fund_request.locking_script.len() as u64, 1);
+            let suitable_utxos = self.count_utxos_above(per_tx_cost);
+            if suitable_utxos < fund_request.no_of_outpoints as usize {
+                return Some(format!(
+                    "Not enough UTXOs for {} separate funding transactions: {suitable_utxos} suitable UTXOs, {} required.",
+                    fund_request.no_of_outpoints, fund_request.no_of_outpoints
+                ));
+            }
+            return None;
+        }
+
+        if self.get_smallest_unspent(total_cost).is_none() {
+            let largest = self.get_largest_unspent().unwrap_or(0);
+            return Some(format!(
+                "No single UTXO large enough for funding transaction: largest UTXO is {largest} satoshi, {total_cost} required. Consolidation may be needed."
+            ));
+        }
+
+        None
     }
 
     /// Create one funding transaction
     pub fn create_funding_tx(&mut self, fund_request: &FundRequest) -> Result<Tx, String> {
-        let locking_script_len: u64 = fund_request.locking_script.len() as u64;
-        let fee_estimate: u64 =
-            (((locking_script_len * fund_request.no_of_outpoints as u64) / 1000) * 500) + 750;
-        let total_cost: u64 =
-            (fund_request.satoshi * fund_request.no_of_outpoints as u64) + fee_estimate;
+        let locking_script_len = fund_request.locking_script.len() as u64;
+        let total_cost = fund_request.satoshi * fund_request.no_of_outpoints as u64
+            + Self::estimate_fee(locking_script_len, fund_request.no_of_outpoints);
         let change_script = self.wallet.get_locking_script();
         let unspent = self
             .get_smallest_unspent(total_cost)
@@ -277,5 +319,80 @@ mod tests {
         let result = client.create_funding_tx(&fund_request);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("No suitable UTXO"));
+    }
+
+    fn test_client_with_utxos(values: &[i64]) -> Client {
+        use chain_gang::interface::UtxoEntry;
+
+        let client_config = ClientConfig {
+            client_id: TEST_CLIENT_ID.to_string(),
+            wif_key: crate::test_support::TEST_WIF.to_string(),
+        };
+        let mut client = Client::new(&client_config);
+        client.unspent = values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| UtxoEntry {
+                height: 1,
+                tx_pos: 0,
+                tx_hash: format!("{:064x}", index + 1),
+                value: *value,
+            })
+            .collect();
+        client.unspent.sort_by_key(|utxo| utxo.value);
+        client
+    }
+
+    fn sample_fund_request(satoshi: u64) -> FundRequest {
+        FundRequest {
+            client_id: TEST_CLIENT_ID.to_string(),
+            satoshi,
+            no_of_outpoints: 1,
+            multiple_tx: false,
+            locking_script: hex::decode(LOCKING_SCRIPT_HEX).unwrap(),
+        }
+    }
+
+    #[test]
+    fn test_funding_balance_error_insufficient_total() {
+        let client = test_client_with_utxos(&[100]);
+        let error = client
+            .funding_balance_error(&sample_fund_request(123))
+            .unwrap();
+        assert!(error.contains("Insufficent client balance"));
+        assert!(error.contains("100 satoshi available"));
+    }
+
+    #[test]
+    fn test_funding_balance_error_no_single_utxo() {
+        let client = test_client_with_utxos(&[300, 300, 300]);
+        let error = client
+            .funding_balance_error(&sample_fund_request(123))
+            .unwrap();
+        assert!(error.contains("No single UTXO large enough"));
+        assert!(error.contains("Consolidation may be needed"));
+    }
+
+    #[test]
+    fn test_funding_balance_error_sufficient() {
+        let client = test_client_with_utxos(&[100, 10_000]);
+        assert!(client
+            .funding_balance_error(&sample_fund_request(123))
+            .is_none());
+    }
+
+    #[test]
+    fn test_funding_balance_error_multiple_tx_not_enough_utxos() {
+        let client = test_client_with_utxos(&[10_000, 10_000]);
+        let fund_request = FundRequest {
+            client_id: TEST_CLIENT_ID.to_string(),
+            satoshi: 123,
+            no_of_outpoints: 3,
+            multiple_tx: true,
+            locking_script: hex::decode(LOCKING_SCRIPT_HEX).unwrap(),
+        };
+        let error = client.funding_balance_error(&fund_request).unwrap();
+        assert!(error.contains("Not enough UTXOs"));
+        assert!(error.contains("2 suitable UTXOs, 3 required"));
     }
 }

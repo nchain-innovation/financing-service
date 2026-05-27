@@ -108,8 +108,11 @@ pub fn unique_dynamic_config_path() -> String {
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir()
-        .join(format!("financing-service-test-{id}-dynamic.toml"))
-        .to_string_lossy()
-        .into_owned()
+    let path = std::env::temp_dir().join(format!(
+        "financing-service-test-{}-{id}-dynamic.toml",
+        std::process::id()
+    ));
+    let path = path.to_string_lossy().into_owned();
+    let _ = std::fs::write(&path, "clients = []\n");
+    path
 }

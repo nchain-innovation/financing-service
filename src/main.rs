@@ -19,8 +19,8 @@ mod test_support;
 use crate::{
     config::{get_config, Config},
     rest_api::{
-        add_client, balance, delete_client, get_address, get_funds, index, status, update_clients,
-        AppState,
+        add_client, balance, delete_client, get_address, get_funds, health, index, status,
+        update_clients, AppState,
     },
     service::Service,
 };
@@ -68,6 +68,7 @@ async fn main() -> std::io::Result<()> {
         App::new()
             .app_data(app_state.clone())
             .service(index)
+            .service(health)
             .service(status)
             .service(balance)
             .service(get_funds)

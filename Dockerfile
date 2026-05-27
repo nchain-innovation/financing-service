@@ -21,4 +21,6 @@ WORKDIR /app/bin
 
 # env var to detect we are in a docker instance
 ENV APP_ENV=docker
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+    CMD curl -f http://127.0.0.1:8080/health || exit 1
 CMD [ "/app/bin/financing-service"]

@@ -6,7 +6,8 @@ use serde::Deserialize;
 use crate::{
     client::FundRequest,
     responses::{
-        error_response, json_ok, AddressResponse, BalanceResponse, SuccessResponse,
+        error_response, json_ok, AddressResponse, BalanceResponse, HealthResponse,
+        SuccessResponse,
     },
     service::Service,
 };
@@ -35,6 +36,12 @@ pub struct AppState {
 #[get("/")]
 pub async fn index(_data: web::Data<AppState>) -> String {
     "Financing Service REST API".to_string()
+}
+
+/// Health check endpoint for container orchestration
+#[get("/health")]
+pub async fn health() -> impl Responder {
+    json_ok(&HealthResponse::ok())
 }
 
 /// Get Service Status endpoint
@@ -103,14 +110,9 @@ pub async fn get_funds(
         locking_script: locking_script_as_bytes,
     };
 
-    match service.has_sufficent_balance(&fund_request) {
-        Some(true) => {}
-        Some(false) | None => {
-            log::info!("insufficient funds!");
-            return error_response(
-                "Insufficent client balance to create funding transactions.",
-            );
-        }
+    if let Some(description) = service.funding_balance_error(&fund_request) {
+        log::info!("insufficient funds: {}", &description);
+        return error_response(description);
     }
 
     match service.create_funding_outpoints(&fund_request).await {
@@ -219,7 +221,8 @@ mod tests {
 
     use crate::{
         rest_api::{
-            add_client, balance, delete_client, get_address, get_funds, index, status, AppState,
+            add_client, balance, delete_client, get_address, get_funds, health, index, status,
+            AppState,
         },
         service::Service,
         test_support::{
@@ -244,6 +247,7 @@ mod tests {
             App::new()
                 .app_data(app_state)
                 .service(index)
+                .service(health)
                 .service(status)
                 .service(balance)
                 .service(get_funds)
@@ -271,6 +275,19 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = test::read_body(resp).await;
         assert_eq!(body, "Financing Service REST API");
+    }
+
+    #[actix_web::test]
+    async fn test_health() {
+        let app = build_app().await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get().uri("/health").to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["status"], "ok");
     }
 
     #[actix_web::test]
@@ -522,7 +539,7 @@ mod tests {
             &app,
             test::TestRequest::post()
                 .uri("/fund")
-                .set_json(fund_body(TEST_CLIENT_ID, 50_000_000, 1, LOCKING_SCRIPT_HEX))
+                .set_json(fund_body(TEST_CLIENT_ID, 100_000_000, 1, LOCKING_SCRIPT_HEX))
                 .to_request(),
         )
         .await;
@@ -532,6 +549,25 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Insufficent client balance"));
+    }
+
+    #[actix_web::test]
+    async fn test_fund_no_single_utxo_large_enough() {
+        let app = build_app().await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/fund")
+                .set_json(fund_body(TEST_CLIENT_ID, 50_000_000, 1, LOCKING_SCRIPT_HEX))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body: Value = test::read_body_json(resp).await;
+        assert!(body["description"]
+            .as_str()
+            .unwrap()
+            .contains("No single UTXO large enough"));
     }
 
     #[actix_web::test]

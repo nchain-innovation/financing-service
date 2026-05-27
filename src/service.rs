@@ -197,13 +197,13 @@ impl Service {
         Some(client.get_address())
     }
 
-    /// Return true if the client has sufficient balance for this transaction
-    pub fn has_sufficent_balance(&self, fund_request: &FundRequest) -> Option<bool> {
+    /// Return a funding balance error for the client, if any.
+    pub fn funding_balance_error(&self, fund_request: &FundRequest) -> Option<String> {
         let client = self
             .clients
             .iter()
             .find(|x| x.client_id == fund_request.client_id)?;
-        client.has_sufficent_balance(fund_request)
+        client.funding_balance_error(fund_request)
     }
 
     /// Given txid and no_of_outpoints return the outpoints as JSON string

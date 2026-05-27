@@ -14,6 +14,17 @@ pub struct ErrorResponse {
 }
 
 #[derive(Serialize)]
+pub struct HealthResponse {
+    pub status: &'static str,
+}
+
+impl HealthResponse {
+    pub fn ok() -> Self {
+        Self { status: "ok" }
+    }
+}
+
+#[derive(Serialize)]
 pub struct SuccessResponse {
     pub status: &'static str,
 }
