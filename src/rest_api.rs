@@ -8,7 +8,8 @@ use crate::{
     client::FundRequest,
     config::ClientConfig,
     responses::{
-        error_response, json_ok, AddressResponse, BalanceResponse, HealthResponse, SuccessResponse,
+        error_response, json_ok, partial_funding_error_response, AddressResponse, BalanceResponse,
+        HealthResponse, SuccessResponse,
     },
     secrets::{secret_reference, validate_env_var_name},
     service::Service,
@@ -164,9 +165,18 @@ pub async fn get_funds(
                 Ok(response) => json_ok(&response),
                 Err(description) => error_response(description),
             },
-            Err(description) => {
-                debug!("fund_with_multiple_transactions error = {:?}", &description);
-                error_response(description)
+            Err(error) => {
+                debug!("fund_with_multiple_transactions error = {:?}", &error);
+                if let Some(partial) = error.partial {
+                    match partial.to_response() {
+                        Ok(response) => {
+                            partial_funding_error_response(error.description, &response)
+                        }
+                        Err(description) => error_response(description),
+                    }
+                } else {
+                    error_response(error.description)
+                }
             }
         };
     }

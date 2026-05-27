@@ -53,21 +53,41 @@ pub struct BalanceResponse {
     pub unconfirmed: i64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct OutpointResponse {
     pub hash: String,
     pub index: u32,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct TxResponse {
     pub tx: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct FundingResponseJson {
     pub outpoints: Vec<OutpointResponse>,
     pub txs: Vec<TxResponse>,
+}
+
+#[derive(Serialize)]
+pub struct PartialFundingErrorResponse {
+    pub description: String,
+    pub outpoints: Vec<OutpointResponse>,
+    pub txs: Vec<TxResponse>,
+}
+
+pub fn partial_funding_error_response(
+    description: impl Into<String>,
+    funding: &FundingResponseJson,
+) -> HttpResponse {
+    HttpResponse::UnprocessableEntity()
+        .content_type(ContentType::json())
+        .json(PartialFundingErrorResponse {
+            description: description.into(),
+            outpoints: funding.outpoints.clone(),
+            txs: funding.txs.clone(),
+        })
 }
 
 pub fn error_response(description: impl Into<String>) -> HttpResponse {
@@ -90,4 +110,27 @@ pub fn json_ok<T: Serialize>(value: &T) -> HttpResponse {
     HttpResponse::Ok()
         .content_type(ContentType::json())
         .json(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn partial_funding_error_response_includes_successful_transactions() {
+        let funding = FundingResponseJson {
+            outpoints: vec![OutpointResponse {
+                hash: "abc123".to_string(),
+                index: 1,
+            }],
+            txs: vec![TxResponse {
+                tx: "010000".to_string(),
+            }],
+        };
+        let response = partial_funding_error_response("partial failure", &funding);
+        assert_eq!(
+            response.status(),
+            actix_http::StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
 }

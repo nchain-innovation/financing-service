@@ -127,6 +127,15 @@ Common error responses:
 * Insufficient total balance — `{"description": "Insufficent client balance: 900 satoshi available, 873 required."}`
 * No suitable UTXO set — `{"description": "Unable to select UTXOs for funding transaction: largest UTXO is 300 satoshi, 873 required including fees."}`
 * Invalid input — `{"description": "Invalid satoshi value '0'"}`
+* Partial `multiple_tx` failure — HTTP 422 with successful transactions included when some broadcasts succeed before a later failure:
+
+```json
+{
+    "description": "Failed to broadcast funding transaction 2 of 3: Failed to broadcast funding transaction. 1 transaction(s) were broadcast successfully: 11e11285...",
+    "outpoints": [{"hash": "11e1128551854896dba1af5ebd75f7fb712ae88684cae59e86f89b158de86697", "index": 1}],
+    "txs": [{"tx": "0100000001..."}]
+}
+```
 
 Funding combines multiple UTXOs when no single input is large enough, as long as total wallet balance covers outputs and fees.
 

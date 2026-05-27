@@ -20,10 +20,32 @@ use crate::{
     util::tx_as_hexstr,
 };
 
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct FundingResponse {
     pub outpoints: Vec<OutPoint>,
     pub txs: Vec<Tx>,
+}
+
+#[derive(Debug)]
+pub struct MultipleTxFundError {
+    pub description: String,
+    pub partial: Option<FundingResponse>,
+}
+
+impl MultipleTxFundError {
+    pub fn complete(description: impl Into<String>) -> Self {
+        Self {
+            description: description.into(),
+            partial: None,
+        }
+    }
+
+    pub fn partial(description: impl Into<String>, completed: FundingResponse) -> Self {
+        Self {
+            description: description.into(),
+            partial: Some(completed),
+        }
+    }
 }
 
 impl FundingResponse {
@@ -383,9 +405,9 @@ impl Service {
     pub async fn fund_with_multiple_transactions(
         service: &Arc<Service>,
         fund_request: &FundRequest,
-    ) -> Result<FundingResponse, String> {
+    ) -> Result<FundingResponse, MultipleTxFundError> {
         if let Some(description) = service.funding_balance_error(fund_request).await {
-            return Err(description);
+            return Err(MultipleTxFundError::complete(description));
         }
 
         let per_tx_request = FundRequest {
@@ -410,7 +432,7 @@ impl Service {
                         Err(cause) => {
                             if tx_index == 0 {
                                 resync_after_multiple_tx_failure(service, fund_request).await;
-                                return Err(cause);
+                                return Err(MultipleTxFundError::complete(cause));
                             }
                             resync_after_multiple_tx_failure(service, fund_request).await;
                             return Err(partial_broadcast_error(
@@ -424,7 +446,7 @@ impl Service {
                 }
                 Err(cause) => {
                     if tx_index == 0 {
-                        return Err(cause);
+                        return Err(MultipleTxFundError::complete(cause));
                     }
                     resync_after_multiple_tx_failure(service, fund_request).await;
                     return Err(partial_broadcast_error(
@@ -478,7 +500,7 @@ fn partial_broadcast_error(
     total: u32,
     broadcast: &FundingResponse,
     cause: String,
-) -> String {
+) -> MultipleTxFundError {
     let succeeded = broadcast.outpoints.len() as u32;
     let mut message =
         format!("Failed to broadcast funding transaction {failed_at} of {total}: {cause}");
@@ -492,8 +514,9 @@ fn partial_broadcast_error(
             ". {succeeded} transaction(s) were broadcast successfully: {}",
             hashes.join(", ")
         ));
+        return MultipleTxFundError::partial(message, broadcast.clone());
     }
-    message
+    MultipleTxFundError::complete(message)
 }
 
 async fn fetch_chain_state(
@@ -572,10 +595,26 @@ mod tests {
             index: 1,
         });
 
-        let message = partial_broadcast_error(2, 3, &broadcast, "network error".to_string());
-        assert!(message.contains("2 of 3"));
-        assert!(message.contains("1 transaction(s) were broadcast successfully"));
-        assert!(message.contains("f67272e5"));
+        let error = partial_broadcast_error(2, 3, &broadcast, "network error".to_string());
+        assert!(error.partial.is_some());
+        assert!(error.description.contains("2 of 3"));
+        assert!(error
+            .description
+            .contains("1 transaction(s) were broadcast successfully"));
+        assert!(error.description.contains("f67272e5"));
+        assert_eq!(error.partial.unwrap().outpoints.len(), 1);
+    }
+
+    #[test]
+    fn partial_broadcast_error_without_successes_has_no_partial_payload() {
+        let error = partial_broadcast_error(
+            1,
+            2,
+            &FundingResponse::default(),
+            "network error".to_string(),
+        );
+        assert!(error.partial.is_none());
+        assert!(error.description.contains("network error"));
     }
 
     #[tokio::test]
