@@ -60,7 +60,6 @@ Admin       ──REST──▶       │                │
 
 ## Open items
 
-* Reduce sensitive data in logs (full tx hex at `info` level)
 * Clean up remaining startup-path panics (`Client::new`, config parse failures)
 
 ## Related documentation

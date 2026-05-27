@@ -353,8 +353,8 @@ impl Service {
         let mut response = FundingResponse::default();
         if prepared.multiple_tx {
             for tx in &prepared.txs {
-                let tx_as_str = tx_as_hexstr(tx)?;
-                log::info!("tx_as_str = {}", &tx_as_str);
+                log::info!("broadcasting funding tx {}", tx.hash().encode());
+                log::debug!("funding tx hex = {}", tx_as_hexstr(tx)?);
                 blockchain.broadcast_tx(tx).await.map_err(|e| {
                     log::warn!("Failed to broadcast funding transaction: {:?}", e);
                     "Failed to broadcast funding transaction.".to_string()
@@ -373,6 +373,8 @@ impl Service {
                 .next()
                 .ok_or_else(|| "No funding transaction prepared.".to_string())?;
             response.txs.push(tx.clone());
+            log::info!("broadcasting funding tx {}", tx.hash().encode());
+            log::debug!("funding tx hex = {}", tx_as_hexstr(&tx)?);
             blockchain.broadcast_tx(&tx).await.map_err(|e| {
                 log::warn!("Failed to broadcast funding transaction: {:?}", e);
                 "Failed to broadcast funding transaction.".to_string()
