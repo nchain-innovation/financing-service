@@ -12,25 +12,27 @@ The FS is designed to be as simple as possible, in that light it:
 
 * One FS can serve multiple clients.
 * FS provides REST API for clients to interact with.
-* FS supports the dynamic addition and removal of clients from the sytem (via REST API).
+* FS supports the dynamic addition and removal of clients from the system (via REST API).
 
-* FS can provide any satoshi amount (subject to sufficent funds).
+* FS can provide any satoshi amount (subject to sufficient funds).
 * FS can provide any number of outpoints, in any number of transactions.
 
 * FS only accesses the funding key required to sign the transaction that provides the funds the client wishes to spend.
 * FS does not access the client's key, instead the client provides the locking script (script_pubkey).
 
 * FS uses WhatsOnChain or UTXO as a Service (UaaS) interfaces to access the blockchain.
-* FS is stateless, that is to say it determines its state by reading the blockchain, it stores no state.
-* FS is configurable, it reads its configuration on startup.
+* FS maintains an in-memory UTXO cache per client, refreshed periodically from the blockchain and before funding and balance requests. Clients added at runtime are persisted to a dynamic config file.
+* FS is configurable; it reads its configuration on startup.
 
-* FS does not cache funding transactions. That is a task better performed by the requesting application, which has much better oversight to determine how many funding transactions to cache, and when to request them.
+* FS does not cache funding transactions for client applications. That is a task better performed by the requesting application, which has much better oversight to determine how many funding transactions to cache, and when to request them.
 
 * FS is written in Rust.
-* FS build dependencies are all freely avalible open-source Rust crates.
+* FS build dependencies are all freely available open-source Rust crates.
 
 * FS does not support Hierarchical Deterministic (HD) Keys (BIP-32).
 * FS supports optional per-client API key authentication and an optional admin key for `POST /client`. Clients without an `api_key` rely on network isolation (firewalls, private networks, reverse proxies). See [Configuration](docs/Configuration.md) and [Supported endpoints](docs/SupportedEndpoints.md).
+* FS supports secret references (`env:VAR`), environment variable overrides, and `wif_env` / `api_key_env` when adding clients at runtime. See [Configuration](docs/Configuration.md#secret-management).
+* FS supports optional per-IP HTTP rate limiting (disabled by default). See [Configuration](docs/Configuration.md#rate-limiting).
 
 ## Use cases
 
@@ -60,7 +62,9 @@ Diagram 2 - Financing Service Overview
 
 As shown in diagram 1 the FS provides an interface that the other application components interface with and uses the blockchain to create the funding transaction outpoints.
 
-The service reads its configuration on startup.
+The service reads its configuration on startup, maintains per-client wallet state in memory, and persists runtime-added clients to disk.
+
+Before returning a balance or building a funding transaction, the service refreshes UTXO state from the blockchain. Concurrent fund requests for the same client use read-only planning under a shared lock and commit UTXO updates only after a transaction is broadcast successfully.
 
 The service uses the `chain-gang` library's WoCInterface to interact with the BSV blockchain.
 
@@ -135,6 +139,12 @@ For details of the REST API endpoints provided by this service see [here](docs/S
 
 ## Configuration
 For service and client configuration, including per-client `api_key` authentication, see [here](docs/Configuration.md)
+
+## Project status
+For architecture, implementation status, and known limitations, see [Project.md](docs/Project.md)
+
+## System requirements
+For formal requirements and how each is verified (automated tests, CI, manual checks), see [SystemRequirements.md](docs/SystemRequirements.md)
 
 ## Locking scripts
 For details on generating locking scripts for the `fund` call see [here](docs/LockingScripts.md)
