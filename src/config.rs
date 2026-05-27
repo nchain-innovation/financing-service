@@ -4,6 +4,8 @@ use chain_gang::network::Network;
 use log::debug;
 use serde::{Deserialize, Serialize};
 
+use crate::secrets::{resolve_secret, warn_plaintext_secrets};
+
 /// Blockchain Interface Configuration
 #[derive(Debug, Default, Deserialize, Clone)]
 pub struct BlockchainInterfaceConfig {
@@ -68,6 +70,13 @@ pub struct Config {
     pub dynamic_config: DynamicConfigConfig,
 }
 
+impl ClientConfig {
+    /// Resolve `env:VAR` references and client-specific environment overrides.
+    pub fn resolve_secrets(self) -> Result<Self, String> {
+        resolve_client_config(self)
+    }
+}
+
 impl Config {
     /// Return the configured network as Network type
     pub fn get_network(&self) -> Result<Network, &str> {
@@ -90,6 +99,78 @@ impl Config {
             other => Err(format!("Unknown log level '{other}'")),
         }
     }
+
+    /// Resolve secret references and apply environment overrides.
+    pub fn resolve_secrets(mut self) -> Result<Self, String> {
+        if let Ok(admin_api_key) = env::var("FS_ADMIN_API_KEY") {
+            if !admin_api_key.is_empty() {
+                self.web_interface.admin_api_key = Some(admin_api_key);
+            }
+        } else if let Some(admin_api_key) = self.web_interface.admin_api_key.take() {
+            self.web_interface.admin_api_key = Some(resolve_secret(&admin_api_key)?);
+        }
+
+        if let Some(clients) = self.client.as_mut() {
+            let resolved = std::mem::take(clients)
+                .into_iter()
+                .map(resolve_client_config)
+                .collect::<Result<Vec<_>, _>>()?;
+            *clients = resolved;
+        }
+
+        Ok(self)
+    }
+}
+
+fn resolve_client_config(mut client: ClientConfig) -> Result<ClientConfig, String> {
+    if let Ok(wif_key) = env::var(client_wif_env_var(&client.client_id)) {
+        if !wif_key.is_empty() {
+            client.wif_key = wif_key;
+        } else {
+            client.wif_key = resolve_secret(&client.wif_key)?;
+        }
+    } else {
+        client.wif_key = resolve_secret(&client.wif_key)?;
+    }
+
+    if let Ok(api_key) = env::var(client_api_key_env_var(&client.client_id)) {
+        if !api_key.is_empty() {
+            client.api_key = Some(api_key);
+        } else if let Some(key) = client.api_key.take() {
+            client.api_key = Some(resolve_secret(&key)?);
+        }
+    } else if let Some(api_key) = client.api_key.take() {
+        client.api_key = Some(resolve_secret(&api_key)?);
+    }
+
+    Ok(client)
+}
+
+fn client_wif_env_var(client_id: &str) -> String {
+    format!("FS_CLIENT_{}_WIF", env_key_suffix(client_id))
+}
+
+fn client_api_key_env_var(client_id: &str) -> String {
+    format!("FS_CLIENT_{}_API_KEY", env_key_suffix(client_id))
+}
+
+fn env_key_suffix(client_id: &str) -> String {
+    client_id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+pub fn load_config(env_var: &str, filename: &str) -> Result<Config, String> {
+    let config = get_config(env_var, filename)?;
+    warn_plaintext_secrets(&config);
+    config.resolve_secrets()
 }
 
 /// Read the config from the provided file
@@ -114,5 +195,57 @@ pub fn get_config(env_var: &str, filename: &str) -> Result<Config, String> {
         None => {
             read_config(filename).map_err(|e| format!("Error reading config file {filename}: {e}"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_secrets_replaces_env_references() {
+        unsafe { env::set_var("FS_TEST_CONFIG_WIF", "test-wif-value") };
+        unsafe { env::set_var("FS_TEST_CONFIG_API_KEY", "test-api-key") };
+        unsafe { env::set_var("FS_TEST_CONFIG_ADMIN", "admin-from-env") };
+        unsafe { env::remove_var("FS_CLIENT_ID1_WIF") };
+
+        let config = Config {
+            web_interface: WebInterfaceConfig {
+                address: Ipv4Addr::new(127, 0, 0, 1),
+                port: 8080,
+                admin_api_key: Some("env:FS_TEST_CONFIG_ADMIN".to_string()),
+            },
+            client: Some(vec![ClientConfig {
+                client_id: "id1".to_string(),
+                wif_key: "env:FS_TEST_CONFIG_WIF".to_string(),
+                api_key: Some("env:FS_TEST_CONFIG_API_KEY".to_string()),
+            }]),
+            ..Default::default()
+        };
+
+        let resolved = config.resolve_secrets().unwrap();
+        assert_eq!(
+            resolved.web_interface.admin_api_key.as_deref(),
+            Some("admin-from-env")
+        );
+        let client = resolved.client.as_ref().unwrap().first().unwrap();
+        assert_eq!(client.wif_key, "test-wif-value");
+        assert_eq!(client.api_key.as_deref(), Some("test-api-key"));
+    }
+
+    #[test]
+    fn resolve_secrets_applies_client_env_overrides() {
+        unsafe { env::set_var("FS_CLIENT_ID1_WIF", "override-wif") };
+        let config = Config {
+            client: Some(vec![ClientConfig {
+                client_id: "id1".to_string(),
+                wif_key: "env:SHOULD_NOT_BE_USED".to_string(),
+                api_key: None,
+            }]),
+            ..Default::default()
+        };
+        let resolved = config.resolve_secrets().unwrap();
+        assert_eq!(resolved.client.as_ref().unwrap()[0].wif_key, "override-wif");
+        unsafe { env::remove_var("FS_CLIENT_ID1_WIF") };
     }
 }

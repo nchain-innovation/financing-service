@@ -10,6 +10,7 @@ mod config;
 mod dynamic_config;
 mod responses;
 mod rest_api;
+mod secrets;
 mod service;
 mod util;
 
@@ -17,7 +18,7 @@ mod util;
 mod test_support;
 
 use crate::{
-    config::{get_config, Config},
+    config::{load_config, Config},
     rest_api::{
         add_client, balance, delete_client, get_address, get_funds, health, index, status,
         update_clients, AppState,
@@ -39,7 +40,7 @@ fn get_addr(config: &Config) -> (Ipv4Addr, u16) {
 /// Main - Read config and setup Web server.
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let config = get_config("FS_CONFIG", "data/financing-service.toml").map_err(|e| {
+    let config = load_config("FS_CONFIG", "data/financing-service.toml").map_err(|e| {
         eprintln!("Unable to read config: {e}");
         std::io::Error::new(std::io::ErrorKind::InvalidData, e)
     })?;

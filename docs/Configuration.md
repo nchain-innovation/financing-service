@@ -94,3 +94,41 @@ api_key = "your-client-secret"
 * `api_key` — optional shared secret for this client's API endpoints
 
 When `api_key` is set for a client, requests for that client must include either `Authorization: Bearer <api_key>` or `X-API-Key: <api_key>`. Clients without an `api_key` remain unauthenticated; restrict them via network isolation. The service logs a warning at startup listing clients without an `api_key`.
+
+## Secret management
+
+Avoid storing literal secrets in TOML when possible. The service supports:
+
+### `env:VAR_NAME` references
+
+Use the `env:` prefix to load a value from the process environment at startup:
+
+```toml
+[web_interface]
+admin_api_key = "env:FS_ADMIN_API_KEY"
+
+[[client]]
+client_id = "id1"
+wif_key = "env:MY_CLIENT_WIF"
+api_key = "env:MY_CLIENT_API_KEY"
+```
+
+If a referenced variable is not set, startup fails with a clear error.
+
+### Environment overrides
+
+These variables take precedence over config file values:
+
+| Variable | Overrides |
+|----------|-----------|
+| `FS_ADMIN_API_KEY` | `web_interface.admin_api_key` |
+| `FS_CLIENT_{CLIENT_ID}_WIF` | `wif_key` for that client (`CLIENT_ID` is uppercased; non-alphanumeric characters become `_`) |
+| `FS_CLIENT_{CLIENT_ID}_API_KEY` | `api_key` for that client |
+
+Example: for `client_id = "id1"`, set `FS_CLIENT_ID1_WIF`.
+
+### Plaintext warnings
+
+When WIF keys, client `api_key`, or `admin_api_key` are stored as literal values in config files, the service logs a warning at startup. Literal values still work for local development.
+
+Dynamic clients added via `POST /client` can use `wif_env` and `api_key_env` instead of `wif` and `api_key`; the service stores `env:VAR` references in the dynamic config file rather than the secret values.

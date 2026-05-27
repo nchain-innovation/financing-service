@@ -43,14 +43,14 @@ impl Client {
     pub fn try_new(config: &ClientConfig) -> Result<Self, String> {
         let wallet = Wallet::from_wif(&config.wif_key).map_err(|_| {
             format!(
-                r#"wif_key = "{}" is not a valid WIF key (client_id = "{}")."#,
-                config.wif_key, config.client_id
+                r#"wif_key is not a valid WIF key (client_id = "{}")."#,
+                config.client_id
             )
         })?;
         let address = wallet.get_address().map_err(|_| {
             format!(
-                r#"wif_key = "{}" is not a valid WIF key - issues with address (client_id = "{}")."#,
-                config.wif_key, config.client_id
+                r#"wif_key is not a valid WIF key - issues with address (client_id = "{}")."#,
+                config.client_id
             )
         })?;
         Ok(Client {

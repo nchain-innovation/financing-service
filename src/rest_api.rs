@@ -6,9 +6,11 @@ use std::sync::Arc;
 use crate::{
     auth::{authorize_admin, authorize_client},
     client::FundRequest,
+    config::ClientConfig,
     responses::{
         error_response, json_ok, AddressResponse, BalanceResponse, HealthResponse, SuccessResponse,
     },
+    secrets::{secret_reference, validate_env_var_name},
     service::Service,
 };
 
@@ -24,9 +26,48 @@ pub struct FundingRequest {
 #[derive(Deserialize, Debug)]
 pub struct ClientAddRequest {
     client_id: String,
-    wif: String,
+    #[serde(default)]
+    wif: Option<String>,
+    #[serde(default)]
+    wif_env: Option<String>,
     #[serde(default)]
     api_key: Option<String>,
+    #[serde(default)]
+    api_key_env: Option<String>,
+}
+
+impl ClientAddRequest {
+    fn into_client_config(self) -> Result<ClientConfig, String> {
+        let wif_key = match (self.wif, self.wif_env) {
+            (Some(wif), None) => wif,
+            (None, Some(env_var)) => {
+                validate_env_var_name(&env_var)?;
+                secret_reference(&env_var)
+            }
+            (Some(_), Some(_)) => {
+                return Err("Provide either wif or wif_env, not both".to_string());
+            }
+            (None, None) => return Err("Missing wif or wif_env".to_string()),
+        };
+
+        let api_key = match (self.api_key, self.api_key_env) {
+            (None, None) => None,
+            (Some(key), None) => Some(key),
+            (None, Some(env_var)) => {
+                validate_env_var_name(&env_var)?;
+                Some(secret_reference(&env_var))
+            }
+            (Some(_), Some(_)) => {
+                return Err("Provide either api_key or api_key_env, not both".to_string());
+            }
+        };
+
+        Ok(ClientConfig {
+            client_id: self.client_id,
+            wif_key,
+            api_key,
+        })
+    }
 }
 
 /// Application State Data
@@ -172,18 +213,18 @@ pub async fn add_client(
     if let Some(response) = authorize_admin(&req, &data.service) {
         return response;
     }
-    let client_id = &info.client_id;
-    log::info!("add_client {}", &client_id);
+    let client_config = match info.into_inner().into_client_config() {
+        Ok(client_config) => client_config,
+        Err(description) => return error_response(description),
+    };
+    let client_id = &client_config.client_id;
+    log::info!("add_client {}", client_id);
 
     if data.service.is_client_id_valid(client_id).await {
         return error_response(format!("Client already exists: {client_id}"));
     }
 
-    match data
-        .service
-        .add_client(client_id, &info.wif, info.api_key.as_deref())
-        .await
-    {
+    match data.service.add_client(&client_config).await {
         Ok(()) => json_ok(&SuccessResponse::new()),
         Err(description) => error_response(description),
     }
@@ -433,6 +474,26 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[actix_web::test]
+    async fn test_add_client_with_wif_env() {
+        unsafe { std::env::set_var("FS_TEST_ADD_CLIENT_WIF", TEST_WIF) };
+        let app = build_app().await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/client")
+                .set_json(json!({
+                    "client_id": "client_env",
+                    "wif_env": "FS_TEST_ADD_CLIENT_WIF",
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["status"], "Success");
     }
 
     #[actix_web::test]

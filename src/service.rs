@@ -71,18 +71,25 @@ impl Service {
 
         if let Some(clients_config) = &config.client {
             for client_config in clients_config {
+                let resolved = client_config.clone().resolve_secrets()?;
                 clients.insert(
                     client_config.client_id.clone(),
-                    Arc::new(RwLock::new(Client::try_new(client_config)?)),
+                    Arc::new(RwLock::new(Client::try_new(&resolved)?)),
                 );
             }
         }
 
         let dynamic_config = DynamicConfig::new(config);
         for client_config in &dynamic_config.contents.clients {
+            crate::secrets::warn_plaintext_client_secrets(
+                &client_config.client_id,
+                &client_config.wif_key,
+                client_config.api_key.as_deref(),
+            );
+            let resolved = client_config.clone().resolve_secrets()?;
             clients.insert(
                 client_config.client_id.clone(),
-                Arc::new(RwLock::new(Client::try_new(client_config)?)),
+                Arc::new(RwLock::new(Client::try_new(&resolved)?)),
             );
         }
 
@@ -137,27 +144,26 @@ impl Service {
         self.clients.read().await.values().cloned().collect()
     }
 
-    pub async fn add_client(
-        &self,
-        client_id: &str,
-        wif: &str,
-        api_key: Option<&str>,
-    ) -> Result<(), String> {
-        let client_config = ClientConfig {
-            client_id: client_id.to_string(),
-            wif_key: wif.to_string(),
-            api_key: api_key.map(str::to_string),
-        };
-        let new_client = Arc::new(RwLock::new(Client::try_new(&client_config)?));
+    pub async fn add_client(&self, client_config: &ClientConfig) -> Result<(), String> {
+        crate::secrets::warn_plaintext_client_secrets(
+            &client_config.client_id,
+            &client_config.wif_key,
+            client_config.api_key.as_deref(),
+        );
+        let resolved = client_config.clone().resolve_secrets()?;
+        let new_client = Arc::new(RwLock::new(Client::try_new(&resolved)?));
         {
             let mut clients = self.clients.write().await;
-            if clients.contains_key(client_id) {
-                return Err(format!("Client already exists: {client_id}"));
+            if clients.contains_key(&client_config.client_id) {
+                return Err(format!(
+                    "Client already exists: {}",
+                    client_config.client_id
+                ));
             }
-            clients.insert(client_id.to_string(), Arc::clone(&new_client));
+            clients.insert(client_config.client_id.clone(), Arc::clone(&new_client));
         }
-        if let Err(error) = self.dynamic_config.lock().await.add(&client_config) {
-            self.clients.write().await.remove(client_id);
+        if let Err(error) = self.dynamic_config.lock().await.add(client_config) {
+            self.clients.write().await.remove(&client_config.client_id);
             return Err(error);
         }
         Ok(())
@@ -508,6 +514,7 @@ async fn fetch_chain_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ClientConfig;
     use crate::test_support::{
         test_blockchain_interface, test_config, test_config_with_keys, unique_dynamic_config_path,
         LOCKING_SCRIPT_HEX, TEST_CLIENT_ID, TEST_WIF,
@@ -600,7 +607,11 @@ mod tests {
         let blockchain = test_blockchain_interface(&config).await;
         let service = Arc::new(Service::new_for_test(&config, blockchain).await);
         service
-            .add_client("client2", TEST_WIF, None)
+            .add_client(&ClientConfig {
+                client_id: "client2".to_string(),
+                wif_key: TEST_WIF.to_string(),
+                api_key: None,
+            })
             .await
             .expect("add second client");
 

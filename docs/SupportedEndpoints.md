@@ -135,8 +135,12 @@ Request body (JSON):
 | Field | Type | Description |
 |-------|------|-------------|
 | `client_id` | string | Identifier for the new client |
-| `wif` | string | WIF private key for the client's funding wallet |
+| `wif` | string | WIF private key for the client's funding wallet (use `wif` or `wif_env`) |
+| `wif_env` | string | Environment variable name containing the WIF; stored as `env:VAR` in dynamic config |
 | `api_key` | string | Optional shared secret for this client's API endpoints |
+| `api_key_env` | string | Environment variable name containing the client API key; stored as `env:VAR` in dynamic config |
+
+Provide either `wif` or `wif_env`, and either `api_key` or `api_key_env` (not both pairs).
 
 ```bash
 curl -H "Authorization: Bearer your-admin-api-key" \
