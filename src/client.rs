@@ -29,8 +29,6 @@ pub struct FundRequest {
 /// Represents a Client of the service
 #[derive(Debug, Clone)]
 pub struct Client {
-    /// Used to identify the client
-    pub client_id: String,
     api_key: Option<String>,
     /// Funding Wallet
     wallet: Wallet,
@@ -56,7 +54,6 @@ impl Client {
             )
         })?;
         Ok(Client {
-            client_id: config.client_id.clone(),
             api_key: config.api_key.clone().filter(|key| !key.is_empty()),
             wallet,
             address,

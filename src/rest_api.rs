@@ -1,7 +1,7 @@
 use actix_web::{delete, get, post, web, HttpRequest, HttpResponse, Responder};
 use log::debug;
 use serde::Deserialize;
-use tokio::sync::RwLock;
+use std::sync::Arc;
 
 use crate::{
     auth::{authorize_admin, authorize_client},
@@ -31,7 +31,7 @@ pub struct ClientAddRequest {
 
 /// Application State Data
 pub struct AppState {
-    pub service: RwLock<Service>,
+    pub service: Arc<Service>,
 }
 
 /// Get Index endpoint
@@ -50,9 +50,7 @@ pub async fn health() -> impl Responder {
 #[get("/status")]
 pub async fn status(data: web::Data<AppState>) -> impl Responder {
     log::info!("status");
-
-    let service = data.service.read().await;
-    json_ok(&service.get_status())
+    json_ok(&data.service.get_status().await)
 }
 
 /// Endpoint to update all the clients, called by ticker every minute
@@ -107,14 +105,11 @@ pub async fn get_funds(
         locking_script: locking_script_as_bytes,
     };
 
-    {
-        let service = data.service.read().await;
-        if !service.is_client_id_valid(client_id) {
-            return error_response(format!("Unknown client_id {client_id}"));
-        }
-        if let Some(response) = authorize_client(&req, client_id, &service) {
-            return response;
-        }
+    if !data.service.is_client_id_valid(client_id).await {
+        return error_response(format!("Unknown client_id {client_id}"));
+    }
+    if let Some(response) = authorize_client(&req, client_id, &data.service).await {
+        return response;
     }
 
     if let Err(description) = Service::refresh_client_chain_state(&data.service, client_id).await {
@@ -135,22 +130,19 @@ pub async fn get_funds(
         };
     }
 
-    let (blockchain, prepared) = {
-        let mut service = data.service.write().await;
+    if let Some(description) = data.service.funding_balance_error(&fund_request).await {
+        log::info!("insufficient funds: {}", &description);
+        return error_response(description);
+    }
 
-        if let Some(description) = service.funding_balance_error(&fund_request) {
-            log::info!("insufficient funds: {}", &description);
-            return error_response(description);
-        }
-
-        match service.prepare_funding_outpoints(&fund_request) {
-            Ok(prepared) => (service.blockchain_interface(), prepared),
+    let (blockchain, prepared) =
+        match Service::prepare_funding_outpoints(&data.service, &fund_request).await {
+            Ok(prepared) => prepared,
             Err(description) => {
                 debug!("prepare_funding_outpoints error = {:?}", &description);
                 return error_response(description);
             }
-        }
-    };
+        };
 
     match Service::broadcast_prepared_funding(blockchain, prepared).await {
         Ok(funding_response) => match funding_response.to_response() {
@@ -177,18 +169,21 @@ pub async fn add_client(
     data: web::Data<AppState>,
     info: web::Json<ClientAddRequest>,
 ) -> impl Responder {
-    let mut service = data.service.write().await;
-    if let Some(response) = authorize_admin(&req, &service) {
+    if let Some(response) = authorize_admin(&req, &data.service) {
         return response;
     }
     let client_id = &info.client_id;
     log::info!("add_client {}", &client_id);
 
-    if service.is_client_id_valid(client_id) {
+    if data.service.is_client_id_valid(client_id).await {
         return error_response(format!("Client already exists: {client_id}"));
     }
 
-    match service.add_client(client_id, &info.wif, info.api_key.as_deref()) {
+    match data
+        .service
+        .add_client(client_id, &info.wif, info.api_key.as_deref())
+        .await
+    {
         Ok(()) => json_ok(&SuccessResponse::new()),
         Err(description) => error_response(description),
     }
@@ -203,18 +198,17 @@ pub async fn delete_client(
     data: web::Data<AppState>,
     info: web::Path<String>,
 ) -> impl Responder {
-    let mut service = data.service.write().await;
     let client_id: String = info.to_string();
     log::info!("delete_client {}", &client_id);
 
-    if !service.is_client_id_valid(&client_id) {
+    if !data.service.is_client_id_valid(&client_id).await {
         return error_response(format!("Unknown client_id {client_id}"));
     }
-    if let Some(response) = authorize_client(&req, &client_id, &service) {
+    if let Some(response) = authorize_client(&req, &client_id, &data.service).await {
         return response;
     }
 
-    match service.delete_client(&client_id) {
+    match data.service.delete_client(&client_id).await {
         Ok(()) => json_ok(&SuccessResponse::new()),
         Err(description) => error_response(description),
     }
@@ -230,16 +224,14 @@ pub async fn get_address(
     let client_id: String = info.to_string();
     log::info!("get address {}", &client_id);
 
-    let service = data.service.read().await;
-
-    if !service.is_client_id_valid(&client_id) {
+    if !data.service.is_client_id_valid(&client_id).await {
         return error_response(format!("Unknown client_id {client_id}"));
     }
-    if let Some(response) = authorize_client(&req, &client_id, &service) {
+    if let Some(response) = authorize_client(&req, &client_id, &data.service).await {
         return response;
     }
 
-    match service.get_address(&client_id) {
+    match data.service.get_address(&client_id).await {
         Some(address) => json_ok(&AddressResponse { address }),
         None => error_response(format!("Unknown client_id {client_id}")),
     }
@@ -255,16 +247,14 @@ pub async fn balance(
     let client_id: String = info.to_string();
     log::info!("get balance {}", &client_id);
 
-    let service = data.service.read().await;
-
-    if !service.is_client_id_valid(&client_id) {
+    if !data.service.is_client_id_valid(&client_id).await {
         return error_response(format!("Unknown client_id {client_id}"));
     }
-    if let Some(response) = authorize_client(&req, &client_id, &service) {
+    if let Some(response) = authorize_client(&req, &client_id, &data.service).await {
         return response;
     }
 
-    match service.get_balance(&client_id) {
+    match data.service.get_balance(&client_id).await {
         Some(balance) => json_ok(&BalanceResponse {
             confirmed: balance.confirmed,
             unconfirmed: balance.unconfirmed,
@@ -279,7 +269,7 @@ mod tests {
     use actix_web::{dev::Service as ActixService, dev::ServiceResponse, Error};
     use actix_web::{http::StatusCode, test, web, App};
     use serde_json::{json, Value};
-    use tokio::sync::RwLock;
+    use std::sync::Arc;
 
     use crate::{
         rest_api::{
@@ -303,9 +293,9 @@ mod tests {
         let config =
             test_config_with_keys(&unique_dynamic_config_path(), client_api_key, admin_api_key);
         let blockchain = test_blockchain_interface(&config).await;
-        let financing_service = Service::new_for_test(&config, blockchain).await;
+        let financing_service = Arc::new(Service::new_for_test(&config, blockchain).await);
         let app_state = web::Data::new(AppState {
-            service: RwLock::new(financing_service),
+            service: financing_service,
         });
 
         test::init_service(

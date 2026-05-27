@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::SystemTime};
+use std::{collections::HashMap, sync::Arc, time::SystemTime};
 
 use chain_gang::{
     interface::{Balance, BlockchainInterface, Utxo},
@@ -6,7 +6,7 @@ use chain_gang::{
 };
 use chrono::prelude::DateTime;
 use chrono::Utc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::{
     blockchain_factory::blockchain_factory,
@@ -53,13 +53,12 @@ pub struct PreparedFunding {
 }
 
 /// Service data
-//#[derive(Debug)]
 pub struct Service {
-    blockchain_status: BlockchainConnectionStatus,
-    blockchain_update_time: Option<SystemTime>,
+    blockchain_status: RwLock<BlockchainConnectionStatus>,
+    blockchain_update_time: RwLock<Option<SystemTime>>,
     blockchain_interface: Arc<dyn BlockchainInterface + Send + Sync>,
-    clients: Vec<Client>,
-    dynamic_config: DynamicConfig,
+    clients: RwLock<HashMap<String, Arc<RwLock<Client>>>>,
+    dynamic_config: Mutex<DynamicConfig>,
     admin_api_key: Option<String>,
 }
 
@@ -68,25 +67,31 @@ impl Service {
         config: &Config,
         blockchain_interface: Arc<dyn BlockchainInterface + Send + Sync>,
     ) -> Result<Service, String> {
-        let mut clients: Vec<Client> = Vec::new();
+        let mut clients = HashMap::new();
 
         if let Some(clients_config) = &config.client {
             for client_config in clients_config {
-                clients.push(Client::try_new(client_config)?);
+                clients.insert(
+                    client_config.client_id.clone(),
+                    Arc::new(RwLock::new(Client::try_new(client_config)?)),
+                );
             }
         }
 
         let dynamic_config = DynamicConfig::new(config);
         for client_config in &dynamic_config.contents.clients {
-            clients.push(Client::try_new(client_config)?);
+            clients.insert(
+                client_config.client_id.clone(),
+                Arc::new(RwLock::new(Client::try_new(client_config)?)),
+            );
         }
 
         Ok(Service {
-            blockchain_status: BlockchainConnectionStatus::Unknown,
-            blockchain_update_time: None,
+            blockchain_status: RwLock::new(BlockchainConnectionStatus::Unknown),
+            blockchain_update_time: RwLock::new(None),
             blockchain_interface,
-            clients,
-            dynamic_config,
+            clients: RwLock::new(clients),
+            dynamic_config: Mutex::new(dynamic_config),
             admin_api_key: config
                 .web_interface
                 .admin_api_key
@@ -103,7 +108,7 @@ impl Service {
             format!("Unable to connect to blockchain, ensure that the service is running: {e:?}")
         })?;
 
-        let mut service = Self::build(config, blockchain_interface)?;
+        let service = Self::build(config, blockchain_interface)?;
         service.update_balances().await;
         Ok(service)
     }
@@ -118,14 +123,22 @@ impl Service {
             .await
             .expect("Unable to connect to test blockchain.");
 
-        let mut service = Self::build(config, blockchain_interface)
+        let service = Self::build(config, blockchain_interface)
             .expect("Invalid client configuration in test setup");
         service.update_balances().await;
         service
     }
 
-    pub fn add_client(
-        &mut self,
+    async fn client_handle(&self, client_id: &str) -> Option<Arc<RwLock<Client>>> {
+        self.clients.read().await.get(client_id).cloned()
+    }
+
+    async fn client_handles(&self) -> Vec<Arc<RwLock<Client>>> {
+        self.clients.read().await.values().cloned().collect()
+    }
+
+    pub async fn add_client(
+        &self,
         client_id: &str,
         wif: &str,
         api_key: Option<&str>,
@@ -135,25 +148,30 @@ impl Service {
             wif_key: wif.to_string(),
             api_key: api_key.map(str::to_string),
         };
-        let new_client = Client::try_new(&client_config)?;
-        self.clients.push(new_client);
-        if let Err(e) = self.dynamic_config.add(&client_config) {
-            self.clients.pop();
-            return Err(e);
+        let new_client = Arc::new(RwLock::new(Client::try_new(&client_config)?));
+        {
+            let mut clients = self.clients.write().await;
+            if clients.contains_key(client_id) {
+                return Err(format!("Client already exists: {client_id}"));
+            }
+            clients.insert(client_id.to_string(), Arc::clone(&new_client));
+        }
+        if let Err(error) = self.dynamic_config.lock().await.add(&client_config) {
+            self.clients.write().await.remove(client_id);
+            return Err(error);
         }
         Ok(())
     }
 
-    pub fn delete_client(&mut self, client_id: &str) -> Result<(), String> {
-        if let Some(index) = self.clients.iter().position(|c| c.client_id == client_id) {
-            self.clients.remove(index);
-        }
-        self.dynamic_config.remove(client_id)
+    pub async fn delete_client(&self, client_id: &str) -> Result<(), String> {
+        self.dynamic_config.lock().await.remove(client_id)?;
+        self.clients.write().await.remove(client_id);
+        Ok(())
     }
 
     /// Return the Service status
-    pub fn get_status(&self) -> StatusResponse {
-        let update_time = match self.blockchain_update_time {
+    pub async fn get_status(&self) -> StatusResponse {
+        let update_time = match *self.blockchain_update_time.read().await {
             Some(time) => {
                 let datetime = DateTime::<Utc>::from(time);
                 datetime.format("%Y-%m-%d %H:%M:%S").to_string()
@@ -162,29 +180,33 @@ impl Service {
         };
         StatusResponse {
             version: env!("CARGO_PKG_VERSION").to_string(),
-            blockchain_status: self.blockchain_status,
+            blockchain_status: *self.blockchain_status.read().await,
             blockchain_update_time: update_time,
         }
     }
 
-    async fn get_block_headers(&mut self) {
-        self.blockchain_status = match self.blockchain_interface.get_block_headers().await {
+    async fn get_block_headers(&self) {
+        let status = match self.blockchain_interface.get_block_headers().await {
             Ok(_) => BlockchainConnectionStatus::Connected,
             Err(e) => {
                 log::warn!("get_block_headers - failed {:?}", e);
                 BlockchainConnectionStatus::Failed
             }
         };
-        self.blockchain_update_time = Some(SystemTime::now());
+        *self.blockchain_status.write().await = status;
+        *self.blockchain_update_time.write().await = Some(SystemTime::now());
     }
 
-    /// Update client balances while holding a mutable reference (startup only).
-    pub async fn update_balances(&mut self) {
-        if self.clients.is_empty() {
+    /// Update client balances at startup.
+    pub async fn update_balances(&self) {
+        let handles = self.client_handles().await;
+        if handles.is_empty() {
             self.get_block_headers().await;
         } else {
-            for client in &mut self.clients {
-                self.blockchain_status = match client
+            for client in handles {
+                let status = match client
+                    .write()
+                    .await
                     .update_balance(self.blockchain_interface.as_ref())
                     .await
                 {
@@ -194,103 +216,81 @@ impl Service {
                         BlockchainConnectionStatus::Failed
                     }
                 };
-                self.blockchain_update_time = Some(SystemTime::now());
+                *self.blockchain_status.write().await = status;
+                *self.blockchain_update_time.write().await = Some(SystemTime::now());
             }
         }
     }
 
-    /// Refresh balances without holding the service lock during blockchain I/O.
-    pub async fn refresh_balances(service: &RwLock<Service>) {
-        let (blockchain, addresses) = {
-            let service = service.read().await;
-            (
-                Arc::clone(&service.blockchain_interface),
-                service
-                    .clients
-                    .iter()
-                    .map(|client| client.get_address())
-                    .collect::<Vec<_>>(),
-            )
+    /// Refresh balances without holding client locks during blockchain I/O.
+    pub async fn refresh_balances(service: &Arc<Service>) {
+        let (blockchain, handles) = {
+            let mut snapshot = Vec::new();
+            for client in service.client_handles().await {
+                snapshot.push((Arc::clone(&client), client.read().await.get_address()));
+            }
+            (Arc::clone(&service.blockchain_interface), snapshot)
         };
 
-        if addresses.is_empty() {
-            let mut service = service.write().await;
+        if handles.is_empty() {
             service.get_block_headers().await;
             return;
         }
 
-        let mut chain_updates = Vec::with_capacity(addresses.len());
-        for address in addresses {
-            chain_updates.push(fetch_chain_state(blockchain.as_ref(), &address).await);
+        let mut chain_updates = Vec::with_capacity(handles.len());
+        for (_, address) in &handles {
+            chain_updates.push(fetch_chain_state(blockchain.as_ref(), address).await);
         }
 
-        let mut service = service.write().await;
         let mut status = BlockchainConnectionStatus::Connected;
-        for (client, chain_state) in service.clients.iter_mut().zip(chain_updates) {
+        for ((client, _), chain_state) in handles.into_iter().zip(chain_updates) {
             match chain_state {
-                Ok((balance, utxo)) => client.apply_chain_state(balance, utxo),
+                Ok((balance, utxo)) => client.write().await.apply_chain_state(balance, utxo),
                 Err(e) => {
                     log::warn!("update_balance - failed {}", e);
                     status = BlockchainConnectionStatus::Failed;
                 }
             }
         }
-        service.blockchain_status = status;
-        service.blockchain_update_time = Some(SystemTime::now());
+        *service.blockchain_status.write().await = status;
+        *service.blockchain_update_time.write().await = Some(SystemTime::now());
     }
 
     /// Refresh one client's balance and UTXO set from the blockchain before funding.
     pub async fn refresh_client_chain_state(
-        service: &RwLock<Service>,
+        service: &Arc<Service>,
         client_id: &str,
     ) -> Result<(), String> {
-        let (blockchain, address) = {
-            let service = service.read().await;
-            if !service.is_client_id_valid(client_id) {
-                return Err(format!("Unknown client_id {client_id}"));
-            }
-            (
-                service.blockchain_interface(),
-                service
-                    .get_address(client_id)
-                    .ok_or_else(|| format!("Unknown client_id {client_id}"))?,
-            )
-        };
-
-        let chain_state = fetch_chain_state(blockchain.as_ref(), &address).await?;
-
-        let mut service = service.write().await;
         let client = service
-            .clients
-            .iter_mut()
-            .find(|client| client.client_id == client_id)
+            .client_handle(client_id)
+            .await
             .ok_or_else(|| format!("Unknown client_id {client_id}"))?;
-        client.apply_chain_state(chain_state.0, chain_state.1);
-        service.blockchain_status = BlockchainConnectionStatus::Connected;
-        service.blockchain_update_time = Some(SystemTime::now());
+        let address = client.read().await.get_address();
+        let chain_state =
+            fetch_chain_state(service.blockchain_interface.as_ref(), &address).await?;
+        client
+            .write()
+            .await
+            .apply_chain_state(chain_state.0, chain_state.1);
+        *service.blockchain_status.write().await = BlockchainConnectionStatus::Connected;
+        *service.blockchain_update_time.write().await = Some(SystemTime::now());
         Ok(())
     }
 
-    /// Given a client_id return true if it is valid
-    pub fn is_client_id_valid(&self, client_id: &str) -> bool {
-        self.clients.iter().any(|x| x.client_id == client_id)
+    pub async fn is_client_id_valid(&self, client_id: &str) -> bool {
+        self.clients.read().await.contains_key(client_id)
     }
 
-    pub fn client_auth_required(&self, client_id: &str) -> bool {
-        self.clients
-            .iter()
-            .find(|client| client.client_id == client_id)
-            .and_then(|client| client.api_key())
-            .is_some()
+    pub async fn client_auth_required(&self, client_id: &str) -> bool {
+        match self.client_handle(client_id).await {
+            Some(client) => client.read().await.api_key().is_some(),
+            None => false,
+        }
     }
 
-    pub fn verify_client_api_key(&self, client_id: &str, provided: &str) -> bool {
-        match self
-            .clients
-            .iter()
-            .find(|client| client.client_id == client_id)
-        {
-            Some(client) => match client.api_key() {
+    pub async fn verify_client_api_key(&self, client_id: &str, provided: &str) -> bool {
+        match self.client_handle(client_id).await {
+            Some(client) => match client.read().await.api_key() {
                 Some(expected) => crate::auth::constant_time_eq(provided, expected),
                 None => true,
             },
@@ -298,16 +298,19 @@ impl Service {
         }
     }
 
-    pub fn clients_without_api_key(&self) -> Vec<&str> {
-        self.clients
-            .iter()
-            .filter(|client| client.api_key().is_none())
-            .map(|client| client.client_id.as_str())
-            .collect()
+    pub async fn clients_without_api_key(&self) -> Vec<String> {
+        let clients = self.clients.read().await;
+        let mut without = Vec::new();
+        for (client_id, client) in clients.iter() {
+            if client.read().await.api_key().is_none() {
+                without.push(client_id.clone());
+            }
+        }
+        without
     }
 
-    pub fn client_count(&self) -> usize {
-        self.clients.len()
+    pub async fn client_count(&self) -> usize {
+        self.clients.read().await.len()
     }
 
     pub fn blockchain_interface(&self) -> Arc<dyn BlockchainInterface + Send + Sync> {
@@ -325,54 +328,58 @@ impl Service {
         }
     }
 
-    /// Given a client_id return the associated balance as JSON string
-    pub fn get_balance(&self, client_id: &str) -> Option<Balance> {
-        let client = self.clients.iter().find(|x| x.client_id == client_id)?;
-        Some(client.get_balance())
+    pub async fn get_balance(&self, client_id: &str) -> Option<Balance> {
+        Some(
+            self.client_handle(client_id)
+                .await?
+                .read()
+                .await
+                .get_balance(),
+        )
     }
 
-    pub fn get_address(&self, client_id: &str) -> Option<String> {
-        let client = self.clients.iter().find(|x| x.client_id == client_id)?;
-        Some(client.get_address())
+    pub async fn get_address(&self, client_id: &str) -> Option<String> {
+        Some(
+            self.client_handle(client_id)
+                .await?
+                .read()
+                .await
+                .get_address(),
+        )
     }
 
-    /// Return a funding balance error for the client, if any.
-    pub fn funding_balance_error(&self, fund_request: &FundRequest) -> Option<String> {
-        let client = self
-            .clients
-            .iter()
-            .find(|x| x.client_id == fund_request.client_id)?;
-        client.funding_balance_error(fund_request)
+    pub async fn funding_balance_error(&self, fund_request: &FundRequest) -> Option<String> {
+        let client = self.client_handle(&fund_request.client_id).await?;
+        let guard = client.read().await;
+        guard.funding_balance_error(fund_request)
     }
 
-    /// Build and sign funding transactions, updating local UTXO state.
-    pub fn prepare_funding_outpoints(
-        &mut self,
+    /// Build and sign a funding transaction, updating only the target client's UTXO state.
+    pub async fn prepare_funding_outpoints(
+        service: &Arc<Service>,
         fund_request: &FundRequest,
-    ) -> Result<PreparedFunding, String> {
-        let client = self
-            .clients
-            .iter_mut()
-            .find(|x| x.client_id == fund_request.client_id)
+    ) -> Result<(Arc<dyn BlockchainInterface + Send + Sync>, PreparedFunding), String> {
+        let client = service
+            .client_handle(&fund_request.client_id)
+            .await
             .ok_or_else(|| format!("Unknown client_id {}", fund_request.client_id))?;
-
-        let tx = client.create_funding_tx(fund_request)?;
-        Ok(PreparedFunding {
-            txs: vec![tx],
-            no_of_outpoints: fund_request.no_of_outpoints,
-        })
+        let tx = client.write().await.create_funding_tx(fund_request)?;
+        Ok((
+            service.blockchain_interface(),
+            PreparedFunding {
+                txs: vec![tx],
+                no_of_outpoints: fund_request.no_of_outpoints,
+            },
+        ))
     }
 
     /// Fund a request with separate transactions, preparing and broadcasting one at a time.
     pub async fn fund_with_multiple_transactions(
-        service: &RwLock<Service>,
+        service: &Arc<Service>,
         fund_request: &FundRequest,
     ) -> Result<FundingResponse, String> {
-        {
-            let service = service.read().await;
-            if let Some(description) = service.funding_balance_error(fund_request) {
-                return Err(description);
-            }
+        if let Some(description) = service.funding_balance_error(fund_request).await {
+            return Err(description);
         }
 
         let per_tx_request = FundRequest {
@@ -387,37 +394,30 @@ impl Service {
         let total = fund_request.no_of_outpoints;
 
         for tx_index in 0..total {
-            let (blockchain, prepared) = {
-                let mut svc = service.write().await;
-                let blockchain = svc.blockchain_interface();
-                let prepared = svc.prepare_funding_outpoints(&per_tx_request);
-                (blockchain, prepared)
-            };
-
-            let prepared = match prepared {
-                Ok(prepared) => prepared,
-                Err(cause) => {
-                    if tx_index == 0 {
-                        return Err(cause);
+            match Self::prepare_funding_outpoints(service, &per_tx_request).await {
+                Ok((blockchain, prepared)) => {
+                    match Self::broadcast_prepared_funding(blockchain, prepared).await {
+                        Ok(partial) => {
+                            combined.outpoints.extend(partial.outpoints);
+                            combined.txs.extend(partial.txs);
+                        }
+                        Err(cause) => {
+                            if tx_index == 0 {
+                                resync_after_multiple_tx_failure(service, fund_request).await;
+                                return Err(cause);
+                            }
+                            resync_after_multiple_tx_failure(service, fund_request).await;
+                            return Err(partial_broadcast_error(
+                                tx_index + 1,
+                                total,
+                                &combined,
+                                cause,
+                            ));
+                        }
                     }
-                    resync_after_multiple_tx_failure(service, fund_request).await;
-                    return Err(partial_broadcast_error(
-                        tx_index + 1,
-                        total,
-                        &combined,
-                        cause,
-                    ));
-                }
-            };
-
-            match Self::broadcast_prepared_funding(blockchain, prepared).await {
-                Ok(partial) => {
-                    combined.outpoints.extend(partial.outpoints);
-                    combined.txs.extend(partial.txs);
                 }
                 Err(cause) => {
                     if tx_index == 0 {
-                        resync_after_multiple_tx_failure(service, fund_request).await;
                         return Err(cause);
                     }
                     resync_after_multiple_tx_failure(service, fund_request).await;
@@ -434,7 +434,7 @@ impl Service {
         Ok(combined)
     }
 
-    /// Broadcast prepared funding transactions without holding the service lock.
+    /// Broadcast prepared funding transactions without holding client locks.
     pub async fn broadcast_prepared_funding(
         blockchain: Arc<dyn BlockchainInterface + Send + Sync>,
         prepared: PreparedFunding,
@@ -460,7 +460,7 @@ impl Service {
     }
 }
 
-async fn resync_after_multiple_tx_failure(service: &RwLock<Service>, fund_request: &FundRequest) {
+async fn resync_after_multiple_tx_failure(service: &Arc<Service>, fund_request: &FundRequest) {
     if let Err(error) = Service::refresh_client_chain_state(service, &fund_request.client_id).await
     {
         log::warn!("failed to resync UTXO cache after partial multiple_tx funding: {error}");
@@ -509,40 +509,46 @@ async fn fetch_chain_state(
 mod tests {
     use super::*;
     use crate::test_support::{
-        test_blockchain_interface, test_config, unique_dynamic_config_path, TEST_CLIENT_ID,
+        test_blockchain_interface, test_config, test_config_with_keys, unique_dynamic_config_path,
+        LOCKING_SCRIPT_HEX, TEST_CLIENT_ID, TEST_WIF,
     };
+
+    fn sample_fund_request(client_id: &str) -> FundRequest {
+        FundRequest {
+            client_id: client_id.to_string(),
+            satoshi: 123,
+            no_of_outpoints: 1,
+            multiple_tx: false,
+            locking_script: hex::decode(LOCKING_SCRIPT_HEX).unwrap(),
+        }
+    }
 
     #[tokio::test]
     async fn refresh_client_chain_state_restores_stale_utxo_cache() {
         let config = test_config(&unique_dynamic_config_path());
         let blockchain = test_blockchain_interface(&config).await;
-        let service = RwLock::new(Service::new_for_test(&config, blockchain).await);
+        let service = Arc::new(Service::new_for_test(&config, blockchain).await);
 
-        {
-            let mut service = service.write().await;
-            let client = service
-                .clients
-                .iter_mut()
-                .find(|client| client.client_id == TEST_CLIENT_ID)
-                .expect("test client");
-            client.apply_chain_state(Balance::default(), Vec::new());
-        }
+        service
+            .client_handle(TEST_CLIENT_ID)
+            .await
+            .expect("test client")
+            .write()
+            .await
+            .apply_chain_state(Balance::default(), Vec::new());
 
         Service::refresh_client_chain_state(&service, TEST_CLIENT_ID)
             .await
             .expect("refresh should succeed");
 
-        let service = service.read().await;
-        let balance = service.get_balance(TEST_CLIENT_ID).expect("test client");
+        let balance = service
+            .get_balance(TEST_CLIENT_ID)
+            .await
+            .expect("test client");
         assert!(balance.confirmed > 0);
         assert!(service
-            .funding_balance_error(&FundRequest {
-                client_id: TEST_CLIENT_ID.to_string(),
-                satoshi: 123,
-                no_of_outpoints: 1,
-                multiple_tx: false,
-                locking_script: hex::decode(crate::test_support::LOCKING_SCRIPT_HEX).unwrap(),
-            })
+            .funding_balance_error(&sample_fund_request(TEST_CLIENT_ID))
+            .await
             .is_none());
     }
 
@@ -569,14 +575,14 @@ mod tests {
     async fn fund_with_multiple_transactions_broadcasts_each_tx_separately() {
         let config = test_config(&unique_dynamic_config_path());
         let blockchain = test_blockchain_interface(&config).await;
-        let service = RwLock::new(Service::new_for_test(&config, blockchain).await);
+        let service = Arc::new(Service::new_for_test(&config, blockchain).await);
 
         let fund_request = FundRequest {
             client_id: TEST_CLIENT_ID.to_string(),
             satoshi: 123,
             no_of_outpoints: 2,
             multiple_tx: true,
-            locking_script: hex::decode(crate::test_support::LOCKING_SCRIPT_HEX).unwrap(),
+            locking_script: hex::decode(LOCKING_SCRIPT_HEX).unwrap(),
         };
 
         let response = Service::fund_with_multiple_transactions(&service, &fund_request)
@@ -585,5 +591,43 @@ mod tests {
         assert_eq!(response.txs.len(), 2);
         assert_eq!(response.outpoints.len(), 2);
         assert_ne!(response.outpoints[0].hash, response.outpoints[1].hash);
+    }
+
+    #[tokio::test]
+    async fn concurrent_fund_requests_for_different_clients_do_not_block() {
+        let path = unique_dynamic_config_path();
+        let config = test_config_with_keys(&path, None, None);
+        let blockchain = test_blockchain_interface(&config).await;
+        let service = Arc::new(Service::new_for_test(&config, blockchain).await);
+        service
+            .add_client("client2", TEST_WIF, None)
+            .await
+            .expect("add second client");
+
+        let service_a = Arc::clone(&service);
+        let service_b = Arc::clone(&service);
+        let request_a = sample_fund_request(TEST_CLIENT_ID);
+        let request_b = sample_fund_request("client2");
+
+        let (result_a, result_b) = tokio::join!(
+            fund_single_transaction(&service_a, &request_a),
+            fund_single_transaction(&service_b, &request_b),
+        );
+
+        result_a.expect("client1 funding should succeed");
+        result_b.expect("client2 funding should succeed");
+    }
+
+    async fn fund_single_transaction(
+        service: &Arc<Service>,
+        fund_request: &FundRequest,
+    ) -> Result<FundingResponse, String> {
+        Service::refresh_client_chain_state(service, &fund_request.client_id).await?;
+        if let Some(description) = service.funding_balance_error(fund_request).await {
+            return Err(description);
+        }
+        let (blockchain, prepared) =
+            Service::prepare_funding_outpoints(service, fund_request).await?;
+        Service::broadcast_prepared_funding(blockchain, prepared).await
     }
 }

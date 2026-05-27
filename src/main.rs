@@ -1,8 +1,7 @@
-use std::{env, net::Ipv4Addr, time::Duration};
+use std::{env, net::Ipv4Addr, sync::Arc, time::Duration};
 use tokio::time;
 
 use actix_web::{web, App, HttpServer};
-use tokio::sync::RwLock;
 
 mod auth;
 mod blockchain_factory;
@@ -66,8 +65,8 @@ async fn main() -> std::io::Result<()> {
             "Admin API key not configured; POST /client is unauthenticated. Set web_interface.admin_api_key or restrict via network isolation."
         );
     }
-    let clients_without_api_key = service.clients_without_api_key();
-    if service.client_count() > 0 && clients_without_api_key.is_empty() {
+    let clients_without_api_key = service.clients_without_api_key().await;
+    if service.client_count().await > 0 && clients_without_api_key.is_empty() {
         log::info!("Per-client API key authentication enabled for all clients");
     } else if !clients_without_api_key.is_empty() {
         log::warn!(
@@ -76,7 +75,7 @@ async fn main() -> std::io::Result<()> {
         );
     }
     let app_state = web::Data::new(AppState {
-        service: RwLock::new(service),
+        service: Arc::new(service),
     });
     let app_state2 = app_state.clone();
     let addr = get_addr(&config);

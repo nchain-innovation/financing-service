@@ -38,17 +38,17 @@ pub fn extract_api_key(req: &HttpRequest) -> Option<String> {
 }
 
 /// Returns `Some(HttpResponse)` when the request is unauthorized.
-pub fn authorize_client(
+pub async fn authorize_client(
     req: &HttpRequest,
     client_id: &str,
     service: &Service,
 ) -> Option<HttpResponse> {
-    if !service.client_auth_required(client_id) {
+    if !service.client_auth_required(client_id).await {
         return None;
     }
 
     match extract_api_key(req) {
-        Some(key) if service.verify_client_api_key(client_id, &key) => None,
+        Some(key) if service.verify_client_api_key(client_id, &key).await => None,
         _ => Some(unauthorized_response()),
     }
 }
@@ -117,7 +117,9 @@ mod tests {
         let service = Service::new_for_test(&config, blockchain).await;
         let req = test::TestRequest::get().to_http_request();
 
-        assert!(authorize_client(&req, TEST_CLIENT_ID, &service).is_none());
+        assert!(authorize_client(&req, TEST_CLIENT_ID, &service)
+            .await
+            .is_none());
     }
 
     #[actix_web::test]
@@ -127,7 +129,9 @@ mod tests {
         let service = Service::new_for_test(&config, blockchain).await;
         let req = test::TestRequest::get().to_http_request();
 
-        let resp = authorize_client(&req, TEST_CLIENT_ID, &service).unwrap();
+        let resp = authorize_client(&req, TEST_CLIENT_ID, &service)
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -140,7 +144,9 @@ mod tests {
             .insert_header(("X-API-Key", "secret"))
             .to_http_request();
 
-        assert!(authorize_client(&req, TEST_CLIENT_ID, &service).is_none());
+        assert!(authorize_client(&req, TEST_CLIENT_ID, &service)
+            .await
+            .is_none());
     }
 
     #[actix_web::test]
@@ -152,7 +158,9 @@ mod tests {
             .insert_header(("X-API-Key", "secret-b"))
             .to_http_request();
 
-        let resp = authorize_client(&req, TEST_CLIENT_ID, &service).unwrap();
+        let resp = authorize_client(&req, TEST_CLIENT_ID, &service)
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
