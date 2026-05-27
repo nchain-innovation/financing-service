@@ -20,9 +20,10 @@ fn read_dynamic_config(filename: &str) -> Result<FileContents, String> {
     Ok(config)
 }
 
-fn save_dynamic_config(filename: &str, file_contents: &FileContents) -> std::io::Result<()> {
-    let content = toml::to_string(file_contents).unwrap();
-    std::fs::write(filename, content)?;
+fn save_dynamic_config(filename: &str, file_contents: &FileContents) -> Result<(), String> {
+    let content =
+        toml::to_string(file_contents).map_err(|e| format!("Failed to serialize config: {e}"))?;
+    std::fs::write(filename, content).map_err(|e| format!("Failed to write config: {e}"))?;
     Ok(())
 }
 
@@ -41,12 +42,12 @@ impl DynamicConfig {
         DynamicConfig { filename, contents }
     }
 
-    pub fn add(&mut self, new_client: &ClientConfig) {
+    pub fn add(&mut self, new_client: &ClientConfig) -> Result<(), String> {
         self.contents.clients.push(new_client.clone());
-        self.save();
+        self.save()
     }
 
-    pub fn remove(&mut self, client_id: &str) {
+    pub fn remove(&mut self, client_id: &str) -> Result<(), String> {
         if let Some(index) = self
             .contents
             .clients
@@ -54,11 +55,13 @@ impl DynamicConfig {
             .position(|c| c.client_id == client_id)
         {
             self.contents.clients.remove(index);
-            self.save();
+            self.save()
+        } else {
+            Ok(())
         }
     }
 
-    fn save(&self) {
-        save_dynamic_config(&self.filename, &self.contents).unwrap();
+    fn save(&self) -> Result<(), String> {
+        save_dynamic_config(&self.filename, &self.contents)
     }
 }

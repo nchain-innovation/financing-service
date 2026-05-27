@@ -40,27 +40,30 @@ pub struct Client {
 }
 
 impl Client {
-    /// Create a new
     pub fn new(config: &ClientConfig) -> Self {
-        let wallet = Wallet::from_wif(&config.wif_key).unwrap_or_else(|_| {
-            panic!(
+        Self::try_new(config).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    pub fn try_new(config: &ClientConfig) -> Result<Self, String> {
+        let wallet = Wallet::from_wif(&config.wif_key).map_err(|_| {
+            format!(
                 r#"wif_key = "{}" is not a valid WIF key (client_id = "{}")."#,
                 config.wif_key, config.client_id
             )
-        });
-        let address = wallet.get_address().unwrap_or_else(|_| {
-            panic!(
+        })?;
+        let address = wallet.get_address().map_err(|_| {
+            format!(
                 r#"wif_key = "{}" is not a valid WIF key - issues with address (client_id = "{}")."#,
                 config.wif_key, config.client_id
             )
-        });
-        Client {
+        })?;
+        Ok(Client {
             client_id: config.client_id.clone(),
             wallet,
             address,
             balance: Balance::default(),
             unspent: Vec::new(),
-        }
+        })
     }
 
     /// Given an interface query it for the latest balance
@@ -98,7 +101,7 @@ impl Client {
         // Note unspent is already sorted by value
         self.unspent
             .iter()
-            .find(|x| x.value > satoshi.try_into().unwrap())
+            .find(|x| x.value > satoshi as i64)
     }
 
     /// Given the tx inputs, determine if there is a suitable Utxo for a funding tx
@@ -117,40 +120,38 @@ impl Client {
             (fund_request.satoshi * fund_request.no_of_outpoints as u64) + fee_estimate
         };
 
-        Some(total_cost < largest_unspent.try_into().unwrap())
+        Some(total_cost < largest_unspent as u64)
     }
 
     /// Create one funding transaction
-    pub fn create_funding_tx(&mut self, fund_request: &FundRequest) -> Option<Tx> {
-        // Calculate fee...
+    pub fn create_funding_tx(&mut self, fund_request: &FundRequest) -> Result<Tx, String> {
         let locking_script_len: u64 = fund_request.locking_script.len() as u64;
         let fee_estimate: u64 =
             (((locking_script_len * fund_request.no_of_outpoints as u64) / 1000) * 500) + 750;
         let total_cost: u64 =
             (fund_request.satoshi * fund_request.no_of_outpoints as u64) + fee_estimate;
-        // Create a locking script for change
         let change_script = self.wallet.get_locking_script();
-        // Find smallest funding unspent that is big enough for tx
-        let unspent = self.get_smallest_unspent(total_cost)?;
-        // Create vin
+        let unspent = self
+            .get_smallest_unspent(total_cost)
+            .ok_or_else(|| "No suitable UTXO available for funding transaction.".to_string())?;
         let vins: Vec<TxIn> = vec![TxIn {
             prev_output: OutPoint {
-                hash: Hash256::decode(&unspent.tx_hash).unwrap(),
+                hash: Hash256::decode(&unspent.tx_hash)
+                    .map_err(|e| format!("Invalid UTXO tx hash: {e}"))?,
                 index: unspent.tx_pos,
             },
             unlock_script: Script::new(),
             sequence: 0xffffffff,
         }];
-        // Create the vout
-        // create vout for change
         let change = unspent.value - total_cost as i64;
-        assert!(change > 0);
+        if change <= 0 {
+            return Err("Insufficient UTXO value for funding transaction.".to_string());
+        }
         let mut vouts: Vec<TxOut> = vec![TxOut {
             satoshis: change,
             lock_script: change_script.clone(),
         }];
 
-        // Append the provided script
         let mut script_pubkey: Script = Script::new();
         script_pubkey.append_slice(&fund_request.locking_script);
 
@@ -168,21 +169,24 @@ impl Client {
             outputs: vouts,
             lock_time: 0,
         };
-        // Sign transaction
         let sighash_flags = SIGHASH_ALL | SIGHASH_FORKID;
 
-        let sighash = create_sighash(&tx, 0, &change_script, unspent.value, sighash_flags).unwrap();
-        let signature = self.wallet.sign_sighash(sighash, sighash_flags).unwrap();
+        let sighash = create_sighash(&tx, 0, &change_script, unspent.value, sighash_flags)
+            .map_err(|e| format!("Failed to create sighash: {e}"))?;
+        let signature = self
+            .wallet
+            .sign_sighash(sighash, sighash_flags)
+            .map_err(|e| format!("Failed to sign transaction: {e}"))?;
 
-        // insert the ScriptSig (unlock_script)
         tx.inputs[0].unlock_script = self.wallet.create_unlock_script(&signature);
 
-        // find unspent index
-        let index = self.unspent.iter().position(|x| x == unspent).unwrap();
+        let index = self
+            .unspent
+            .iter()
+            .position(|x| x == unspent)
+            .ok_or_else(|| "UTXO not found in local cache.".to_string())?;
 
-        // Remove input from unspent
         self.unspent.remove(index);
-        // Add output to unspent
         let entry = UtxoEntry {
             height: 0,
             tx_pos: 0,
@@ -190,27 +194,21 @@ impl Client {
             value: change,
         };
         self.unspent.push(entry);
-        // Sort unspent by value
         self.unspent.sort_by_key(|x| x.value);
 
-        // Return the transaction
-        Some(tx)
+        Ok(tx)
     }
 
     /// Create no_of_outpoints funding txs each with one outpoint
-    pub fn create_multiple_funding_txs(&mut self, fund_request: &FundRequest) -> Vec<Tx> {
+    pub fn create_multiple_funding_txs(
+        &mut self,
+        fund_request: &FundRequest,
+    ) -> Result<Vec<Tx>, String> {
         let mut txs: Vec<Tx> = Vec::new();
-        for _i in 0..fund_request.no_of_outpoints {
-            match self.create_funding_tx(fund_request) {
-                Some(tx) => txs.push(tx),
-                None => {
-                    print!("create_funding_tx failed");
-                    break;
-                }
-            }
+        for _ in 0..fund_request.no_of_outpoints {
+            txs.push(self.create_funding_tx(fund_request)?);
         }
-        // Return the list of created txs
-        txs
+        Ok(txs)
     }
 }
 
@@ -342,16 +340,18 @@ mod tests {
         let tx = client.create_funding_tx(&fund_request).unwrap();
 
         debug!("tx = {:?}", &tx);
-        assert_eq!(tx_as_hexstr(&tx), "0100000001786563262f7e951eea3d9db3e4997daeba748ffa99219e298401dfe99d1033e5000000006b483045022100c7a22fbf24470b2c96b82ce1bfd5896f515e3f0f509f307e94f699baefe0f8c3022044ddbb29952769c67ba117762ee628d299846039a6d90bc59618c770b226bfc2412103a8ae071ddd8690b94755c7112ca304bcac45c15904cc013f0ad6c2ea0b1019b2ffffffff02c7ec9100000000001976a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac7b000000000000001976a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac00000000");
+        assert_eq!(
+            tx_as_hexstr(&tx).unwrap(),
+            "0100000001786563262f7e951eea3d9db3e4997daeba748ffa99219e298401dfe99d1033e5000000006b483045022100c7a22fbf24470b2c96b82ce1bfd5896f515e3f0f509f307e94f699baefe0f8c3022044ddbb29952769c67ba117762ee628d299846039a6d90bc59618c770b226bfc2412103a8ae071ddd8690b94755c7112ca304bcac45c15904cc013f0ad6c2ea0b1019b2ffffffff02c7ec9100000000001976a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac7b000000000000001976a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac00000000"
+        );
     }
 
     #[tokio::test]
-    #[should_panic]
     async fn test_invalid_wif_key() {
         let client_config: ClientConfig = ClientConfig {
             client_id: "id1".to_string(),
             wif_key: "EGa6cZHpfLZmUzXbkvq72s15rbiUonkrQAhDU4FG".to_string(),
         };
-        Client::new(&client_config);
+        assert!(Client::try_new(&client_config).is_err());
     }
 }

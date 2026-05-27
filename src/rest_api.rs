@@ -1,9 +1,13 @@
 use actix_web::{delete, get, http::header::ContentType, post, web, HttpResponse, Responder};
 use async_mutex::Mutex;
-use log::{debug, info};
+use log::debug;
 use serde::Deserialize;
 
-use crate::{client::FundRequest, service::Service};
+use crate::{
+    client::FundRequest,
+    error::error_response,
+    service::Service,
+};
 
 /// Application State Data
 pub struct AppState {
@@ -61,47 +65,30 @@ pub async fn get_funds(
 
     let mut service = data.service.lock().await;
 
-    // These local vars are required as the format! strings don't accept '.` in `{}`
     let client_id = &info.client_id;
     let satoshi = info.satoshi;
     let no_of_outpoints = info.no_of_outpoints;
     let multiple_tx = info.multiple_tx;
     let locking_script = &info.locking_script;
 
-    info!("get_funds!");
-    // Request funding outpoints
-    // Do all input checks here
     if !service.is_client_id_valid(client_id) {
-        let response = format!("{{\"description\": \"Unknown client_id {client_id}\"}}");
-        return HttpResponse::UnprocessableEntity()
-            .content_type(ContentType::json())
-            .body(response);
+        return error_response(format!("Unknown client_id {client_id}"));
     }
     if satoshi == 0 {
-        let response = format!("{{\"description\": \"Invalid satoshi value '{satoshi}'\"}}");
-        return HttpResponse::UnprocessableEntity()
-            .content_type(ContentType::json())
-            .body(response);
+        return error_response(format!("Invalid satoshi value '{satoshi}'"));
     }
     if no_of_outpoints == 0 {
-        let response =
-            format!("{{\"description\": \"Invalid no_of_outpoints value '{no_of_outpoints}'}}");
-        return HttpResponse::UnprocessableEntity()
-            .content_type(ContentType::json())
-            .body(response);
-    }
-    // Check locking_script can be converted to bytes
-    let decode_locking_script = hex::decode(locking_script);
-    if decode_locking_script.is_err() {
-        let response = format!(
-            "{{\"description\": \"Unable to convert locking_script to bytes '{locking_script}'\"}}"
-        );
-        return HttpResponse::UnprocessableEntity()
-            .content_type(ContentType::json())
-            .body(response);
+        return error_response(format!("Invalid no_of_outpoints value '{no_of_outpoints}'"));
     }
 
-    let locking_script_as_bytes = decode_locking_script.unwrap();
+    let locking_script_as_bytes = match hex::decode(locking_script) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return error_response(format!(
+                "Unable to convert locking_script to bytes '{locking_script}'"
+            ));
+        }
+    };
     debug!("locking_script_as_bytes = {:?}", &locking_script_as_bytes);
 
     let fund_request = FundRequest {
@@ -112,27 +99,26 @@ pub async fn get_funds(
         locking_script: locking_script_as_bytes,
     };
 
-    let has_sufficent = service.has_sufficent_balance(&fund_request);
+    match service.has_sufficent_balance(&fund_request) {
+        Some(true) => {}
+        Some(false) | None => {
+            log::info!("insufficient funds!");
+            return error_response(
+                "Insufficent client balance to create funding transactions.",
+            );
+        }
+    }
 
-    if has_sufficent.is_none() || !has_sufficent.unwrap() {
-        log::info!("insufficient funds!");
-        let response =
-            "{\"description\": \"Insufficent client balance to create funding transactions.\"}"
-                .to_string();
-        HttpResponse::UnprocessableEntity()
-            .content_type(ContentType::json())
-            .body(response)
-    } else {
-        match service.create_funding_outpoints(&fund_request).await {
-            Ok(funding_response) => HttpResponse::Ok()
+    match service.create_funding_outpoints(&fund_request).await {
+        Ok(funding_response) => match funding_response.to_json() {
+            Ok(body) => HttpResponse::Ok()
                 .content_type(ContentType::json())
-                .body(funding_response.to_json()),
-            Err(err_str) => {
-                debug!("err_str = {:?}", &err_str);
-                HttpResponse::UnprocessableEntity()
-                    .content_type(ContentType::json())
-                    .body(err_str)
-            }
+                .body(body),
+            Err(description) => error_response(description),
+        },
+        Err(description) => {
+            debug!("create_funding_outpoints error = {:?}", &description);
+            error_response(description)
         }
     }
 }
@@ -156,25 +142,18 @@ pub async fn add_client(
     info: web::Json<ClienAddRequest>,
 ) -> impl Responder {
     let mut service = data.service.lock().await;
-    // These local vars are required as the format! strings don't accept '.` in `{}`
     let client_id = &info.client_id;
     log::info!("add_client {}", &client_id);
 
-    // check to see if client_id already exists
     if service.is_client_id_valid(client_id) {
-        // Return error we already have this client
-        let response = format!("{{\"description\": \"Unknown client_id {client_id}\"}}");
-        HttpResponse::UnprocessableEntity()
-            .content_type(ContentType::json())
-            .body(response)
-    } else {
-        // if not add it
-        service.add_client(client_id, &info.wif);
+        return error_response(format!("Client already exists: {client_id}"));
+    }
 
-        let response: String = "{\"status\": \"Success\"}".to_string();
-        HttpResponse::Ok()
+    match service.add_client(client_id, &info.wif) {
+        Ok(()) => HttpResponse::Ok()
             .content_type(ContentType::json())
-            .body(response)
+            .body("{\"status\": \"Success\"}"),
+        Err(description) => error_response(description),
     }
 }
 
@@ -184,25 +163,18 @@ pub async fn add_client(
 #[delete("/client/{client_id}")]
 pub async fn delete_client(data: web::Data<AppState>, info: web::Path<String>) -> impl Responder {
     let mut service = data.service.lock().await;
-    // These local vars are required as the format! strings don't accept '.` in `{}`
     let client_id: String = info.to_string();
     log::info!("delete_client {}", &client_id);
 
-    // check to see if client_id already exists
-    if service.is_client_id_valid(&client_id) {
-        // if so delete it
-        service.delete_client(&client_id);
+    if !service.is_client_id_valid(&client_id) {
+        return error_response(format!("Unknown client_id {client_id}"));
+    }
 
-        let response = "{\"status\": \"Success\"}".to_string();
-        HttpResponse::Ok()
+    match service.delete_client(&client_id) {
+        Ok(()) => HttpResponse::Ok()
             .content_type(ContentType::json())
-            .body(response)
-    } else {
-        // return error as we already have this client
-        let response = format!("{{\"description\": \"Unknown client_id {client_id} \"}}");
-        HttpResponse::UnprocessableEntity()
-            .content_type(ContentType::json())
-            .body(response)
+            .body("{\"status\": \"Success\"}"),
+        Err(description) => error_response(description),
     }
 }
 
@@ -214,18 +186,15 @@ pub async fn get_address(data: web::Data<AppState>, info: web::Path<String>) -> 
 
     let service = data.service.lock().await;
 
-    // Check client_id
     if !service.is_client_id_valid(&client_id) {
-        let response = format!("{{\"description\": \"Unknown client_id {client_id} \"}}");
-        HttpResponse::UnprocessableEntity()
+        return error_response(format!("Unknown client_id {client_id}"));
+    }
+
+    match service.get_address(&client_id) {
+        Some(address) => HttpResponse::Ok()
             .content_type(ContentType::json())
-            .body(response)
-    } else {
-        let address = service.get_address(&client_id).unwrap();
-        let response = format!("{{\"address\": \"{address}\"}}");
-        HttpResponse::Ok()
-            .content_type(ContentType::json())
-            .body(response)
+            .body(format!("{{\"address\": \"{address}\"}}")),
+        None => error_response(format!("Unknown client_id {client_id}")),
     }
 }
 
@@ -237,20 +206,20 @@ pub async fn balance(data: web::Data<AppState>, info: web::Path<String>) -> impl
 
     let service = data.service.lock().await;
 
-    // Check client_id
     if !service.is_client_id_valid(&client_id) {
-        let response = format!("{{\"description\": \"Unknown client_id {client_id}\"}}");
-        HttpResponse::UnprocessableEntity()
-            .content_type(ContentType::json())
-            .body(response)
-    } else {
-        let balance = service.get_balance(&client_id).unwrap();
-        let confirmed = balance.confirmed;
-        let unconfirmed = balance.unconfirmed;
+        return error_response(format!("Unknown client_id {client_id}"));
+    }
 
-        let response = format!("{{\"confirmed\": {confirmed}, \"unconfirmed\": {unconfirmed}}}");
-        HttpResponse::Ok()
-            .content_type(ContentType::json())
-            .body(response)
+    match service.get_balance(&client_id) {
+        Some(balance) => {
+            let confirmed = balance.confirmed;
+            let unconfirmed = balance.unconfirmed;
+            HttpResponse::Ok()
+                .content_type(ContentType::json())
+                .body(format!(
+                    "{{\"confirmed\": {confirmed}, \"unconfirmed\": {unconfirmed}}}"
+                ))
+        }
+        None => error_response(format!("Unknown client_id {client_id}")),
     }
 }

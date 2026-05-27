@@ -54,26 +54,25 @@ impl FundingResponse {
         retval
     }
 
-    fn txs_to_json(&self) -> String {
-        //                 let tx_as_str = tx_as_hexstr(&a_tx);
+    fn txs_to_json(&self) -> Result<String, String> {
         let mut retval: String = "[".to_string();
 
         for (i, tx) in self.txs.iter().enumerate() {
-            retval += format!("{{\"tx\": \"{}\"}}", tx_as_hexstr(tx)).as_str();
+            retval += format!("{{\"tx\": \"{}\"}}", tx_as_hexstr(tx)?).as_str();
             if i + 1 != self.txs.len() {
                 retval += ",";
             }
         }
         retval += "]";
-        retval
+        Ok(retval)
     }
 
-    pub fn to_json(&self) -> String {
-        format!(
+    pub fn to_json(&self) -> Result<String, String> {
+        Ok(format!(
             "{{\"outpoints\":  {}, \"txs\": {}}}",
             self.outpoints_to_json(),
-            self.txs_to_json()
-        )
+            self.txs_to_json()?
+        ))
     }
 }
 
@@ -124,24 +123,25 @@ impl Service {
         service
     }
 
-    pub fn add_client(&mut self, client_id: &str, wif: &str) {
+    pub fn add_client(&mut self, client_id: &str, wif: &str) -> Result<(), String> {
         let client_config = ClientConfig {
             client_id: client_id.to_string(),
             wif_key: wif.to_string(),
         };
-        let new_client = Client::new(&client_config);
+        let new_client = Client::try_new(&client_config)?;
         self.clients.push(new_client);
-        // save dynamic info
-        self.dynamic_config.add(&client_config);
+        if let Err(e) = self.dynamic_config.add(&client_config) {
+            self.clients.pop();
+            return Err(e);
+        }
+        Ok(())
     }
 
-    pub fn delete_client(&mut self, client_id: &str) {
-        // let new_client = Client::new(&client_config, self.network);
+    pub fn delete_client(&mut self, client_id: &str) -> Result<(), String> {
         if let Some(index) = self.clients.iter().position(|c| c.client_id == client_id) {
             self.clients.remove(index);
         }
-        // save dynamic info
-        self.dynamic_config.remove(client_id);
+        self.dynamic_config.remove(client_id)
     }
 
     /// Return the Service status as a JSON string
@@ -229,49 +229,36 @@ impl Service {
         &mut self,
         fund_request: &FundRequest,
     ) -> Result<FundingResponse, String> {
-        let client: &mut Client = self
+        let client = self
             .clients
             .iter_mut()
             .find(|x| x.client_id == fund_request.client_id)
-            .unwrap();
+            .ok_or_else(|| format!("Unknown client_id {}", fund_request.client_id))?;
 
         let mut response = FundingResponse::default();
-        // Check balance
         if fund_request.no_of_outpoints > 1 && fund_request.multiple_tx {
-            // Create multiple tx
-            response.txs = client.create_multiple_funding_txs(fund_request);
+            response.txs = client.create_multiple_funding_txs(fund_request)?;
 
-            // broadcast multiple txs
             for a_tx in &response.txs {
-                // broadcast tx
-                let tx_as_str = tx_as_hexstr(a_tx);
+                let tx_as_str = tx_as_hexstr(a_tx)?;
                 log::info!("tx_as_str = {}", &tx_as_str);
 
                 match self.blockchain_interface.broadcast_tx(a_tx).await {
                     Ok(_hash) => {
-                        // Append to the list
-                        // Note the provided hash is a str whereas OutPoint wants a Hash256
                         response.outpoints.push(OutPoint {
                             hash: a_tx.hash(),
                             index: 1,
                         });
                     }
-                    _ => {
-                        log::info!("Failed to broadcast funding transaction");
-                        return Err(
-                            "{\"description\": \"Failed to broadcast funding transaction.\"}"
-                                .to_string(),
-                        );
+                    Err(e) => {
+                        log::warn!("Failed to broadcast funding transaction: {:?}", e);
+                        return Err("Failed to broadcast funding transaction.".to_string());
                     }
                 }
             }
-            // Provide all the outpoints
             Ok(response)
         } else {
-            // Create one tx
-            let b_tx: Tx = client.create_funding_tx(fund_request).unwrap();
-            // broadcast tx
-            //let tx_as_str = tx_as_hexstr(&b_tx);
+            let b_tx = client.create_funding_tx(fund_request)?;
             response.txs.push(b_tx.clone());
 
             match self.blockchain_interface.broadcast_tx(&b_tx).await {
@@ -280,12 +267,9 @@ impl Service {
                     response.outpoints = self.get_outpoints(hash, fund_request.no_of_outpoints);
                     Ok(response)
                 }
-                _ => {
-                    log::info!("Failed to broadcast funding transaction");
-                    Err(
-                        "{\"description\": \"Failed to broadcast funding transaction.\"}"
-                            .to_string(),
-                    )
+                Err(e) => {
+                    log::warn!("Failed to broadcast funding transaction: {:?}", e);
+                    Err("Failed to broadcast funding transaction.".to_string())
                 }
             }
         }
