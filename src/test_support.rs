@@ -1,6 +1,15 @@
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU32, Ordering},
+    Arc,
+};
 
-use chain_gang::interface::{BlockchainInterface, TestInterface, UtxoEntry};
+use async_trait::async_trait;
+use chain_gang::{
+    interface::{Balance, BlockchainInterface, TestInterface, Utxo, UtxoEntry},
+    messages::{BlockHeader, Tx},
+    network::Network,
+    util::ChainGangError,
+};
 
 use crate::config::{BlockchainInterfaceConfig, ClientConfig, Config, DynamicConfigConfig};
 
@@ -129,4 +138,68 @@ pub fn unique_dynamic_config_path() -> String {
     let path = path.to_string_lossy().into_owned();
     let _ = std::fs::write(&path, "clients = []\n");
     path
+}
+
+/// Test blockchain that fails `broadcast_tx` after a configured number of successes.
+pub struct FailingBroadcastBlockchain {
+    inner: tokio::sync::Mutex<TestInterface>,
+    fail_after: u32,
+    broadcasts: AtomicU32,
+}
+
+impl FailingBroadcastBlockchain {
+    pub async fn new(config: &Config, fail_after: u32) -> Arc<Self> {
+        let mut inner = TestInterface::new();
+        inner.set_network(&config.get_network().unwrap());
+        inner.set_utxo(TEST_ADDRESS, &test_utxo()).await;
+        inner.set_height(1517571).await;
+        Arc::new(Self {
+            inner: tokio::sync::Mutex::new(inner),
+            fail_after,
+            broadcasts: AtomicU32::new(0),
+        })
+    }
+}
+
+#[async_trait]
+impl BlockchainInterface for FailingBroadcastBlockchain {
+    fn set_network(&mut self, network: &Network) {
+        if let Ok(mut inner) = self.inner.try_lock() {
+            inner.set_network(network);
+        }
+    }
+
+    async fn status(&self) -> Result<(), ChainGangError> {
+        self.inner.lock().await.status().await
+    }
+
+    async fn get_balance(&self, address: &str) -> Result<Balance, ChainGangError> {
+        self.inner.lock().await.get_balance(address).await
+    }
+
+    async fn get_utxo(&self, address: &str) -> Result<Utxo, ChainGangError> {
+        self.inner.lock().await.get_utxo(address).await
+    }
+
+    async fn broadcast_tx(&self, tx: &Tx) -> Result<String, ChainGangError> {
+        let n = self.broadcasts.fetch_add(1, Ordering::SeqCst) + 1;
+        if n > self.fail_after {
+            return Err(ChainGangError::BadArgument(
+                "simulated broadcast failure".to_string(),
+            ));
+        }
+        self.inner.lock().await.broadcast_tx(tx).await
+    }
+
+    async fn get_tx(&self, txid: &str) -> Result<Tx, ChainGangError> {
+        self.inner.lock().await.get_tx(txid).await
+    }
+
+    async fn get_latest_block_header(&self) -> Result<BlockHeader, ChainGangError> {
+        self.inner.lock().await.get_latest_block_header().await
+    }
+
+    async fn get_block_headers(&self) -> Result<String, ChainGangError> {
+        self.inner.lock().await.get_block_headers().await
+    }
 }

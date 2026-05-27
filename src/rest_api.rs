@@ -321,7 +321,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::{
-        config::RateLimitConfig,
+        config::{ClientConfig, Config, RateLimitConfig},
         rate_limit,
         rest_api::{
             add_client, balance, delete_client, get_address, get_funds, health, index, status,
@@ -415,6 +415,33 @@ mod tests {
 
     async fn build_app() -> impl ActixService<Request, Response = ServiceResponse, Error = Error> {
         build_app_with_keys(None, None).await
+    }
+
+    async fn build_app_with_service(
+        config: Config,
+    ) -> (
+        impl ActixService<Request, Response = ServiceResponse, Error = Error>,
+        Arc<Service>,
+    ) {
+        let blockchain = test_blockchain_interface(&config).await;
+        let service = Arc::new(Service::new_for_test(&config, blockchain).await);
+        let app_state = web::Data::new(AppState {
+            service: Arc::clone(&service),
+        });
+        let app = test::init_service(
+            App::new()
+                .app_data(app_state)
+                .service(index)
+                .service(health)
+                .service(status)
+                .service(balance)
+                .service(get_funds)
+                .service(add_client)
+                .service(delete_client)
+                .service(get_address),
+        )
+        .await;
+        (app, service)
     }
 
     fn fund_body(
@@ -965,5 +992,198 @@ mod tests {
             .await;
             assert_eq!(resp.status(), StatusCode::OK);
         }
+    }
+
+    #[actix_web::test]
+    async fn sr_fund_005_fund_endpoint_refreshes_stale_utxo_cache() {
+        use chain_gang::interface::Balance;
+
+        let path = unique_dynamic_config_path();
+        let config = test_config_with_keys(&path, None, None);
+        let (app, service) = build_app_with_service(config).await;
+        service
+            .set_test_chain_state(TEST_CLIENT_ID, Balance::default(), Vec::new())
+            .await
+            .expect("test client");
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/fund")
+                .set_json(fund_body(TEST_CLIENT_ID, 123, 1, LOCKING_SCRIPT_HEX))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[actix_web::test]
+    async fn sr_fund_006_balance_endpoint_refreshes_stale_utxo_cache() {
+        use chain_gang::interface::Balance;
+
+        let path = unique_dynamic_config_path();
+        let config = test_config_with_keys(&path, None, None);
+        let (app, service) = build_app_with_service(config).await;
+        service
+            .set_test_chain_state(TEST_CLIENT_ID, Balance::default(), Vec::new())
+            .await
+            .expect("test client");
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/client/{TEST_CLIENT_ID}/balance"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = test::read_body_json(resp).await;
+        assert!(body["confirmed"].as_i64().unwrap() > 0);
+    }
+
+    #[actix_web::test]
+    async fn sr_func_007_add_client_persists_to_dynamic_config_file() {
+        unsafe { std::env::set_var("FS_TEST_ADD_CLIENT_WIF", TEST_WIF) };
+        let path = unique_dynamic_config_path();
+        let config = test_config_with_keys(&path, None, None);
+        let (app, _service) = build_app_with_service(config).await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/client")
+                .set_json(json!({
+                    "client_id": "client_env",
+                    "wif_env": "FS_TEST_ADD_CLIENT_WIF",
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("client_env"));
+        assert!(saved.contains("env:FS_TEST_ADD_CLIENT_WIF"));
+    }
+
+    #[actix_web::test]
+    async fn sr_clnt_001_service_supports_multiple_configured_clients() {
+        let path = unique_dynamic_config_path();
+        let mut config = test_config_with_keys(&path, None, None);
+        config.client = Some(vec![
+            ClientConfig {
+                client_id: TEST_CLIENT_ID.to_string(),
+                wif_key: TEST_WIF.to_string(),
+                api_key: None,
+            },
+            ClientConfig {
+                client_id: "client2".to_string(),
+                wif_key: TEST_WIF.to_string(),
+                api_key: None,
+            },
+        ]);
+        let (app, service) = build_app_with_service(config).await;
+        assert_eq!(service.client_count().await, 2);
+
+        for client_id in [TEST_CLIENT_ID, "client2"] {
+            let resp = test::call_service(
+                &app,
+                test::TestRequest::get()
+                    .uri(&format!("/client/{client_id}/address"))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+    }
+
+    #[actix_web::test]
+    async fn sr_sec_001_address_and_delete_require_client_api_key_when_enabled() {
+        let path = unique_dynamic_config_path();
+        let config = test_config_with_keys(&path, Some(TEST_API_KEY), None);
+        let (app, service) = build_app_with_service(config).await;
+        service
+            .add_client(&ClientConfig {
+                client_id: "deletable".to_string(),
+                wif_key: TEST_WIF.to_string(),
+                api_key: Some(TEST_API_KEY.to_string()),
+            })
+            .await
+            .expect("add deletable client");
+
+        for uri in [
+            format!("/client/{TEST_CLIENT_ID}/address"),
+            "/client/deletable".to_string(),
+        ] {
+            let resp = if uri.contains("/address") {
+                test::call_service(&app, test::TestRequest::get().uri(&uri).to_request()).await
+            } else {
+                test::call_service(&app, test::TestRequest::delete().uri(&uri).to_request()).await
+            };
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        }
+    }
+
+    #[actix_web::test]
+    async fn sr_sec_002_unauthorized_response_uses_standard_json_body() {
+        let app = build_app_with_api_key(Some(TEST_API_KEY)).await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/fund")
+                .set_json(fund_body(TEST_CLIENT_ID, 123, 1, LOCKING_SCRIPT_HEX))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["description"], "Unauthorized");
+    }
+
+    #[actix_web::test]
+    async fn sr_sec_010_invalid_wif_error_does_not_echo_secret() {
+        let secret_wif = "cSecretWifValueThatMustNotAppearInErrors123456789";
+        let app = build_app().await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/client")
+                .set_json(json!({
+                    "client_id": "client3",
+                    "wif": secret_wif,
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = String::from_utf8(test::read_body(resp).await.to_vec()).unwrap();
+        assert!(!body.contains(secret_wif));
+    }
+
+    #[actix_web::test]
+    async fn sr_sec_011_index_unauthenticated_when_client_api_key_enabled() {
+        let app = build_app_with_api_key(Some(TEST_API_KEY)).await;
+        let resp = test::call_service(&app, test::TestRequest::get().uri("/").to_request()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[actix_web::test]
+    async fn sr_func_011_success_and_error_responses_use_expected_status_codes() {
+        let app = build_app().await;
+        let ok = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/client/{TEST_CLIENT_ID}/balance"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(ok.status(), StatusCode::OK);
+
+        let err = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/client/unknown/balance")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 }

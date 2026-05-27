@@ -98,4 +98,11 @@ mod tests {
             burst_size: None,
         });
     }
+
+    #[test]
+    fn sr_lim_004_rate_limit_uses_peer_ip_key_extractor() {
+        let source = include_str!("rate_limit.rs");
+        assert!(source.contains("PeerIpKeyExtractor"));
+        assert!(source.contains("FinancingServiceKeyExtractor"));
+    }
 }

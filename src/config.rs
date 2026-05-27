@@ -212,6 +212,15 @@ fn env_key_suffix(client_id: &str) -> String {
         .collect()
 }
 
+/// Return the HTTP bind address and port, honouring `APP_ENV=docker`.
+pub fn web_bind_address(config: &Config) -> (Ipv4Addr, u16) {
+    let port = config.web_interface.port;
+    match env::var_os("APP_ENV") {
+        Some(content) if content == "docker" => (Ipv4Addr::new(0, 0, 0, 0), port),
+        Some(_) | None => (config.web_interface.address, port),
+    }
+}
+
 pub fn load_config(env_var: &str, filename: &str) -> Result<Config, String> {
     let config = get_config(env_var, filename)?;
     config.web_interface.rate_limit.validate()?;
@@ -247,6 +256,7 @@ pub fn get_config(env_var: &str, filename: &str) -> Result<Config, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chain_gang::network::Network;
 
     #[test]
     fn resolve_secrets_replaces_env_references() {
@@ -297,6 +307,29 @@ mod tests {
     }
 
     #[test]
+    fn sr_sec_008_resolve_secrets_applies_client_api_key_env_override() {
+        unsafe { env::set_var("FS_CLIENT_ID1_API_KEY", "override-api-key") };
+        let config = Config {
+            client: Some(vec![ClientConfig {
+                client_id: "id1".to_string(),
+                wif_key: "env:FS_TEST_CONFIG_WIF".to_string(),
+                api_key: Some("env:SHOULD_NOT_BE_USED".to_string()),
+            }]),
+            ..Default::default()
+        };
+        unsafe { env::set_var("FS_TEST_CONFIG_WIF", "test-wif-value") };
+        let resolved = config.resolve_secrets().unwrap();
+        assert_eq!(
+            resolved.client.as_ref().unwrap()[0].api_key.as_deref(),
+            Some("override-api-key")
+        );
+        unsafe {
+            env::remove_var("FS_CLIENT_ID1_API_KEY");
+            env::remove_var("FS_TEST_CONFIG_WIF");
+        }
+    }
+
+    #[test]
     fn rate_limit_config_rejects_zero_requests_per_second_when_enabled() {
         let config = RateLimitConfig {
             enabled: true,
@@ -304,5 +337,145 @@ mod tests {
             burst_size: None,
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn sr_cfg_001_load_config_reads_toml_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "financing-service-cfg-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[blockchain_interface]
+interface_type = "test"
+network_type = "testnet"
+
+[web_interface]
+address = "127.0.0.1"
+port = 9091
+
+[logging]
+level = "info"
+
+[service]
+utxo_refresh_period = 45
+
+[dynamic_config]
+filename = "./data/dynamic.toml"
+"#,
+        )
+        .unwrap();
+
+        unsafe { env::remove_var("FS_CONFIG") };
+        let config = load_config("FS_CONFIG", path.to_str().unwrap()).unwrap();
+        assert_eq!(config.web_interface.port, 9091);
+        assert_eq!(config.service.utxo_refresh_period, 45);
+    }
+
+    #[test]
+    fn sr_cfg_002_get_config_reads_fs_config_json() {
+        unsafe {
+            env::set_var(
+                "FS_CONFIG",
+                r#"{"blockchain_interface":{"interface_type":"test","network_type":"testnet"},"web_interface":{"address":"127.0.0.1","port":9092},"logging":{"level":"info"},"service":{"utxo_refresh_period":30},"dynamic_config":{"filename":"./data/dynamic.toml"}}"#,
+            );
+        }
+        let config = get_config("FS_CONFIG", "missing-file.toml").unwrap();
+        assert_eq!(config.web_interface.port, 9092);
+        unsafe { env::remove_var("FS_CONFIG") };
+    }
+
+    #[test]
+    fn sr_cfg_003_web_bind_address_uses_all_interfaces_in_docker() {
+        unsafe { env::set_var("APP_ENV", "docker") };
+        let config = Config {
+            web_interface: WebInterfaceConfig {
+                address: Ipv4Addr::new(127, 0, 0, 1),
+                port: 8080,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(web_bind_address(&config), (Ipv4Addr::new(0, 0, 0, 0), 8080));
+        unsafe { env::remove_var("APP_ENV") };
+    }
+
+    #[test]
+    fn sr_cfg_006_get_log_level_accepts_configured_levels() {
+        for (level, expected) in [
+            ("error", log::Level::Error),
+            ("warn", log::Level::Warn),
+            ("info", log::Level::Info),
+            ("debug", log::Level::Debug),
+            ("trace", log::Level::Trace),
+        ] {
+            let config = Config {
+                logging: LoggingConfig {
+                    level: level.to_string(),
+                },
+                ..Default::default()
+            };
+            assert_eq!(config.get_log_level().unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn sr_bchn_002_get_network_supports_mainnet_testnet_and_stn() {
+        for (network_type, expected) in [
+            ("mainnet", Network::BSV_Mainnet),
+            ("testnet", Network::BSV_Testnet),
+            ("stn", Network::BSV_STN),
+        ] {
+            let config = Config {
+                blockchain_interface: BlockchainInterfaceConfig {
+                    network_type: network_type.to_string(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            assert_eq!(config.get_network().unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn sr_clnt_001_config_supports_multiple_static_clients() {
+        let config = Config {
+            client: Some(vec![
+                ClientConfig {
+                    client_id: "id1".to_string(),
+                    wif_key: "wif1".to_string(),
+                    api_key: None,
+                },
+                ClientConfig {
+                    client_id: "id2".to_string(),
+                    wif_key: "wif2".to_string(),
+                    api_key: None,
+                },
+            ]),
+            ..Default::default()
+        };
+        assert_eq!(config.client.as_ref().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn sr_nfr_007_load_config_returns_error_for_invalid_file() {
+        unsafe { env::remove_var("FS_CONFIG") };
+        let err = load_config("FS_CONFIG", "definitely-missing-config.toml").unwrap_err();
+        assert!(err.contains("Error reading config file"));
+    }
+
+    #[test]
+    fn sr_bchn_003_sample_config_sets_utxo_refresh_period() {
+        let content = std::fs::read_to_string("data/financing-service.toml").unwrap();
+        let config: Config = toml::from_str(&content).unwrap();
+        assert_eq!(config.service.utxo_refresh_period, 60);
     }
 }

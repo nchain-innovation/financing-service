@@ -1,4 +1,4 @@
-use std::{env, net::Ipv4Addr, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 use tokio::time;
 
 use actix_governor::Governor;
@@ -20,7 +20,7 @@ mod util;
 mod test_support;
 
 use crate::{
-    config::{load_config, Config},
+    config::{load_config, web_bind_address},
     rest_api::{
         add_client, balance, delete_client, get_address, get_funds, health, index, status,
         update_clients, AppState,
@@ -28,16 +28,8 @@ use crate::{
     service::Service,
 };
 
-// Given the config return the websever ip address and port
-fn get_addr(config: &Config) -> (Ipv4Addr, u16) {
-    let port = config.web_interface.port;
-    match env::var_os("APP_ENV") {
-        // Allow all access in docker
-        // (required as otherwise the localmachine can not access the webserver)
-        Some(content) if content == "docker" => (Ipv4Addr::new(0, 0, 0, 0), port),
-        Some(_) | None => (config.web_interface.address, port),
-    }
-}
+#[cfg(test)]
+mod system_requirements;
 
 /// Main - Read config and setup Web server.
 #[actix_web::main]
@@ -90,7 +82,7 @@ async fn main() -> std::io::Result<()> {
         service: Arc::new(service),
     });
     let app_state2 = app_state.clone();
-    let addr = get_addr(&config);
+    let addr = web_bind_address(&config);
 
     // Setup periodic task
     let utxo_refresh_period = config.service.utxo_refresh_period;

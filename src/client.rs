@@ -559,4 +559,24 @@ mod tests {
         assert!(error.contains("Not enough UTXOs"));
         assert!(error.contains("2 suitable UTXOs, 3 required"));
     }
+
+    #[test]
+    fn sr_fund_001_funding_tx_uses_supplied_locking_script() {
+        let client = test_client_with_utxos(&[50_000]);
+        let fund_request = sample_fund_request(1_000);
+        let (tx, _) = client.plan_funding_tx(&fund_request).unwrap();
+        let tx_hex = tx_as_hexstr(&tx).unwrap();
+        assert!(tx_hex.contains(LOCKING_SCRIPT_HEX));
+    }
+
+    #[test]
+    fn sr_fund_010_plan_funding_tx_leaves_utxo_cache_unchanged_until_commit() {
+        let mut client = test_client_with_utxos(&[50_000, 40_000]);
+        let fund_request = sample_fund_request(1_000);
+        let (_, plan_a) = client.plan_funding_tx(&fund_request).unwrap();
+        let (_, plan_b) = client.plan_funding_tx(&fund_request).unwrap();
+        assert_eq!(plan_a.spent_indices, plan_b.spent_indices);
+        client.commit_funding_spend(plan_a);
+        assert!(client.plan_funding_tx(&fund_request).is_ok());
+    }
 }

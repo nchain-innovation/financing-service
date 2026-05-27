@@ -378,6 +378,21 @@ impl Service {
         )
     }
 
+    #[cfg(test)]
+    pub async fn set_test_chain_state(
+        &self,
+        client_id: &str,
+        balance: Balance,
+        unspent: Utxo,
+    ) -> Result<(), String> {
+        let client = self
+            .client_handle(client_id)
+            .await
+            .ok_or_else(|| format!("Unknown client_id {client_id}"))?;
+        client.write().await.apply_chain_state(balance, unspent);
+        Ok(())
+    }
+
     pub async fn funding_balance_error(&self, fund_request: &FundRequest) -> Option<String> {
         let client = self.client_handle(&fund_request.client_id).await?;
         let guard = client.read().await;
@@ -738,6 +753,38 @@ mod tests {
 
         result_a.expect("first same-client funding should succeed");
         result_b.expect("second same-client funding should succeed");
+    }
+
+    #[tokio::test]
+    async fn sr_fund_008_partial_multiple_tx_failure_resyncs_chain_state() {
+        use crate::test_support::FailingBroadcastBlockchain;
+
+        let config = test_config(&unique_dynamic_config_path());
+        let blockchain = FailingBroadcastBlockchain::new(&config, 1).await;
+        let service = Arc::new(Service::new_for_test(&config, blockchain).await);
+
+        let fund_request = FundRequest {
+            client_id: TEST_CLIENT_ID.to_string(),
+            satoshi: 123,
+            no_of_outpoints: 2,
+            multiple_tx: true,
+            locking_script: hex::decode(LOCKING_SCRIPT_HEX).unwrap(),
+        };
+
+        let error = Service::fund_with_multiple_transactions(&service, &fund_request)
+            .await
+            .expect_err("second broadcast should fail");
+        assert!(error.partial.is_some());
+
+        let balance = service
+            .get_balance(TEST_CLIENT_ID)
+            .await
+            .expect("test client");
+        assert!(balance.confirmed > 0);
+        assert!(service
+            .funding_balance_error(&sample_fund_request(TEST_CLIENT_ID))
+            .await
+            .is_none());
     }
 
     async fn fund_single_transaction(
