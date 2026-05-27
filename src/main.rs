@@ -4,6 +4,7 @@ use tokio::time;
 use actix_web::{web, App, HttpServer};
 use async_mutex::Mutex;
 
+mod auth;
 mod blockchain_factory;
 mod client;
 mod config;
@@ -17,6 +18,7 @@ mod util;
 mod test_support;
 
 use crate::{
+    auth::ApiKeyAuth,
     config::{get_config, Config},
     rest_api::{
         add_client, balance, delete_client, get_address, get_funds, health, index, status,
@@ -45,6 +47,14 @@ async fn main() -> std::io::Result<()> {
     };
 
     simple_logger::init_with_level(config.get_log_level()).unwrap();
+    let auth = ApiKeyAuth::new(config.web_interface.api_key.clone());
+    if auth.is_enabled() {
+        log::info!("API key authentication enabled");
+    } else {
+        log::warn!(
+            "API key authentication disabled; protect /fund and /client via network isolation or set web_interface.api_key"
+        );
+    }
     let service = Service::new(&config).await;
     let app_state = web::Data::new(AppState {
         service: Mutex::new(service),
@@ -64,17 +74,22 @@ async fn main() -> std::io::Result<()> {
         }
     });
 
+    let auth = auth.clone();
     HttpServer::new(move || {
         App::new()
             .app_data(app_state.clone())
             .service(index)
             .service(health)
-            .service(status)
-            .service(balance)
-            .service(get_funds)
-            .service(add_client)
-            .service(delete_client)
-            .service(get_address)
+            .service(
+                web::scope("")
+                    .wrap(auth.clone())
+                    .service(status)
+                    .service(balance)
+                    .service(get_funds)
+                    .service(add_client)
+                    .service(delete_client)
+                    .service(get_address),
+            )
     })
     .bind(addr)
     .unwrap_or_else(|e| {

@@ -8,11 +8,20 @@ pub const TEST_ADDRESS: &str = "n1jaAsKZfE6kufLy5DAtAyQ1RzGXwMeNAF";
 pub const LOCKING_SCRIPT_HEX: &str = "76a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac";
 
 pub fn test_config(dynamic_filename: &str) -> Config {
+    test_config_with_api_key(dynamic_filename, None)
+}
+
+pub fn test_config_with_api_key(dynamic_filename: &str, api_key: Option<&str>) -> Config {
     Config {
         blockchain_interface: BlockchainInterfaceConfig {
             interface_type: "test".to_string(),
             network_type: "testnet".to_string(),
             url: None,
+        },
+        web_interface: crate::config::WebInterfaceConfig {
+            address: std::net::Ipv4Addr::LOCALHOST,
+            port: 8080,
+            api_key: api_key.map(str::to_string),
         },
         client: Some(vec![ClientConfig {
             client_id: TEST_CLIENT_ID.to_string(),

@@ -39,6 +39,9 @@ pub struct DynamicConfigConfig {
 pub struct WebInterfaceConfig {
     pub address: Ipv4Addr,
     pub port: u16,
+    /// When set, required for all endpoints except `/` and `/health`.
+    #[serde(default)]
+    pub api_key: Option<String>,
 }
 
 impl Default for WebInterfaceConfig {
@@ -46,6 +49,7 @@ impl Default for WebInterfaceConfig {
         WebInterfaceConfig {
             address: Ipv4Addr::new(0, 0, 0, 0),
             port: 0,
+            api_key: None,
         }
     }
 }

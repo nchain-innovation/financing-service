@@ -219,19 +219,24 @@ mod tests {
     use serde_json::{json, Value};
 
     use crate::{
+        auth::ApiKeyAuth,
         rest_api::{
             add_client, balance, delete_client, get_address, get_funds, health, index, status,
             AppState,
         },
         service::Service,
         test_support::{
-            test_blockchain_interface, test_config, unique_dynamic_config_path, LOCKING_SCRIPT_HEX,
-            TEST_ADDRESS, TEST_CLIENT_ID, TEST_WIF,
+            test_blockchain_interface, test_config_with_api_key, unique_dynamic_config_path,
+            LOCKING_SCRIPT_HEX, TEST_ADDRESS, TEST_CLIENT_ID, TEST_WIF,
         },
     };
 
-    async fn build_app() -> impl ActixService<Request, Response = ServiceResponse, Error = Error> {
-        let config = test_config(&unique_dynamic_config_path());
+    const TEST_API_KEY: &str = "test-secret-key";
+
+    async fn build_app_with_api_key(
+        api_key: Option<&str>,
+    ) -> impl ActixService<Request, Response = ServiceResponse, Error = Error> {
+        let config = test_config_with_api_key(&unique_dynamic_config_path(), api_key);
         let blockchain = test_blockchain_interface(&config).await;
         let financing_service = Service::new_for_test(&config, blockchain).await;
         let app_state = web::Data::new(AppState {
@@ -243,14 +248,22 @@ mod tests {
                 .app_data(app_state)
                 .service(index)
                 .service(health)
-                .service(status)
-                .service(balance)
-                .service(get_funds)
-                .service(add_client)
-                .service(delete_client)
-                .service(get_address),
+                .service(
+                    web::scope("")
+                        .wrap(ApiKeyAuth::new(api_key.map(str::to_string)))
+                        .service(status)
+                        .service(balance)
+                        .service(get_funds)
+                        .service(add_client)
+                        .service(delete_client)
+                        .service(get_address),
+                ),
         )
         .await
+    }
+
+    async fn build_app() -> impl ActixService<Request, Response = ServiceResponse, Error = Error> {
+        build_app_with_api_key(None).await
     }
 
     fn fund_body(
@@ -585,5 +598,76 @@ mod tests {
         assert_eq!(body["outpoints"].as_array().unwrap().len(), 1);
         assert_eq!(body["txs"].as_array().unwrap().len(), 1);
         assert!(body["outpoints"][0]["hash"].as_str().unwrap().len() > 0);
+    }
+
+    #[actix_web::test]
+    async fn test_health_unauthenticated_when_api_key_enabled() {
+        let app = build_app_with_api_key(Some(TEST_API_KEY)).await;
+        let resp =
+            test::call_service(&app, test::TestRequest::get().uri("/health").to_request()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[actix_web::test]
+    async fn test_fund_requires_api_key_when_enabled() {
+        let app = build_app_with_api_key(Some(TEST_API_KEY)).await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/fund")
+                .set_json(fund_body(TEST_CLIENT_ID, 123, 1, LOCKING_SCRIPT_HEX))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["description"], "Unauthorized");
+    }
+
+    #[actix_web::test]
+    async fn test_fund_accepts_bearer_token() {
+        let app = build_app_with_api_key(Some(TEST_API_KEY)).await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/fund")
+                .insert_header(("Authorization", format!("Bearer {TEST_API_KEY}")))
+                .set_json(fund_body(TEST_CLIENT_ID, 123, 1, LOCKING_SCRIPT_HEX))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[actix_web::test]
+    async fn test_add_client_accepts_x_api_key_header() {
+        let app = build_app_with_api_key(Some(TEST_API_KEY)).await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/client")
+                .insert_header(("X-API-Key", TEST_API_KEY))
+                .set_json(json!({
+                    "client_id": "client2",
+                    "wif": TEST_WIF,
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[actix_web::test]
+    async fn test_status_rejects_invalid_api_key() {
+        let app = build_app_with_api_key(Some(TEST_API_KEY)).await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/status")
+                .insert_header(("X-API-Key", "wrong-key"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 }

@@ -2,6 +2,17 @@
 
 The service listens on the port configured in `data/financing-service.toml` (default `8080`).
 
+When `web_interface.api_key` is set, all endpoints except `/` and `/health` require authentication via either:
+
+* `Authorization: Bearer <api_key>`
+* `X-API-Key: <api_key>`
+
+Missing or invalid credentials return HTTP `401`:
+
+```json
+{"description": "Unauthorized"}
+```
+
 All JSON error responses use HTTP status `422` with this shape:
 
 ```json
@@ -81,7 +92,8 @@ Creates one or more funding transactions. Request body (JSON):
 | `locking_script` | string | Hex-encoded locking script for the funding outputs |
 
 ```bash
-curl -H "Content-Type: application/json" \
+curl -H "Authorization: Bearer your-api-key" \
+     -H "Content-Type: application/json" \
      --request POST \
      --data '{"client_id":"client1","satoshi":123,"no_of_outpoints":1,"multiple_tx":false,"locking_script":"76a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac"}' \
      http://127.0.0.1:8080/fund
@@ -110,7 +122,8 @@ Funding requires a single UTXO large enough to cover each transaction. The servi
 Add a client at runtime. The client is persisted to the dynamic config file.
 
 ```bash
-curl -H "Content-Type: application/json" \
+curl -H "Authorization: Bearer your-api-key" \
+     -H "Content-Type: application/json" \
      --request POST \
      --data '{"client_id":"client15","wif":"cVLcPuZMfnNNcaU...................oLh3piTnX9WCndRqWh"}' \
      http://127.0.0.1:8080/client

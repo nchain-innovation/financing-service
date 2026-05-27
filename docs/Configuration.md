@@ -27,9 +27,19 @@ Configures the REST API endpoint for the service.
 [web_interface]
 address = "127.0.0.1"
 port = 8080
+# api_key = "your-secret-key"
 ```
 
 When `APP_ENV=docker`, the service listens on `0.0.0.0` regardless of `address`.
+
+### Authentication
+
+Set `api_key` to require a shared secret on all endpoints except `/` and `/health`. Clients must send either:
+
+* `Authorization: Bearer <api_key>`
+* `X-API-Key: <api_key>`
+
+When `api_key` is omitted, authentication is disabled. In that case, restrict access with network isolation (for example, bind to `127.0.0.1` and place the service behind a reverse proxy or private network). The service logs a warning at startup when authentication is disabled.
 
 ## [logging]
 

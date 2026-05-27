@@ -78,6 +78,14 @@ pub fn error_response(description: impl Into<String>) -> HttpResponse {
         })
 }
 
+pub fn unauthorized_response() -> HttpResponse {
+    HttpResponse::Unauthorized()
+        .content_type(ContentType::json())
+        .json(ErrorResponse {
+            description: "Unauthorized".to_string(),
+        })
+}
+
 pub fn json_ok<T: Serialize>(value: &T) -> HttpResponse {
     HttpResponse::Ok()
         .content_type(ContentType::json())
