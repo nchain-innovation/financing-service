@@ -4,6 +4,5 @@
 out.txt
 tree.txt
 
-Cargo.lock
 /data/dynamic*.toml
 /certs

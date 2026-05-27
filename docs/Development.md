@@ -55,6 +55,10 @@ cargo clippy -- -D warnings
 
 These checks run automatically in GitHub Actions (`.github/workflows/rust.yml`) on push and pull request to `main`.
 
+## Dependencies
+
+`Cargo.lock` is committed for reproducible builds. Run `cargo update` only when intentionally upgrading dependencies, then re-run tests and commit the updated lockfile.
+
 ## Source code documentation
 
 Generate source code documentation:

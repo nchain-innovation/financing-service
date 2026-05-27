@@ -46,7 +46,7 @@ Admin       ──REST──▶       │                │
 * Balance checks against total wallet balance and single-UTXO availability
 * Docker image with `/health` liveness check
 * CI: build, test, `cargo fmt --check`, `cargo clippy -- -D warnings`
-* Pinned `chain-gang` git dependency for reproducible builds
+* Pinned `chain-gang` git dependency and committed `Cargo.lock` for reproducible builds
 * 41 automated tests (unit, integration, REST API)
 
 ## Known limitations
@@ -62,7 +62,6 @@ Admin       ──REST──▶       │                │
 ## Open items
 
 * UTXO consolidation (multi-input funding transactions)
-* Commit `Cargo.lock` for fully reproducible dependency resolution
 * Add `cargo audit` to CI
 * Protect `POST /client` (e.g. admin key or existing-client auth)
 * Reduce sensitive data in logs (full tx hex at `info` level)
