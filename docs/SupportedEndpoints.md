@@ -11,7 +11,7 @@ The key must match the `client_id` being accessed. Using another client's key re
 
 This applies to `POST /fund`, `GET /client/{client_id}/balance`, `GET /client/{client_id}/address`, and `DELETE /client/{client_id}` when that client has an `api_key`. `/`, `/health`, and `/status` remain unauthenticated.
 
-`POST /client` is not authenticated. It accepts an optional `api_key` field that is stored for the new client. Restrict this endpoint via network isolation. See [Configuration](Configuration.md) for setting `api_key` in static and dynamic client config.
+`POST /client` requires `web_interface.admin_api_key` when configured. Send the admin key via `Authorization: Bearer <admin_api_key>` or `X-API-Key: <admin_api_key>`. The request body may include an optional `api_key` field that is stored for the new client. See [Configuration](Configuration.md).
 
 Missing or invalid credentials return HTTP `401`:
 
@@ -128,7 +128,7 @@ Funding requires a single UTXO large enough to cover each transaction. The servi
 
 `POST /client`
 
-Add a client at runtime. The client is persisted to the dynamic config file. This endpoint is not authenticated — restrict access via network isolation.
+Add a client at runtime. The client is persisted to the dynamic config file. Requires `web_interface.admin_api_key` when configured.
 
 Request body (JSON):
 
@@ -139,7 +139,8 @@ Request body (JSON):
 | `api_key` | string | Optional shared secret for this client's API endpoints |
 
 ```bash
-curl -H "Content-Type: application/json" \
+curl -H "Authorization: Bearer your-admin-api-key" \
+     -H "Content-Type: application/json" \
      --request POST \
      --data '{"client_id":"client15","wif":"cVLcPuZMfnNNcaU...................oLh3piTnX9WCndRqWh","api_key":"your-client-api-key"}' \
      http://127.0.0.1:8080/client
@@ -148,6 +149,10 @@ curl -H "Content-Type: application/json" \
 ```json
 {"status": "Success"}
 ```
+
+Common error responses:
+
+* Unauthorized — `{"description": "Unauthorized"}` (missing or invalid admin key)
 
 ## Delete client
 

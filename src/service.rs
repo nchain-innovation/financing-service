@@ -54,6 +54,7 @@ pub struct Service {
     blockchain_interface: Box<dyn BlockchainInterface>,
     clients: Vec<Client>,
     dynamic_config: DynamicConfig,
+    admin_api_key: Option<String>,
 }
 
 impl Service {
@@ -80,6 +81,11 @@ impl Service {
             blockchain_interface,
             clients,
             dynamic_config,
+            admin_api_key: config
+                .web_interface
+                .admin_api_key
+                .clone()
+                .filter(|key| !key.is_empty()),
         }
     }
 
@@ -224,6 +230,17 @@ impl Service {
 
     pub fn client_count(&self) -> usize {
         self.clients.len()
+    }
+
+    pub fn admin_auth_required(&self) -> bool {
+        self.admin_api_key.is_some()
+    }
+
+    pub fn verify_admin_api_key(&self, provided: &str) -> bool {
+        match self.admin_api_key.as_deref() {
+            Some(expected) => crate::auth::constant_time_eq(provided, expected),
+            None => true,
+        }
     }
 
     /// Given a client_id return the associated balance as JSON string

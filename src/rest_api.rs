@@ -4,7 +4,7 @@ use log::debug;
 use serde::Deserialize;
 
 use crate::{
-    auth::authorize_client,
+    auth::{authorize_admin, authorize_client},
     client::FundRequest,
     responses::{
         error_response, json_ok, AddressResponse, BalanceResponse, HealthResponse, SuccessResponse,
@@ -142,10 +142,14 @@ pub async fn get_funds(
 /// {"status": "Success"}
 #[post("/client")]
 pub async fn add_client(
+    req: HttpRequest,
     data: web::Data<AppState>,
     info: web::Json<ClientAddRequest>,
 ) -> impl Responder {
     let mut service = data.service.lock().await;
+    if let Some(response) = authorize_admin(&req, &service) {
+        return response;
+    }
     let client_id = &info.client_id;
     log::info!("add_client {}", &client_id);
 
@@ -253,17 +257,20 @@ mod tests {
         },
         service::Service,
         test_support::{
-            test_blockchain_interface, test_config_with_api_key, unique_dynamic_config_path,
-            LOCKING_SCRIPT_HEX, TEST_ADDRESS, TEST_CLIENT_ID, TEST_WIF,
+            test_blockchain_interface, test_config_with_keys, unique_dynamic_config_path,
+            unique_dynamic_config_path, LOCKING_SCRIPT_HEX, TEST_ADDRESS, TEST_CLIENT_ID, TEST_WIF,
         },
     };
 
     const TEST_API_KEY: &str = "test-secret-key";
+    const TEST_ADMIN_API_KEY: &str = "test-admin-key";
 
-    async fn build_app_with_api_key(
-        api_key: Option<&str>,
+    async fn build_app_with_keys(
+        client_api_key: Option<&str>,
+        admin_api_key: Option<&str>,
     ) -> impl ActixService<Request, Response = ServiceResponse, Error = Error> {
-        let config = test_config_with_api_key(&unique_dynamic_config_path(), api_key);
+        let config =
+            test_config_with_keys(&unique_dynamic_config_path(), client_api_key, admin_api_key);
         let blockchain = test_blockchain_interface(&config).await;
         let financing_service = Service::new_for_test(&config, blockchain).await;
         let app_state = web::Data::new(AppState {
@@ -285,8 +292,20 @@ mod tests {
         .await
     }
 
+    async fn build_app_with_api_key(
+        api_key: Option<&str>,
+    ) -> impl ActixService<Request, Response = ServiceResponse, Error = Error> {
+        build_app_with_keys(api_key, None).await
+    }
+
+    async fn build_app_with_admin_key(
+        admin_api_key: Option<&str>,
+    ) -> impl ActixService<Request, Response = ServiceResponse, Error = Error> {
+        build_app_with_keys(None, admin_api_key).await
+    }
+
     async fn build_app() -> impl ActixService<Request, Response = ServiceResponse, Error = Error> {
-        build_app_with_api_key(None).await
+        build_app_with_keys(None, None).await
     }
 
     fn fund_body(
@@ -663,13 +682,12 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn test_add_client_accepts_x_api_key_header() {
-        let app = build_app_with_api_key(Some(TEST_API_KEY)).await;
+    async fn test_add_client_requires_admin_key_when_enabled() {
+        let app = build_app_with_admin_key(Some(TEST_ADMIN_API_KEY)).await;
         let resp = test::call_service(
             &app,
             test::TestRequest::post()
                 .uri("/client")
-                .insert_header(("X-API-Key", TEST_API_KEY))
                 .set_json(json!({
                     "client_id": "client2",
                     "wif": TEST_WIF,
@@ -677,7 +695,44 @@ mod tests {
                 .to_request(),
         )
         .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[actix_web::test]
+    async fn test_add_client_accepts_admin_bearer_token() {
+        let app = build_app_with_admin_key(Some(TEST_ADMIN_API_KEY)).await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/client")
+                .insert_header(("Authorization", format!("Bearer {TEST_ADMIN_API_KEY}")))
+                .set_json(json!({
+                    "client_id": "client2",
+                    "wif": TEST_WIF,
+                    "api_key": "new-client-key",
+                }))
+                .to_request(),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[actix_web::test]
+    async fn test_add_client_rejects_wrong_admin_key() {
+        let app = build_app_with_admin_key(Some(TEST_ADMIN_API_KEY)).await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/client")
+                .insert_header(("X-API-Key", "wrong-admin-key"))
+                .set_json(json!({
+                    "client_id": "client2",
+                    "wif": TEST_WIF,
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[actix_web::test]

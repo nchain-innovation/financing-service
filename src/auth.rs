@@ -53,6 +53,18 @@ pub fn authorize_client(
     }
 }
 
+/// Returns `Some(HttpResponse)` when the admin request is unauthorized.
+pub fn authorize_admin(req: &HttpRequest, service: &Service) -> Option<HttpResponse> {
+    if !service.admin_auth_required() {
+        return None;
+    }
+
+    match extract_api_key(req) {
+        Some(key) if service.verify_admin_api_key(&key) => None,
+        _ => Some(unauthorized_response()),
+    }
+}
+
 #[cfg(test)]
 mod unit_tests {
     use super::constant_time_eq;
@@ -71,14 +83,14 @@ mod unit_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{authorize_client, extract_api_key, BEARER_PREFIX};
+    use super::{authorize_admin, authorize_client, extract_api_key, BEARER_PREFIX};
     use actix_web::{http::StatusCode, test};
 
     use crate::{
         service::Service,
         test_support::{
-            test_blockchain_interface, test_config_with_api_key, unique_dynamic_config_path,
-            TEST_CLIENT_ID,
+            test_blockchain_interface, test_config_with_api_key, test_config_with_keys,
+            unique_dynamic_config_path, TEST_CLIENT_ID,
         },
     };
 
@@ -142,5 +154,40 @@ mod tests {
 
         let resp = authorize_client(&req, TEST_CLIENT_ID, &service).unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[actix_web::test]
+    async fn authorize_admin_allows_when_no_key_configured() {
+        let config = test_config_with_keys(&unique_dynamic_config_path(), None, None);
+        let blockchain = test_blockchain_interface(&config).await;
+        let service = Service::new_for_test(&config, blockchain).await;
+        let req = test::TestRequest::get().to_http_request();
+
+        assert!(authorize_admin(&req, &service).is_none());
+    }
+
+    #[actix_web::test]
+    async fn authorize_admin_rejects_missing_key() {
+        let config =
+            test_config_with_keys(&unique_dynamic_config_path(), None, Some("admin-secret"));
+        let blockchain = test_blockchain_interface(&config).await;
+        let service = Service::new_for_test(&config, blockchain).await;
+        let req = test::TestRequest::get().to_http_request();
+
+        let resp = authorize_admin(&req, &service).unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[actix_web::test]
+    async fn authorize_admin_accepts_matching_key() {
+        let config =
+            test_config_with_keys(&unique_dynamic_config_path(), None, Some("admin-secret"));
+        let blockchain = test_blockchain_interface(&config).await;
+        let service = Service::new_for_test(&config, blockchain).await;
+        let req = test::TestRequest::get()
+            .insert_header(("Authorization", format!("{BEARER_PREFIX}admin-secret")))
+            .to_http_request();
+
+        assert!(authorize_admin(&req, &service).is_none());
     }
 }

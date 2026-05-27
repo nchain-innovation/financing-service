@@ -47,6 +47,13 @@ async fn main() -> std::io::Result<()> {
 
     simple_logger::init_with_level(config.get_log_level()).unwrap();
     let service = Service::new(&config).await;
+    if service.admin_auth_required() {
+        log::info!("Admin API key authentication enabled for POST /client");
+    } else {
+        log::warn!(
+            "Admin API key not configured; POST /client is unauthenticated. Set web_interface.admin_api_key or restrict via network isolation."
+        );
+    }
     let clients_without_api_key = service.clients_without_api_key();
     if service.client_count() > 0 && clients_without_api_key.is_empty() {
         log::info!("Per-client API key authentication enabled for all clients");

@@ -30,7 +30,7 @@ The FS is designed to be as simple as possible, in that light it:
 * FS build dependencies are all freely avalible open-source Rust crates.
 
 * FS does not support Hierarchical Deterministic (HD) Keys (BIP-32).
-* FS supports optional per-client API key authentication. Each client can have an `api_key` that protects that client's funding and balance endpoints. Clients without an `api_key` rely on network isolation (firewalls, private networks, reverse proxies). See [Configuration](docs/Configuration.md) and [Supported endpoints](docs/SupportedEndpoints.md).
+* FS supports optional per-client API key authentication and an optional admin key for `POST /client`. Clients without an `api_key` rely on network isolation (firewalls, private networks, reverse proxies). See [Configuration](docs/Configuration.md) and [Supported endpoints](docs/SupportedEndpoints.md).
 
 ## Use cases
 

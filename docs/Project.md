@@ -43,6 +43,7 @@ Admin       ──REST──▶       │                │
 * JSON request/response bodies with typed serde DTOs
 * Dynamic client add/remove via `POST /client` and `DELETE /client/{id}`
 * Optional per-client `api_key` authentication
+* Optional `admin_api_key` for `POST /client`
 * Balance checks against total wallet balance and single-UTXO availability
 * Docker image with `/health` liveness check
 * CI: build, test, `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo audit`
@@ -55,14 +56,12 @@ Admin       ──REST──▶       │                │
 * **UTXO cache staleness** — balances refresh on a configurable interval (default 60 seconds). A fund request between refreshes may fail if UTXOs were spent on-chain.
 * **Multi-tx partial failure** — in `multiple_tx` mode, earlier transactions may broadcast successfully before a later one fails.
 * **Request serialization** — all endpoints share a single `Mutex<Service>`. Fund requests hold the lock through blockchain broadcast.
-* **Plaintext secrets** — WIF keys and optional `api_key` values are stored in TOML config files.
-* **Unauthenticated admin endpoint** — `POST /client` has no auth; restrict via network isolation.
+* **Plaintext secrets** — WIF keys, optional client `api_key`, and optional `admin_api_key` are stored in TOML config files.
 * **No rate limiting or HTTPS** — expected to be handled at the deployment layer (reverse proxy, firewall).
 
 ## Open items
 
 * UTXO consolidation (multi-input funding transactions)
-* Protect `POST /client` (e.g. admin key or existing-client auth)
 * Reduce sensitive data in logs (full tx hex at `info` level)
 * Clean up remaining startup-path panics (`Client::new`, config parse failures)
 

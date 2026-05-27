@@ -27,11 +27,21 @@ Configures the REST API endpoint for the service.
 [web_interface]
 address = "127.0.0.1"
 port = 8080
+# admin_api_key = "your-admin-secret"
 ```
 
 When `APP_ENV=docker`, the service listens on `0.0.0.0` regardless of `address`.
 
 Bind to `127.0.0.1` or place the service behind a reverse proxy on a private network when exposing funding endpoints.
+
+### Admin authentication
+
+Set `admin_api_key` to require a shared secret on `POST /client`. Clients must send either:
+
+* `Authorization: Bearer <admin_api_key>`
+* `X-API-Key: <admin_api_key>`
+
+When `admin_api_key` is omitted, `POST /client` is unauthenticated. The service logs a warning at startup when the admin key is not configured.
 
 ## [logging]
 
