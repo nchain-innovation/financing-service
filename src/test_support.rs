@@ -32,6 +32,7 @@ pub fn test_config_with_keys(
             address: std::net::Ipv4Addr::LOCALHOST,
             port: 8080,
             admin_api_key: admin_api_key.map(str::to_string),
+            rate_limit: crate::config::RateLimitConfig::default(),
         },
         client: Some(vec![ClientConfig {
             client_id: TEST_CLIENT_ID.to_string(),

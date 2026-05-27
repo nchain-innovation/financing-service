@@ -36,6 +36,7 @@ Admin       ──REST──▶       │                │
 | `auth.rs` | Per-client API key verification |
 | `blockchain_factory.rs` | Pluggable blockchain backends |
 | `dynamic_config.rs` | Persist runtime-added clients |
+| `rate_limit.rs` | Per-IP HTTP rate limiting middleware |
 
 ## Implemented
 
@@ -45,18 +46,19 @@ Admin       ──REST──▶       │                │
 * Optional per-client `api_key` authentication
 * Optional `admin_api_key` for `POST /client`
 * Secret references via `env:VAR`, environment overrides, and `wif_env` / `api_key_env` on `POST /client`
+* Configurable per-IP HTTP rate limiting with `/health` exempt
 * Balance checks against total wallet balance; funding combines multiple UTXOs when needed
 * Docker image with `/health` liveness check
 * CI: build, test, `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo audit`
 * Pinned `chain-gang` git dependency and committed `Cargo.lock` for reproducible builds
-* 59 automated tests (unit, integration, REST API)
+* 64 automated tests (unit, integration, REST API)
 
 ## Known limitations
 
 * **Balance endpoint cache** — `GET /client/{id}/balance` reflects the last periodic refresh unless a recent `/fund` updated that client. Funding requests refresh UTXOs from the blockchain immediately before transaction preparation.
 * **Multi-tx partial failure** — if a later broadcast fails in `multiple_tx` mode, earlier transactions remain on-chain. The service resyncs UTXO state from the blockchain and returns an error listing successful transaction ids.
 * **Concurrent fund requests for the same client** — funding for a given `client_id` still serializes on that client's UTXO lock. Different clients can fund concurrently.
-* **No rate limiting or HTTPS** — expected to be handled at the deployment layer (reverse proxy, firewall).
+* **No HTTPS** — expected to be handled at the deployment layer (reverse proxy, firewall).
 
 ## Open items
 

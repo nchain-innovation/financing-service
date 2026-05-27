@@ -43,6 +43,25 @@ Set `admin_api_key` to require a shared secret on `POST /client`. Clients must s
 
 When `admin_api_key` is omitted, `POST /client` is unauthenticated. The service logs a warning at startup when the admin key is not configured.
 
+### Rate limiting
+
+Optional per-IP rate limiting is configured under `[web_interface.rate_limit]`:
+
+```toml
+[web_interface.rate_limit]
+enabled = true
+requests_per_second = 10
+burst_size = 20
+```
+
+* `enabled` — turn rate limiting on or off (default: `false`)
+* `requests_per_second` — sustained request rate allowed per client IP
+* `burst_size` — maximum burst before limiting (defaults to `requests_per_second`)
+
+When enabled, excess requests receive HTTP 429 with a JSON error body. `/health` is exempt so container orchestration probes are not throttled.
+
+Behind a reverse proxy, the limit applies to the proxy's IP unless you configure the proxy to pass the original client address and implement a custom key extractor.
+
 ## [logging]
 
 Configures the log level for the service.

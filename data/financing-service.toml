@@ -6,6 +6,10 @@ network_type = "testnet"
 [web_interface]
 address = "127.0.0.1"
 port = 8080
+# [web_interface.rate_limit]
+# enabled = true
+# requests_per_second = 10
+# burst_size = 20
 
 [logging]
 level = "info"

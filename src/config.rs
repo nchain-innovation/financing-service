@@ -39,6 +39,48 @@ pub struct DynamicConfigConfig {
     pub filename: String,
 }
 
+/// Per-IP HTTP rate limiting configuration.
+#[derive(Debug, Deserialize, Clone)]
+pub struct RateLimitConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_requests_per_second")]
+    pub requests_per_second: u64,
+    #[serde(default)]
+    pub burst_size: Option<u32>,
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        RateLimitConfig {
+            enabled: false,
+            requests_per_second: default_requests_per_second(),
+            burst_size: None,
+        }
+    }
+}
+
+fn default_requests_per_second() -> u64 {
+    10
+}
+
+impl RateLimitConfig {
+    pub fn effective_burst_size(&self) -> u32 {
+        self.burst_size
+            .unwrap_or(self.requests_per_second.min(u32::MAX as u64) as u32)
+            .max(1)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.enabled && self.requests_per_second == 0 {
+            return Err(
+                "web_interface.rate_limit.requests_per_second must be greater than 0 when rate limiting is enabled".to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Web Interface Configuration
 #[derive(Debug, Deserialize, Clone)]
 pub struct WebInterfaceConfig {
@@ -47,6 +89,8 @@ pub struct WebInterfaceConfig {
     /// When set, required for `POST /client`.
     #[serde(default)]
     pub admin_api_key: Option<String>,
+    #[serde(default)]
+    pub rate_limit: RateLimitConfig,
 }
 
 impl Default for WebInterfaceConfig {
@@ -55,6 +99,7 @@ impl Default for WebInterfaceConfig {
             address: Ipv4Addr::new(0, 0, 0, 0),
             port: 0,
             admin_api_key: None,
+            rate_limit: RateLimitConfig::default(),
         }
     }
 }
@@ -169,6 +214,7 @@ fn env_key_suffix(client_id: &str) -> String {
 
 pub fn load_config(env_var: &str, filename: &str) -> Result<Config, String> {
     let config = get_config(env_var, filename)?;
+    config.web_interface.rate_limit.validate()?;
     warn_plaintext_secrets(&config);
     config.resolve_secrets()
 }
@@ -214,6 +260,7 @@ mod tests {
                 address: Ipv4Addr::new(127, 0, 0, 1),
                 port: 8080,
                 admin_api_key: Some("env:FS_TEST_CONFIG_ADMIN".to_string()),
+                rate_limit: RateLimitConfig::default(),
             },
             client: Some(vec![ClientConfig {
                 client_id: "id1".to_string(),
@@ -247,5 +294,15 @@ mod tests {
         let resolved = config.resolve_secrets().unwrap();
         assert_eq!(resolved.client.as_ref().unwrap()[0].wif_key, "override-wif");
         unsafe { env::remove_var("FS_CLIENT_ID1_WIF") };
+    }
+
+    #[test]
+    fn rate_limit_config_rejects_zero_requests_per_second_when_enabled() {
+        let config = RateLimitConfig {
+            enabled: true,
+            requests_per_second: 0,
+            burst_size: None,
+        };
+        assert!(config.validate().is_err());
     }
 }

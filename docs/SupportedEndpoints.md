@@ -19,6 +19,12 @@ Missing or invalid credentials return HTTP `401`:
 {"description": "Unauthorized"}
 ```
 
+When `[web_interface.rate_limit]` is enabled, excess requests from the same IP receive HTTP `429`:
+
+```json
+{"description": "Rate limit exceeded, retry in 1s"}
+```
+
 All JSON error responses use HTTP status `422` with this shape:
 
 ```json

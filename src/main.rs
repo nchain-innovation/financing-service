@@ -1,6 +1,7 @@
 use std::{env, net::Ipv4Addr, sync::Arc, time::Duration};
 use tokio::time;
 
+use actix_governor::Governor;
 use actix_web::{web, App, HttpServer};
 
 mod auth;
@@ -8,6 +9,7 @@ mod blockchain_factory;
 mod client;
 mod config;
 mod dynamic_config;
+mod rate_limit;
 mod responses;
 mod rest_api;
 mod secrets;
@@ -75,6 +77,15 @@ async fn main() -> std::io::Result<()> {
             clients_without_api_key.join(", ")
         );
     }
+    let governor_config = rate_limit::build_governor_config(&config.web_interface.rate_limit);
+    if config.web_interface.rate_limit.enabled {
+        log::info!(
+            "Rate limiting enabled: {} requests/s per IP (burst {})",
+            config.web_interface.rate_limit.requests_per_second,
+            config.web_interface.rate_limit.effective_burst_size()
+        );
+        rate_limit::spawn_retain_task(&governor_config);
+    }
     let app_state = web::Data::new(AppState {
         service: Arc::new(service),
     });
@@ -93,8 +104,10 @@ async fn main() -> std::io::Result<()> {
         }
     });
 
+    let governor_config = governor_config.clone();
     HttpServer::new(move || {
         App::new()
+            .wrap(Governor::new(&governor_config))
             .app_data(app_state.clone())
             .service(index)
             .service(health)

@@ -306,13 +306,17 @@ pub async fn balance(
 
 #[cfg(test)]
 mod tests {
-    use actix_http::Request;
+    use actix_governor::Governor;
+    use actix_http::{body::BoxBody, Request};
+    use actix_web::body::EitherBody;
     use actix_web::{dev::Service as ActixService, dev::ServiceResponse, Error};
     use actix_web::{http::StatusCode, test, web, App};
     use serde_json::{json, Value};
     use std::sync::Arc;
 
     use crate::{
+        config::RateLimitConfig,
+        rate_limit,
         rest_api::{
             add_client, balance, delete_client, get_address, get_funds, health, index, status,
             AppState,
@@ -326,6 +330,43 @@ mod tests {
 
     const TEST_API_KEY: &str = "test-secret-key";
     const TEST_ADMIN_API_KEY: &str = "test-admin-key";
+
+    async fn build_app_with_rate_limit(
+        burst_size: u32,
+    ) -> impl ActixService<Request, Response = ServiceResponse<EitherBody<BoxBody>>, Error = Error>
+    {
+        let mut config = test_config_with_keys(&unique_dynamic_config_path(), None, None);
+        config.web_interface.rate_limit = RateLimitConfig {
+            enabled: true,
+            requests_per_second: 1,
+            burst_size: Some(burst_size),
+        };
+        let governor_config = rate_limit::build_governor_config(&config.web_interface.rate_limit);
+        let blockchain = test_blockchain_interface(&config).await;
+        let financing_service = Arc::new(Service::new_for_test(&config, blockchain).await);
+        let app_state = web::Data::new(AppState {
+            service: financing_service,
+        });
+
+        test::init_service(
+            App::new()
+                .wrap(Governor::new(&governor_config))
+                .app_data(app_state)
+                .service(index)
+                .service(health)
+                .service(status)
+                .service(balance)
+                .service(get_funds)
+                .service(add_client)
+                .service(delete_client)
+                .service(get_address),
+        )
+        .await
+    }
+
+    fn peer_addr() -> std::net::SocketAddr {
+        "127.0.0.1:8080".parse().expect("valid peer address")
+    }
 
     async fn build_app_with_keys(
         client_api_key: Option<&str>,
@@ -871,5 +912,52 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[actix_web::test]
+    async fn test_rate_limit_returns_429_when_burst_exceeded() {
+        let app = build_app_with_rate_limit(2).await;
+        for _ in 0..2 {
+            let resp = test::call_service(
+                &app,
+                test::TestRequest::get()
+                    .uri("/")
+                    .peer_addr(peer_addr())
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/")
+                .peer_addr(peer_addr())
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body: Value = test::read_body_json(resp).await;
+        assert!(body["description"]
+            .as_str()
+            .unwrap()
+            .contains("Rate limit exceeded"));
+    }
+
+    #[actix_web::test]
+    async fn test_health_is_exempt_from_rate_limit() {
+        let app = build_app_with_rate_limit(1).await;
+        for _ in 0..5 {
+            let resp = test::call_service(
+                &app,
+                test::TestRequest::get()
+                    .uri("/health")
+                    .peer_addr(peer_addr())
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
     }
 }
