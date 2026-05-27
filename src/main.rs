@@ -40,13 +40,25 @@ fn get_addr(config: &Config) -> (Ipv4Addr, u16) {
 /// Main - Read config and setup Web server.
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let config = match get_config("FS_CONFIG", "data/financing-service.toml") {
-        Some(config) => config,
-        None => panic!("Unable to read config"),
-    };
+    let config = get_config("FS_CONFIG", "data/financing-service.toml").map_err(|e| {
+        eprintln!("Unable to read config: {e}");
+        std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+    })?;
 
-    simple_logger::init_with_level(config.get_log_level()).unwrap();
-    let service = Service::new(&config).await;
+    let log_level = config.get_log_level().map_err(|e| {
+        eprintln!("Invalid logging configuration: {e}");
+        std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+    })?;
+
+    simple_logger::init_with_level(log_level).map_err(|e| {
+        eprintln!("Unable to initialize logger: {e}");
+        std::io::Error::other(e.to_string())
+    })?;
+
+    let service = Service::new(&config).await.map_err(|e| {
+        log::error!("Unable to start service: {e}");
+        std::io::Error::other(e)
+    })?;
     if service.admin_auth_required() {
         log::info!("Admin API key authentication enabled for POST /client");
     } else {
@@ -94,12 +106,10 @@ async fn main() -> std::io::Result<()> {
             .service(get_address)
     })
     .bind(addr)
-    .unwrap_or_else(|e| {
-        panic!(
-            r#"Unable to connect to address/port "{:?}". Error = {:?}"#,
-            addr, e
-        )
-    })
+    .map_err(|e| {
+        log::error!(r#"Unable to bind to address/port "{addr:?}": {e}"#);
+        e
+    })?
     .run()
     .await
 }

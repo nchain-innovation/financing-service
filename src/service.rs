@@ -65,24 +65,24 @@ pub struct Service {
 }
 
 impl Service {
-    async fn build(
+    fn build(
         config: &Config,
         blockchain_interface: Arc<dyn BlockchainInterface + Send + Sync>,
-    ) -> Service {
+    ) -> Result<Service, String> {
         let mut clients: Vec<Client> = Vec::new();
 
         if let Some(clients_config) = &config.client {
             for client_config in clients_config {
-                clients.push(Client::new(client_config));
+                clients.push(Client::try_new(client_config)?);
             }
         }
 
         let dynamic_config = DynamicConfig::new(config);
         for client_config in &dynamic_config.contents.clients {
-            clients.push(Client::new(client_config));
+            clients.push(Client::try_new(client_config)?);
         }
 
-        Service {
+        Ok(Service {
             blockchain_status: BlockchainConnectionStatus::Unknown,
             blockchain_update_time: None,
             blockchain_interface,
@@ -93,21 +93,20 @@ impl Service {
                 .admin_api_key
                 .clone()
                 .filter(|key| !key.is_empty()),
-        }
+        })
     }
 
     /// Create a new Service from the provided config
-    pub async fn new(config: &Config) -> Service {
-        let blockchain_interface = blockchain_factory(config);
+    pub async fn new(config: &Config) -> Result<Service, String> {
+        let blockchain_interface = blockchain_factory(config)?;
 
-        blockchain_interface
-            .status()
-            .await
-            .expect("Unable to connect to blockchain, ensure that the service is running.");
+        blockchain_interface.status().await.map_err(|e| {
+            format!("Unable to connect to blockchain, ensure that the service is running: {e:?}")
+        })?;
 
-        let mut service = Self::build(config, blockchain_interface).await;
+        let mut service = Self::build(config, blockchain_interface)?;
         service.update_balances().await;
-        service
+        Ok(service)
     }
 
     #[cfg(test)]
@@ -120,7 +119,8 @@ impl Service {
             .await
             .expect("Unable to connect to test blockchain.");
 
-        let mut service = Self::build(config, blockchain_interface).await;
+        let mut service = Self::build(config, blockchain_interface)
+            .expect("Invalid client configuration in test setup");
         service.update_balances().await;
         service
     }

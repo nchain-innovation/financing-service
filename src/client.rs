@@ -41,10 +41,6 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn new(config: &ClientConfig) -> Self {
-        Self::try_new(config).unwrap_or_else(|e| panic!("{e}"))
-    }
-
     pub fn try_new(config: &ClientConfig) -> Result<Self, String> {
         let wallet = Wallet::from_wif(&config.wif_key).map_err(|_| {
             format!(
@@ -410,7 +406,7 @@ mod tests {
         let blockchain_interface = test_blockchain_interface(&config).await;
 
         let client_config = config.client.unwrap();
-        let mut client = Client::new(&client_config[0]);
+        let mut client = Client::try_new(&client_config[0]).unwrap();
 
         let result = client.update_balance(&*blockchain_interface).await;
         assert!(result.is_ok());
@@ -449,7 +445,7 @@ mod tests {
             wif_key: crate::test_support::TEST_WIF.to_string(),
             api_key: None,
         };
-        let mut client = Client::new(&client_config);
+        let mut client = Client::try_new(&client_config).unwrap();
         let fund_request = FundRequest {
             client_id: TEST_CLIENT_ID.to_string(),
             satoshi: 123,
@@ -471,7 +467,7 @@ mod tests {
             wif_key: crate::test_support::TEST_WIF.to_string(),
             api_key: None,
         };
-        let mut client = Client::new(&client_config);
+        let mut client = Client::try_new(&client_config).unwrap();
         client.unspent = values
             .iter()
             .enumerate()

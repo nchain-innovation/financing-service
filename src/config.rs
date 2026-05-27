@@ -79,16 +79,15 @@ impl Config {
         }
     }
 
-    // Return the log level
     // Return the log level (as a log::Level type) from the config
-    pub fn get_log_level(&self) -> log::Level {
+    pub fn get_log_level(&self) -> Result<log::Level, String> {
         match self.logging.level.as_str() {
-            "error" => log::Level::Error,
-            "warn" | "warning" => log::Level::Warn,
-            "info" | "information" => log::Level::Info,
-            "debug" => log::Level::Debug,
-            "trace" => log::Level::Trace,
-            _ => panic!("Unknown log level {}", self.logging.level),
+            "error" => Ok(log::Level::Error),
+            "warn" | "warning" => Ok(log::Level::Warn),
+            "info" | "information" => Ok(log::Level::Info),
+            "debug" => Ok(log::Level::Debug),
+            "trace" => Ok(log::Level::Trace),
+            other => Err(format!("Unknown log level '{other}'")),
         }
     }
 }
@@ -103,25 +102,17 @@ fn read_config(filename: &str) -> Result<Config, String> {
 }
 
 /// Read the config from environment variable, if not read from filename
-pub fn get_config(env_var: &str, filename: &str) -> Option<Config> {
-    // read config try env var, then filename, panic if fails
-
+pub fn get_config(env_var: &str, filename: &str) -> Result<Config, String> {
     match env::var_os(env_var) {
         Some(content) => {
-            let val = content.into_string().unwrap();
-            // Parse to Config
-            match serde_json::from_str(&val) {
-                Ok(config) => Some(config),
-                Err(e) => panic!("Error parsing JSON environment var {:?}", e),
-            }
+            let val = content
+                .into_string()
+                .map_err(|_| format!("Environment variable {env_var} is not valid UTF-8"))?;
+            serde_json::from_str(&val)
+                .map_err(|e| format!("Error parsing JSON environment variable {env_var}: {e}"))
         }
         None => {
-            // Read config from file
-            let config = match read_config(filename) {
-                Ok(config) => config,
-                Err(error) => panic!("Error reading config file {:?}", error),
-            };
-            Some(config)
+            read_config(filename).map_err(|e| format!("Error reading config file {filename}: {e}"))
         }
     }
 }

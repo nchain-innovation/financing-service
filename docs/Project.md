@@ -60,7 +60,7 @@ Admin       ──REST──▶       │                │
 
 ## Open items
 
-* Clean up remaining startup-path panics (`Client::new`, config parse failures)
+None at present.
 
 ## Related documentation
 
