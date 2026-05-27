@@ -258,7 +258,7 @@ mod tests {
         service::Service,
         test_support::{
             test_blockchain_interface, test_config_with_keys, unique_dynamic_config_path,
-            unique_dynamic_config_path, LOCKING_SCRIPT_HEX, TEST_ADDRESS, TEST_CLIENT_ID, TEST_WIF,
+            LOCKING_SCRIPT_HEX, TEST_ADDRESS, TEST_CLIENT_ID, TEST_WIF,
         },
     };
 
@@ -606,7 +606,7 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn test_fund_no_single_utxo_large_enough() {
+    async fn test_fund_consolidates_multiple_utxos() {
         let app = build_app().await;
         let resp = test::call_service(
             &app,
@@ -616,12 +616,9 @@ mod tests {
                 .to_request(),
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(resp.status(), StatusCode::OK);
         let body: Value = test::read_body_json(resp).await;
-        assert!(body["description"]
-            .as_str()
-            .unwrap()
-            .contains("No single UTXO large enough"));
+        assert_eq!(body["txs"].as_array().unwrap().len(), 1);
     }
 
     #[actix_web::test]

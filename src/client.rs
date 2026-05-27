@@ -111,18 +111,27 @@ impl Client {
         self.unspent.iter().map(|utxo| utxo.value).sum()
     }
 
-    fn estimate_fee(locking_script_len: u64, no_of_outpoints: u32) -> u64 {
-        (((locking_script_len * no_of_outpoints as u64) / 1000) * 500) + 750
+    fn estimate_fee(locking_script_len: u64, no_of_outpoints: u32, no_of_inputs: u32) -> u64 {
+        const INPUT_BYTES: u64 = 148;
+        const CHANGE_OUTPUT_BYTES: u64 = 34;
+        const TX_OVERHEAD_BYTES: u64 = 10;
+        let output_bytes = locking_script_len * no_of_outpoints as u64 + CHANGE_OUTPUT_BYTES;
+        let tx_bytes = TX_OVERHEAD_BYTES + INPUT_BYTES * no_of_inputs.max(1) as u64 + output_bytes;
+        ((tx_bytes / 1000) * 500) + 750
     }
 
-    fn estimate_total_cost(fund_request: &FundRequest) -> u64 {
+    fn estimate_total_cost(fund_request: &FundRequest, no_of_inputs: u32) -> u64 {
         let locking_script_len = fund_request.locking_script.len() as u64;
         if fund_request.no_of_outpoints > 1 && fund_request.multiple_tx {
-            let fee_estimate = Self::estimate_fee(locking_script_len, 1);
+            let fee_estimate = Self::estimate_fee(locking_script_len, 1, 1);
             fund_request.no_of_outpoints as u64 * (fund_request.satoshi + fee_estimate)
         } else {
             fund_request.satoshi * fund_request.no_of_outpoints as u64
-                + Self::estimate_fee(locking_script_len, fund_request.no_of_outpoints)
+                + Self::estimate_fee(
+                    locking_script_len,
+                    fund_request.no_of_outpoints,
+                    no_of_inputs,
+                )
         }
     }
 
@@ -133,13 +142,98 @@ impl Client {
             .count()
     }
 
+    /// Select UTXO indices whose combined value covers the estimated cost, preferring fewer inputs.
+    fn select_utxo_indices(&self, fund_request: &FundRequest) -> Option<Vec<usize>> {
+        let mut sorted: Vec<usize> = (0..self.unspent.len()).collect();
+        sorted.sort_by_key(|&index| std::cmp::Reverse(self.unspent[index].value));
+
+        let mut selected = Vec::new();
+        for index in sorted {
+            selected.push(index);
+            let input_sum: i64 = selected.iter().map(|&i| self.unspent[i].value).sum();
+            let total_cost = Self::estimate_total_cost(fund_request, selected.len() as u32) as i64;
+            if input_sum >= total_cost {
+                return Some(selected);
+            }
+        }
+        None
+    }
+
+    fn outpoint_from_utxo(unspent: &UtxoEntry) -> Result<OutPoint, String> {
+        Ok(OutPoint {
+            hash: Hash256::decode(&unspent.tx_hash)
+                .map_err(|e| format!("Invalid UTXO tx hash: {e}"))?,
+            index: unspent.tx_pos,
+        })
+    }
+
+    fn funding_outputs(
+        &self,
+        fund_request: &FundRequest,
+        change: i64,
+        change_script: &Script,
+    ) -> Vec<TxOut> {
+        let mut vouts = vec![TxOut {
+            satoshis: change,
+            lock_script: change_script.clone(),
+        }];
+
+        let mut script_pubkey = Script::new();
+        script_pubkey.append_slice(&fund_request.locking_script);
+        let txout = TxOut {
+            satoshis: fund_request.satoshi as i64,
+            lock_script: script_pubkey,
+        };
+        for _ in 0..fund_request.no_of_outpoints {
+            vouts.push(txout.clone());
+        }
+        vouts
+    }
+
+    fn sign_funding_tx_inputs(
+        &self,
+        tx: &mut Tx,
+        input_amounts: &[i64],
+        change_script: &Script,
+        sighash_flags: u8,
+    ) -> Result<(), String> {
+        for (index, amount) in input_amounts.iter().enumerate() {
+            let sighash = create_sighash(tx, index, change_script, *amount, sighash_flags)
+                .map_err(|e| format!("Failed to create sighash: {e}"))?;
+            let signature = self
+                .wallet
+                .sign_sighash(sighash, sighash_flags)
+                .map_err(|e| format!("Failed to sign transaction: {e}"))?;
+            tx.inputs[index].unlock_script = self.wallet.create_unlock_script(&signature);
+        }
+        Ok(())
+    }
+
+    fn spend_utxos(&mut self, spent_indices: &[usize], change_entry: UtxoEntry) {
+        let spent: std::collections::HashSet<usize> = spent_indices.iter().copied().collect();
+        self.unspent = self
+            .unspent
+            .iter()
+            .enumerate()
+            .filter_map(|(index, utxo)| {
+                if spent.contains(&index) {
+                    None
+                } else {
+                    Some(utxo.clone())
+                }
+            })
+            .collect();
+        self.unspent.push(change_entry);
+        self.unspent.sort_by_key(|utxo| utxo.value);
+    }
+
     /// Return a description when the client cannot fund the request.
     pub fn funding_balance_error(&self, fund_request: &FundRequest) -> Option<String> {
         if self.unspent.is_empty() {
             return Some("No UTXOs available for funding.".to_string());
         }
 
-        let total_cost = Self::estimate_total_cost(fund_request);
+        let total_cost = Self::estimate_total_cost(fund_request, 1);
         let total_available = self.total_unspent();
 
         if total_available <= total_cost as i64 {
@@ -150,7 +244,7 @@ impl Client {
 
         if fund_request.no_of_outpoints > 1 && fund_request.multiple_tx {
             let per_tx_cost = fund_request.satoshi
-                + Self::estimate_fee(fund_request.locking_script.len() as u64, 1);
+                + Self::estimate_fee(fund_request.locking_script.len() as u64, 1, 1);
             let suitable_utxos = self.count_utxos_above(per_tx_cost);
             if suitable_utxos < fund_request.no_of_outpoints as usize {
                 return Some(format!(
@@ -161,88 +255,122 @@ impl Client {
             return None;
         }
 
-        if self.get_smallest_unspent(total_cost).is_none() {
+        if self.select_utxo_indices(fund_request).is_none() {
             let largest = self.get_largest_unspent().unwrap_or(0);
+            let max_inputs = self.unspent.len() as u32;
+            let required_with_all_inputs = Self::estimate_total_cost(fund_request, max_inputs);
             return Some(format!(
-                "No single UTXO large enough for funding transaction: largest UTXO is {largest} satoshi, {total_cost} required. Consolidation may be needed."
+                "Unable to select UTXOs for funding transaction: largest UTXO is {largest} satoshi, {required_with_all_inputs} required including fees."
             ));
         }
 
         None
     }
 
-    /// Create one funding transaction
-    pub fn create_funding_tx(&mut self, fund_request: &FundRequest) -> Result<Tx, String> {
-        let locking_script_len = fund_request.locking_script.len() as u64;
-        let total_cost = fund_request.satoshi * fund_request.no_of_outpoints as u64
-            + Self::estimate_fee(locking_script_len, fund_request.no_of_outpoints);
+    fn create_funding_tx_single_input(
+        &mut self,
+        fund_request: &FundRequest,
+        unspent: &UtxoEntry,
+        total_cost: u64,
+    ) -> Result<Tx, String> {
         let change_script = self.wallet.get_locking_script();
-        let unspent = self
-            .get_smallest_unspent(total_cost)
-            .ok_or_else(|| "No suitable UTXO available for funding transaction.".to_string())?;
-        let vins: Vec<TxIn> = vec![TxIn {
-            prev_output: OutPoint {
-                hash: Hash256::decode(&unspent.tx_hash)
-                    .map_err(|e| format!("Invalid UTXO tx hash: {e}"))?,
-                index: unspent.tx_pos,
-            },
-            unlock_script: Script::new(),
-            sequence: 0xffffffff,
-        }];
         let change = unspent.value - total_cost as i64;
         if change <= 0 {
             return Err("Insufficient UTXO value for funding transaction.".to_string());
         }
-        let mut vouts: Vec<TxOut> = vec![TxOut {
-            satoshis: change,
-            lock_script: change_script.clone(),
-        }];
-
-        let mut script_pubkey: Script = Script::new();
-        script_pubkey.append_slice(&fund_request.locking_script);
-
-        let txout = TxOut {
-            satoshis: fund_request.satoshi as i64,
-            lock_script: script_pubkey,
-        };
-        for _ in 0..fund_request.no_of_outpoints {
-            vouts.push(txout.clone());
-        }
 
         let mut tx = Tx {
             version: 1,
-            inputs: vins,
-            outputs: vouts,
+            inputs: vec![TxIn {
+                prev_output: Self::outpoint_from_utxo(unspent)?,
+                unlock_script: Script::new(),
+                sequence: 0xffffffff,
+            }],
+            outputs: self.funding_outputs(fund_request, change, &change_script),
             lock_time: 0,
         };
+
         let sighash_flags = SIGHASH_ALL | SIGHASH_FORKID;
-
-        let sighash = create_sighash(&tx, 0, &change_script, unspent.value, sighash_flags)
-            .map_err(|e| format!("Failed to create sighash: {e}"))?;
-        let signature = self
-            .wallet
-            .sign_sighash(sighash, sighash_flags)
-            .map_err(|e| format!("Failed to sign transaction: {e}"))?;
-
-        tx.inputs[0].unlock_script = self.wallet.create_unlock_script(&signature);
+        self.sign_funding_tx_inputs(&mut tx, &[unspent.value], &change_script, sighash_flags)?;
 
         let index = self
             .unspent
             .iter()
             .position(|x| x == unspent)
             .ok_or_else(|| "UTXO not found in local cache.".to_string())?;
-
-        self.unspent.remove(index);
-        let entry = UtxoEntry {
+        let change_entry = UtxoEntry {
             height: 0,
             tx_pos: 0,
             tx_hash: tx.hash().encode(),
             value: change,
         };
-        self.unspent.push(entry);
-        self.unspent.sort_by_key(|x| x.value);
+        self.spend_utxos(&[index], change_entry);
 
         Ok(tx)
+    }
+
+    fn create_funding_tx_multi_input(
+        &mut self,
+        fund_request: &FundRequest,
+        selected_indices: &[usize],
+    ) -> Result<Tx, String> {
+        let change_script = self.wallet.get_locking_script();
+        let input_amounts: Vec<i64> = selected_indices
+            .iter()
+            .map(|&index| self.unspent[index].value)
+            .collect();
+        let input_sum: i64 = input_amounts.iter().sum();
+        let total_cost =
+            Self::estimate_total_cost(fund_request, selected_indices.len() as u32) as i64;
+        let change = input_sum - total_cost;
+        if change <= 0 {
+            return Err("Insufficient UTXO value for funding transaction.".to_string());
+        }
+
+        let inputs = selected_indices
+            .iter()
+            .map(|&index| {
+                Ok(TxIn {
+                    prev_output: Self::outpoint_from_utxo(&self.unspent[index])?,
+                    unlock_script: Script::new(),
+                    sequence: 0xffffffff,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+
+        let mut tx = Tx {
+            version: 1,
+            inputs,
+            outputs: self.funding_outputs(fund_request, change, &change_script),
+            lock_time: 0,
+        };
+
+        let sighash_flags = SIGHASH_ALL | SIGHASH_FORKID;
+        self.sign_funding_tx_inputs(&mut tx, &input_amounts, &change_script, sighash_flags)?;
+
+        let change_entry = UtxoEntry {
+            height: 0,
+            tx_pos: 0,
+            tx_hash: tx.hash().encode(),
+            value: change,
+        };
+        self.spend_utxos(selected_indices, change_entry);
+
+        Ok(tx)
+    }
+
+    /// Create one funding transaction
+    pub fn create_funding_tx(&mut self, fund_request: &FundRequest) -> Result<Tx, String> {
+        let total_cost_single = Self::estimate_total_cost(fund_request, 1);
+        if let Some(unspent) = self.get_smallest_unspent(total_cost_single) {
+            let unspent = unspent.clone();
+            return self.create_funding_tx_single_input(fund_request, &unspent, total_cost_single);
+        }
+
+        let selected_indices = self
+            .select_utxo_indices(fund_request)
+            .ok_or_else(|| "No suitable UTXO set available for funding transaction.".to_string())?;
+        self.create_funding_tx_multi_input(fund_request, &selected_indices)
     }
 
     /// Create no_of_outpoints funding txs each with one outpoint
@@ -373,13 +501,21 @@ mod tests {
     }
 
     #[test]
-    fn test_funding_balance_error_no_single_utxo() {
+    fn test_funding_balance_error_consolidates_multiple_utxos() {
         let client = test_client_with_utxos(&[300, 300, 300]);
-        let error = client
+        assert!(client
             .funding_balance_error(&sample_fund_request(123))
-            .unwrap();
-        assert!(error.contains("No single UTXO large enough"));
-        assert!(error.contains("Consolidation may be needed"));
+            .is_none());
+    }
+
+    #[test]
+    fn test_create_funding_tx_consolidates_multiple_utxos() {
+        let mut client = test_client_with_utxos(&[300, 300, 300]);
+        let tx = client
+            .create_funding_tx(&sample_fund_request(123))
+            .expect("expected multi-input funding transaction");
+        assert_eq!(tx.inputs.len(), 3);
+        assert_eq!(tx.outputs.len(), 2);
     }
 
     #[test]

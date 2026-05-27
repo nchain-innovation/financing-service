@@ -44,24 +44,22 @@ Admin       ──REST──▶       │                │
 * Dynamic client add/remove via `POST /client` and `DELETE /client/{id}`
 * Optional per-client `api_key` authentication
 * Optional `admin_api_key` for `POST /client`
-* Balance checks against total wallet balance and single-UTXO availability
+* Balance checks against total wallet balance; funding combines multiple UTXOs when needed
 * Docker image with `/health` liveness check
 * CI: build, test, `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo audit`
 * Pinned `chain-gang` git dependency and committed `Cargo.lock` for reproducible builds
-* 41 automated tests (unit, integration, REST API)
+* 47 automated tests (unit, integration, REST API)
 
 ## Known limitations
 
-* **Single-UTXO funding** — each funding transaction requires one UTXO large enough to cover outputs and fees. The service does not combine multiple small UTXOs.
 * **UTXO cache staleness** — balances refresh on a configurable interval (default 60 seconds). A fund request between refreshes may fail if UTXOs were spent on-chain.
-* **Multi-tx partial failure** — in `multiple_tx` mode, earlier transactions may broadcast successfully before a later one fails.
+* **Multi-tx partial failure** — in `multiple_tx` mode, earlier transactions may broadcast successfully before a later one fails. Each transaction in this mode still uses a single UTXO.
 * **Request serialization** — all endpoints share a single `Mutex<Service>`. Fund requests hold the lock through blockchain broadcast.
 * **Plaintext secrets** — WIF keys, optional client `api_key`, and optional `admin_api_key` are stored in TOML config files.
 * **No rate limiting or HTTPS** — expected to be handled at the deployment layer (reverse proxy, firewall).
 
 ## Open items
 
-* UTXO consolidation (multi-input funding transactions)
 * Reduce sensitive data in logs (full tx hex at `info` level)
 * Clean up remaining startup-path panics (`Client::new`, config parse failures)
 

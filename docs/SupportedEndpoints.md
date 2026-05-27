@@ -119,10 +119,10 @@ Common error responses:
 * Unauthorized — `{"description": "Unauthorized"}` (missing or invalid `api_key` for the client)
 * Unknown client — `{"description": "Unknown client_id client1"}`
 * Insufficient total balance — `{"description": "Insufficent client balance: 900 satoshi available, 873 required."}`
-* No single UTXO large enough — `{"description": "No single UTXO large enough for funding transaction: largest UTXO is 300 satoshi, 873 required. Consolidation may be needed."}`
+* No suitable UTXO set — `{"description": "Unable to select UTXOs for funding transaction: largest UTXO is 300 satoshi, 873 required including fees."}`
 * Invalid input — `{"description": "Invalid satoshi value '0'"}`
 
-Funding requires a single UTXO large enough to cover each transaction. The service does not combine multiple small UTXOs into one input.
+Funding combines multiple UTXOs when no single input is large enough, as long as total wallet balance covers outputs and fees.
 
 ## Add client
 
