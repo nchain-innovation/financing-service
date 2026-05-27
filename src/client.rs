@@ -17,6 +17,7 @@ use chain_gang::{
 
 use crate::config::ClientConfig;
 
+#[derive(Clone)]
 pub struct FundRequest {
     pub client_id: String,
     pub satoshi: u64,
@@ -373,18 +374,6 @@ impl Client {
             .select_utxo_indices(fund_request)
             .ok_or_else(|| "No suitable UTXO set available for funding transaction.".to_string())?;
         self.create_funding_tx_multi_input(fund_request, &selected_indices)
-    }
-
-    /// Create no_of_outpoints funding txs each with one outpoint
-    pub fn create_multiple_funding_txs(
-        &mut self,
-        fund_request: &FundRequest,
-    ) -> Result<Vec<Tx>, String> {
-        let mut txs: Vec<Tx> = Vec::new();
-        for _ in 0..fund_request.no_of_outpoints {
-            txs.push(self.create_funding_tx(fund_request)?);
-        }
-        Ok(txs)
     }
 }
 

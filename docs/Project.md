@@ -53,7 +53,7 @@ Admin       ──REST──▶       │                │
 ## Known limitations
 
 * **Balance endpoint cache** — `GET /client/{id}/balance` reflects the last periodic refresh unless a recent `/fund` updated that client. Funding requests refresh UTXOs from the blockchain immediately before transaction preparation.
-* **Multi-tx partial failure** — in `multiple_tx` mode, earlier transactions may broadcast successfully before a later one fails. Each transaction in this mode still uses a single UTXO.
+* **Multi-tx partial failure** — if a later broadcast fails in `multiple_tx` mode, earlier transactions remain on-chain. The service resyncs UTXO state from the blockchain and returns an error listing successful transaction ids.
 * **Concurrent fund requests** — read-only endpoints and blockchain broadcast no longer hold the service write lock, but transaction preparation still serializes per client UTXO state.
 * **Plaintext secrets** — WIF keys, optional client `api_key`, and optional `admin_api_key` are stored in TOML config files.
 * **No rate limiting or HTTPS** — expected to be handled at the deployment layer (reverse proxy, firewall).

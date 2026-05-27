@@ -122,6 +122,19 @@ pub async fn get_funds(
         return error_response(description);
     }
 
+    if fund_request.no_of_outpoints > 1 && fund_request.multiple_tx {
+        return match Service::fund_with_multiple_transactions(&data.service, &fund_request).await {
+            Ok(funding_response) => match funding_response.to_response() {
+                Ok(response) => json_ok(&response),
+                Err(description) => error_response(description),
+            },
+            Err(description) => {
+                debug!("fund_with_multiple_transactions error = {:?}", &description);
+                error_response(description)
+            }
+        };
+    }
+
     let (blockchain, prepared) = {
         let mut service = data.service.write().await;
 
@@ -637,6 +650,29 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body: Value = test::read_body_json(resp).await;
         assert_eq!(body["txs"].as_array().unwrap().len(), 1);
+    }
+
+    #[actix_web::test]
+    async fn test_fund_multiple_tx_success() {
+        let app = build_app().await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/fund")
+                .set_json(json!({
+                    "client_id": TEST_CLIENT_ID,
+                    "satoshi": 123,
+                    "no_of_outpoints": 2,
+                    "multiple_tx": true,
+                    "locking_script": LOCKING_SCRIPT_HEX,
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["txs"].as_array().unwrap().len(), 2);
+        assert_eq!(body["outpoints"].as_array().unwrap().len(), 2);
     }
 
     #[actix_web::test]

@@ -50,7 +50,6 @@ impl FundingResponse {
 pub struct PreparedFunding {
     pub txs: Vec<Tx>,
     pub no_of_outpoints: u32,
-    pub multiple_tx: bool,
 }
 
 /// Service data
@@ -357,21 +356,82 @@ impl Service {
             .find(|x| x.client_id == fund_request.client_id)
             .ok_or_else(|| format!("Unknown client_id {}", fund_request.client_id))?;
 
-        if fund_request.no_of_outpoints > 1 && fund_request.multiple_tx {
-            let txs = client.create_multiple_funding_txs(fund_request)?;
-            Ok(PreparedFunding {
-                txs,
-                no_of_outpoints: fund_request.no_of_outpoints,
-                multiple_tx: true,
-            })
-        } else {
-            let tx = client.create_funding_tx(fund_request)?;
-            Ok(PreparedFunding {
-                txs: vec![tx],
-                no_of_outpoints: fund_request.no_of_outpoints,
-                multiple_tx: false,
-            })
+        let tx = client.create_funding_tx(fund_request)?;
+        Ok(PreparedFunding {
+            txs: vec![tx],
+            no_of_outpoints: fund_request.no_of_outpoints,
+        })
+    }
+
+    /// Fund a request with separate transactions, preparing and broadcasting one at a time.
+    pub async fn fund_with_multiple_transactions(
+        service: &RwLock<Service>,
+        fund_request: &FundRequest,
+    ) -> Result<FundingResponse, String> {
+        {
+            let service = service.read().await;
+            if let Some(description) = service.funding_balance_error(fund_request) {
+                return Err(description);
+            }
         }
+
+        let per_tx_request = FundRequest {
+            client_id: fund_request.client_id.clone(),
+            satoshi: fund_request.satoshi,
+            no_of_outpoints: 1,
+            multiple_tx: false,
+            locking_script: fund_request.locking_script.clone(),
+        };
+
+        let mut combined = FundingResponse::default();
+        let total = fund_request.no_of_outpoints;
+
+        for tx_index in 0..total {
+            let (blockchain, prepared) = {
+                let mut svc = service.write().await;
+                let blockchain = svc.blockchain_interface();
+                let prepared = svc.prepare_funding_outpoints(&per_tx_request);
+                (blockchain, prepared)
+            };
+
+            let prepared = match prepared {
+                Ok(prepared) => prepared,
+                Err(cause) => {
+                    if tx_index == 0 {
+                        return Err(cause);
+                    }
+                    resync_after_multiple_tx_failure(service, fund_request).await;
+                    return Err(partial_broadcast_error(
+                        tx_index + 1,
+                        total,
+                        &combined,
+                        cause,
+                    ));
+                }
+            };
+
+            match Self::broadcast_prepared_funding(blockchain, prepared).await {
+                Ok(partial) => {
+                    combined.outpoints.extend(partial.outpoints);
+                    combined.txs.extend(partial.txs);
+                }
+                Err(cause) => {
+                    if tx_index == 0 {
+                        resync_after_multiple_tx_failure(service, fund_request).await;
+                        return Err(cause);
+                    }
+                    resync_after_multiple_tx_failure(service, fund_request).await;
+                    return Err(partial_broadcast_error(
+                        tx_index + 1,
+                        total,
+                        &combined,
+                        cause,
+                    ));
+                }
+            }
+        }
+
+        Ok(combined)
     }
 
     /// Broadcast prepared funding transactions without holding the service lock.
@@ -379,42 +439,55 @@ impl Service {
         blockchain: Arc<dyn BlockchainInterface + Send + Sync>,
         prepared: PreparedFunding,
     ) -> Result<FundingResponse, String> {
+        let tx = prepared
+            .txs
+            .into_iter()
+            .next()
+            .ok_or_else(|| "No funding transaction prepared.".to_string())?;
         let mut response = FundingResponse::default();
-        if prepared.multiple_tx {
-            for tx in &prepared.txs {
-                log::info!("broadcasting funding tx {}", tx.hash().encode());
-                log::debug!("funding tx hex = {}", tx_as_hexstr(tx)?);
-                blockchain.broadcast_tx(tx).await.map_err(|e| {
-                    log::warn!("Failed to broadcast funding transaction: {:?}", e);
-                    "Failed to broadcast funding transaction.".to_string()
-                })?;
-                response.outpoints.push(OutPoint {
-                    hash: tx.hash(),
-                    index: 1,
-                });
-            }
-            response.txs = prepared.txs;
-            Ok(response)
-        } else {
-            let tx = prepared
-                .txs
-                .into_iter()
-                .next()
-                .ok_or_else(|| "No funding transaction prepared.".to_string())?;
-            response.txs.push(tx.clone());
-            log::info!("broadcasting funding tx {}", tx.hash().encode());
-            log::debug!("funding tx hex = {}", tx_as_hexstr(&tx)?);
-            blockchain.broadcast_tx(&tx).await.map_err(|e| {
-                log::warn!("Failed to broadcast funding transaction: {:?}", e);
-                "Failed to broadcast funding transaction.".to_string()
-            })?;
-            let hash = tx.hash();
-            response.outpoints = (1..prepared.no_of_outpoints + 1)
-                .map(|index| OutPoint { hash, index })
-                .collect();
-            Ok(response)
-        }
+        response.txs.push(tx.clone());
+        log::info!("broadcasting funding tx {}", tx.hash().encode());
+        log::debug!("funding tx hex = {}", tx_as_hexstr(&tx)?);
+        blockchain.broadcast_tx(&tx).await.map_err(|e| {
+            log::warn!("Failed to broadcast funding transaction: {:?}", e);
+            "Failed to broadcast funding transaction.".to_string()
+        })?;
+        let hash = tx.hash();
+        response.outpoints = (1..prepared.no_of_outpoints + 1)
+            .map(|index| OutPoint { hash, index })
+            .collect();
+        Ok(response)
     }
+}
+
+async fn resync_after_multiple_tx_failure(service: &RwLock<Service>, fund_request: &FundRequest) {
+    if let Err(error) = Service::refresh_client_chain_state(service, &fund_request.client_id).await
+    {
+        log::warn!("failed to resync UTXO cache after partial multiple_tx funding: {error}");
+    }
+}
+
+fn partial_broadcast_error(
+    failed_at: u32,
+    total: u32,
+    broadcast: &FundingResponse,
+    cause: String,
+) -> String {
+    let succeeded = broadcast.outpoints.len() as u32;
+    let mut message =
+        format!("Failed to broadcast funding transaction {failed_at} of {total}: {cause}");
+    if succeeded > 0 {
+        let hashes: Vec<String> = broadcast
+            .outpoints
+            .iter()
+            .map(|outpoint| outpoint.hash.encode())
+            .collect();
+        message.push_str(&format!(
+            ". {succeeded} transaction(s) were broadcast successfully: {}",
+            hashes.join(", ")
+        ));
+    }
+    message
 }
 
 async fn fetch_chain_state(
@@ -471,5 +544,46 @@ mod tests {
                 locking_script: hex::decode(crate::test_support::LOCKING_SCRIPT_HEX).unwrap(),
             })
             .is_none());
+    }
+
+    #[test]
+    fn partial_broadcast_error_lists_successful_txids() {
+        use chain_gang::{messages::OutPoint, util::Hash256};
+
+        let mut broadcast = FundingResponse::default();
+        broadcast.outpoints.push(OutPoint {
+            hash: Hash256::decode(
+                "f67272e5c1408ecbeb8da543437c125ee1a17110317d44d13eafe31b771b795e",
+            )
+            .expect("valid hash"),
+            index: 1,
+        });
+
+        let message = partial_broadcast_error(2, 3, &broadcast, "network error".to_string());
+        assert!(message.contains("2 of 3"));
+        assert!(message.contains("1 transaction(s) were broadcast successfully"));
+        assert!(message.contains("f67272e5"));
+    }
+
+    #[tokio::test]
+    async fn fund_with_multiple_transactions_broadcasts_each_tx_separately() {
+        let config = test_config(&unique_dynamic_config_path());
+        let blockchain = test_blockchain_interface(&config).await;
+        let service = RwLock::new(Service::new_for_test(&config, blockchain).await);
+
+        let fund_request = FundRequest {
+            client_id: TEST_CLIENT_ID.to_string(),
+            satoshi: 123,
+            no_of_outpoints: 2,
+            multiple_tx: true,
+            locking_script: hex::decode(crate::test_support::LOCKING_SCRIPT_HEX).unwrap(),
+        };
+
+        let response = Service::fund_with_multiple_transactions(&service, &fund_request)
+            .await
+            .expect("multiple_tx funding should succeed");
+        assert_eq!(response.txs.len(), 2);
+        assert_eq!(response.outpoints.len(), 2);
+        assert_ne!(response.outpoints[0].hash, response.outpoints[1].hash);
     }
 }
