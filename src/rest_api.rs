@@ -1,13 +1,30 @@
-use actix_web::{delete, get, http::header::ContentType, post, web, HttpResponse, Responder};
+use actix_web::{delete, get, post, web, HttpResponse, Responder};
 use async_mutex::Mutex;
 use log::debug;
 use serde::Deserialize;
 
 use crate::{
     client::FundRequest,
-    error::error_response,
+    responses::{
+        error_response, json_ok, AddressResponse, BalanceResponse, SuccessResponse,
+    },
     service::Service,
 };
+
+#[derive(Deserialize, Debug)]
+pub struct FundingRequest {
+    client_id: String,
+    satoshi: u64,
+    no_of_outpoints: u32,
+    multiple_tx: bool,
+    locking_script: String,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct ClientAddRequest {
+    client_id: String,
+    wif: String,
+}
 
 /// Application State Data
 pub struct AppState {
@@ -26,27 +43,14 @@ pub async fn status(data: web::Data<AppState>) -> impl Responder {
     log::info!("status");
 
     let service = data.service.lock().await;
-    let status = service.get_status();
-    HttpResponse::Ok()
-        .content_type(ContentType::json())
-        .body(status)
+    json_ok(&service.get_status())
 }
 
 /// Endpoint to update all the clients, called by ticker every minute
 pub async fn update_clients(data: web::Data<AppState>) -> impl Responder {
     let mut service = data.service.lock().await;
     service.update_balances().await;
-    HttpResponse::Ok()
-}
-
-/// This is the /fund API call request
-#[derive(Deserialize, Debug)]
-pub struct FundingRequest {
-    client_id: String,
-    satoshi: u64,
-    no_of_outpoints: u32,
-    multiple_tx: bool,
-    locking_script: String,
+    HttpResponse::Ok().finish()
 }
 
 /// Post Fund endpoint
@@ -110,10 +114,8 @@ pub async fn get_funds(
     }
 
     match service.create_funding_outpoints(&fund_request).await {
-        Ok(funding_response) => match funding_response.to_json() {
-            Ok(body) => HttpResponse::Ok()
-                .content_type(ContentType::json())
-                .body(body),
+        Ok(funding_response) => match funding_response.to_response() {
+            Ok(response) => json_ok(&response),
             Err(description) => error_response(description),
         },
         Err(description) => {
@@ -121,12 +123,6 @@ pub async fn get_funds(
             error_response(description)
         }
     }
-}
-
-#[derive(Deserialize, Debug)]
-pub struct ClienAddRequest {
-    client_id: String,
-    wif: String,
 }
 
 /// Add client
@@ -139,7 +135,7 @@ pub struct ClienAddRequest {
 #[post("/client")]
 pub async fn add_client(
     data: web::Data<AppState>,
-    info: web::Json<ClienAddRequest>,
+    info: web::Json<ClientAddRequest>,
 ) -> impl Responder {
     let mut service = data.service.lock().await;
     let client_id = &info.client_id;
@@ -150,9 +146,7 @@ pub async fn add_client(
     }
 
     match service.add_client(client_id, &info.wif) {
-        Ok(()) => HttpResponse::Ok()
-            .content_type(ContentType::json())
-            .body("{\"status\": \"Success\"}"),
+        Ok(()) => json_ok(&SuccessResponse::new()),
         Err(description) => error_response(description),
     }
 }
@@ -171,9 +165,7 @@ pub async fn delete_client(data: web::Data<AppState>, info: web::Path<String>) -
     }
 
     match service.delete_client(&client_id) {
-        Ok(()) => HttpResponse::Ok()
-            .content_type(ContentType::json())
-            .body("{\"status\": \"Success\"}"),
+        Ok(()) => json_ok(&SuccessResponse::new()),
         Err(description) => error_response(description),
     }
 }
@@ -191,9 +183,7 @@ pub async fn get_address(data: web::Data<AppState>, info: web::Path<String>) -> 
     }
 
     match service.get_address(&client_id) {
-        Some(address) => HttpResponse::Ok()
-            .content_type(ContentType::json())
-            .body(format!("{{\"address\": \"{address}\"}}")),
+        Some(address) => json_ok(&AddressResponse { address }),
         None => error_response(format!("Unknown client_id {client_id}")),
     }
 }
@@ -211,15 +201,10 @@ pub async fn balance(data: web::Data<AppState>, info: web::Path<String>) -> impl
     }
 
     match service.get_balance(&client_id) {
-        Some(balance) => {
-            let confirmed = balance.confirmed;
-            let unconfirmed = balance.unconfirmed;
-            HttpResponse::Ok()
-                .content_type(ContentType::json())
-                .body(format!(
-                    "{{\"confirmed\": {confirmed}, \"unconfirmed\": {unconfirmed}}}"
-                ))
-        }
+        Some(balance) => json_ok(&BalanceResponse {
+            confirmed: balance.confirmed,
+            unconfirmed: balance.unconfirmed,
+        }),
         None => error_response(format!("Unknown client_id {client_id}")),
     }
 }

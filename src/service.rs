@@ -1,4 +1,3 @@
-use serde::Serialize;
 use std::time::SystemTime;
 
 use chain_gang::{
@@ -14,19 +13,12 @@ use crate::{
     client::{Client, FundRequest},
     config::{ClientConfig, Config},
     dynamic_config::DynamicConfig,
+    responses::{
+        BlockchainConnectionStatus, FundingResponseJson, OutpointResponse, StatusResponse,
+        TxResponse,
+    },
     util::tx_as_hexstr,
 };
-
-/// Blockchain Connection Status
-#[derive(Debug, Serialize, Clone, Copy)]
-pub enum BlockchainConnectionStatus {
-    /// Unknown - Starting state of the service
-    Unknown,
-    /// Failed - The service has failed to connect to the blockchain
-    Failed,
-    /// Connected - The service has connected to the blockchain
-    Connected,
-}
 
 #[derive(Clone, Default)]
 pub struct FundingResponse {
@@ -35,44 +27,22 @@ pub struct FundingResponse {
 }
 
 impl FundingResponse {
-    /// Given outpoints return them as a string
-    fn outpoints_to_json(&self) -> String {
-        let mut retval: String = "[".to_string();
-
-        for (i, op) in self.outpoints.iter().enumerate() {
-            retval += format!(
-                "{{\"hash\": \"{}\", \"index\": {}}}",
-                op.hash.encode(),
-                op.index
-            )
-            .as_str();
-            if i + 1 != self.outpoints.len() {
-                retval += ",";
-            }
+    pub fn to_response(&self) -> Result<FundingResponseJson, String> {
+        let outpoints = self
+            .outpoints
+            .iter()
+            .map(|op| OutpointResponse {
+                hash: op.hash.encode(),
+                index: op.index,
+            })
+            .collect();
+        let mut txs = Vec::with_capacity(self.txs.len());
+        for tx in &self.txs {
+            txs.push(TxResponse {
+                tx: tx_as_hexstr(tx)?,
+            });
         }
-        retval += "]";
-        retval
-    }
-
-    fn txs_to_json(&self) -> Result<String, String> {
-        let mut retval: String = "[".to_string();
-
-        for (i, tx) in self.txs.iter().enumerate() {
-            retval += format!("{{\"tx\": \"{}\"}}", tx_as_hexstr(tx)?).as_str();
-            if i + 1 != self.txs.len() {
-                retval += ",";
-            }
-        }
-        retval += "]";
-        Ok(retval)
-    }
-
-    pub fn to_json(&self) -> Result<String, String> {
-        Ok(format!(
-            "{{\"outpoints\":  {}, \"txs\": {}}}",
-            self.outpoints_to_json(),
-            self.txs_to_json()?
-        ))
+        Ok(FundingResponseJson { outpoints, txs })
     }
 }
 
@@ -163,8 +133,8 @@ impl Service {
         self.dynamic_config.remove(client_id)
     }
 
-    /// Return the Service status as a JSON string
-    pub fn get_status(&self) -> String {
+    /// Return the Service status
+    pub fn get_status(&self) -> StatusResponse {
         let update_time = match self.blockchain_update_time {
             Some(time) => {
                 let datetime = DateTime::<Utc>::from(time);
@@ -172,11 +142,11 @@ impl Service {
             }
             None => "None".to_string(),
         };
-        let version = env!("CARGO_PKG_VERSION");
-        format!(
-            "{{\"version\": \"{}\", \"blockchain_status\": \"{:?}\", \"blockchain_update_time\": \"{}\"}}",
-            version, self.blockchain_status, update_time
-        )
+        StatusResponse {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            blockchain_status: self.blockchain_status,
+            blockchain_update_time: update_time,
+        }
     }
 
     async fn get_block_headers(&mut self) {

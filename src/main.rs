@@ -8,7 +8,7 @@ mod blockchain_factory;
 mod client;
 mod config;
 mod dynamic_config;
-mod error;
+mod responses;
 mod rest_api;
 mod service;
 mod util;
