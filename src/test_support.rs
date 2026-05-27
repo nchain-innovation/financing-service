@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use chain_gang::interface::{BlockchainInterface, TestInterface, UtxoEntry};
 
 use crate::config::{BlockchainInterfaceConfig, ClientConfig, Config, DynamicConfigConfig};
@@ -104,14 +106,14 @@ pub fn test_utxo() -> Vec<UtxoEntry> {
 
 pub async fn test_blockchain_interface(
     config: &Config,
-) -> Box<dyn BlockchainInterface + Send + Sync> {
+) -> Arc<dyn BlockchainInterface + Send + Sync> {
     let mut blockchain_interface = TestInterface::new();
     blockchain_interface.set_network(&config.get_network().unwrap());
     blockchain_interface
         .set_utxo(TEST_ADDRESS, &test_utxo())
         .await;
     blockchain_interface.set_height(1517571).await;
-    Box::new(blockchain_interface)
+    Arc::new(blockchain_interface)
 }
 
 pub fn unique_dynamic_config_path() -> String {

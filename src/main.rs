@@ -2,7 +2,7 @@ use std::{env, net::Ipv4Addr, time::Duration};
 use tokio::time;
 
 use actix_web::{web, App, HttpServer};
-use async_mutex::Mutex;
+use tokio::sync::RwLock;
 
 mod auth;
 mod blockchain_factory;
@@ -64,7 +64,7 @@ async fn main() -> std::io::Result<()> {
         );
     }
     let app_state = web::Data::new(AppState {
-        service: Mutex::new(service),
+        service: RwLock::new(service),
     });
     let app_state2 = app_state.clone();
     let addr = get_addr(&config);

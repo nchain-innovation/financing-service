@@ -1,7 +1,7 @@
 use actix_web::{delete, get, post, web, HttpRequest, HttpResponse, Responder};
-use async_mutex::Mutex;
 use log::debug;
 use serde::Deserialize;
+use tokio::sync::RwLock;
 
 use crate::{
     auth::{authorize_admin, authorize_client},
@@ -31,7 +31,7 @@ pub struct ClientAddRequest {
 
 /// Application State Data
 pub struct AppState {
-    pub service: Mutex<Service>,
+    pub service: RwLock<Service>,
 }
 
 /// Get Index endpoint
@@ -51,14 +51,13 @@ pub async fn health() -> impl Responder {
 pub async fn status(data: web::Data<AppState>) -> impl Responder {
     log::info!("status");
 
-    let service = data.service.lock().await;
+    let service = data.service.read().await;
     json_ok(&service.get_status())
 }
 
 /// Endpoint to update all the clients, called by ticker every minute
 pub async fn update_clients(data: web::Data<AppState>) -> impl Responder {
-    let mut service = data.service.lock().await;
-    service.update_balances().await;
+    Service::refresh_balances(&data.service).await;
     HttpResponse::Ok().finish()
 }
 
@@ -77,20 +76,12 @@ pub async fn get_funds(
 ) -> impl Responder {
     log::info!("get_funds");
 
-    let mut service = data.service.lock().await;
-
     let client_id = &info.client_id;
     let satoshi = info.satoshi;
     let no_of_outpoints = info.no_of_outpoints;
     let multiple_tx = info.multiple_tx;
     let locking_script = &info.locking_script;
 
-    if !service.is_client_id_valid(client_id) {
-        return error_response(format!("Unknown client_id {client_id}"));
-    }
-    if let Some(response) = authorize_client(&req, client_id, &service) {
-        return response;
-    }
     if satoshi == 0 {
         return error_response(format!("Invalid satoshi value '{satoshi}'"));
     }
@@ -116,18 +107,37 @@ pub async fn get_funds(
         locking_script: locking_script_as_bytes,
     };
 
-    if let Some(description) = service.funding_balance_error(&fund_request) {
-        log::info!("insufficient funds: {}", &description);
-        return error_response(description);
-    }
+    let (blockchain, prepared) = {
+        let mut service = data.service.write().await;
 
-    match service.create_funding_outpoints(&fund_request).await {
+        if !service.is_client_id_valid(client_id) {
+            return error_response(format!("Unknown client_id {client_id}"));
+        }
+        if let Some(response) = authorize_client(&req, client_id, &service) {
+            return response;
+        }
+
+        if let Some(description) = service.funding_balance_error(&fund_request) {
+            log::info!("insufficient funds: {}", &description);
+            return error_response(description);
+        }
+
+        match service.prepare_funding_outpoints(&fund_request) {
+            Ok(prepared) => (service.blockchain_interface(), prepared),
+            Err(description) => {
+                debug!("prepare_funding_outpoints error = {:?}", &description);
+                return error_response(description);
+            }
+        }
+    };
+
+    match Service::broadcast_prepared_funding(blockchain, prepared).await {
         Ok(funding_response) => match funding_response.to_response() {
             Ok(response) => json_ok(&response),
             Err(description) => error_response(description),
         },
         Err(description) => {
-            debug!("create_funding_outpoints error = {:?}", &description);
+            debug!("broadcast_prepared_funding error = {:?}", &description);
             error_response(description)
         }
     }
@@ -146,7 +156,7 @@ pub async fn add_client(
     data: web::Data<AppState>,
     info: web::Json<ClientAddRequest>,
 ) -> impl Responder {
-    let mut service = data.service.lock().await;
+    let mut service = data.service.write().await;
     if let Some(response) = authorize_admin(&req, &service) {
         return response;
     }
@@ -172,7 +182,7 @@ pub async fn delete_client(
     data: web::Data<AppState>,
     info: web::Path<String>,
 ) -> impl Responder {
-    let mut service = data.service.lock().await;
+    let mut service = data.service.write().await;
     let client_id: String = info.to_string();
     log::info!("delete_client {}", &client_id);
 
@@ -199,7 +209,7 @@ pub async fn get_address(
     let client_id: String = info.to_string();
     log::info!("get address {}", &client_id);
 
-    let service = data.service.lock().await;
+    let service = data.service.read().await;
 
     if !service.is_client_id_valid(&client_id) {
         return error_response(format!("Unknown client_id {client_id}"));
@@ -224,7 +234,7 @@ pub async fn balance(
     let client_id: String = info.to_string();
     log::info!("get balance {}", &client_id);
 
-    let service = data.service.lock().await;
+    let service = data.service.read().await;
 
     if !service.is_client_id_valid(&client_id) {
         return error_response(format!("Unknown client_id {client_id}"));
@@ -247,8 +257,8 @@ mod tests {
     use actix_http::Request;
     use actix_web::{dev::Service as ActixService, dev::ServiceResponse, Error};
     use actix_web::{http::StatusCode, test, web, App};
-    use async_mutex::Mutex;
     use serde_json::{json, Value};
+    use tokio::sync::RwLock;
 
     use crate::{
         rest_api::{
@@ -274,7 +284,7 @@ mod tests {
         let blockchain = test_blockchain_interface(&config).await;
         let financing_service = Service::new_for_test(&config, blockchain).await;
         let app_state = web::Data::new(AppState {
-            service: Mutex::new(financing_service),
+            service: RwLock::new(financing_service),
         });
 
         test::init_service(

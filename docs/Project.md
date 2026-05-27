@@ -54,7 +54,7 @@ Admin       ──REST──▶       │                │
 
 * **UTXO cache staleness** — balances refresh on a configurable interval (default 60 seconds). A fund request between refreshes may fail if UTXOs were spent on-chain.
 * **Multi-tx partial failure** — in `multiple_tx` mode, earlier transactions may broadcast successfully before a later one fails. Each transaction in this mode still uses a single UTXO.
-* **Request serialization** — all endpoints share a single `Mutex<Service>`. Fund requests hold the lock through blockchain broadcast.
+* **Concurrent fund requests** — read-only endpoints and blockchain broadcast no longer hold the service write lock, but transaction preparation still serializes per client UTXO state.
 * **Plaintext secrets** — WIF keys, optional client `api_key`, and optional `admin_api_key` are stored in TOML config files.
 * **No rate limiting or HTTPS** — expected to be handled at the deployment layer (reverse proxy, firewall).
 

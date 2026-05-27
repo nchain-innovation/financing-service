@@ -88,6 +88,12 @@ impl Client {
         Ok(())
     }
 
+    pub fn apply_chain_state(&mut self, balance: Balance, unspent: Utxo) {
+        self.balance = balance;
+        self.unspent = unspent;
+        self.unspent.sort_by_key(|x| x.value);
+    }
+
     /// Return balance as JSON string
     pub fn get_balance(&self) -> Balance {
         self.balance

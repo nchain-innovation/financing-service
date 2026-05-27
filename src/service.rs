@@ -1,12 +1,12 @@
-use std::time::SystemTime;
+use std::{sync::Arc, time::SystemTime};
 
 use chain_gang::{
     interface::{Balance, BlockchainInterface},
     messages::{OutPoint, Tx},
-    util::Hash256,
 };
 use chrono::prelude::DateTime;
 use chrono::Utc;
+use tokio::sync::RwLock;
 
 use crate::{
     blockchain_factory::blockchain_factory,
@@ -46,12 +46,19 @@ impl FundingResponse {
     }
 }
 
+#[derive(Clone, Default)]
+pub struct PreparedFunding {
+    pub txs: Vec<Tx>,
+    pub no_of_outpoints: u32,
+    pub multiple_tx: bool,
+}
+
 /// Service data
 //#[derive(Debug)]
 pub struct Service {
     blockchain_status: BlockchainConnectionStatus,
     blockchain_update_time: Option<SystemTime>,
-    blockchain_interface: Box<dyn BlockchainInterface>,
+    blockchain_interface: Arc<dyn BlockchainInterface + Send + Sync>,
     clients: Vec<Client>,
     dynamic_config: DynamicConfig,
     admin_api_key: Option<String>,
@@ -60,7 +67,7 @@ pub struct Service {
 impl Service {
     async fn build(
         config: &Config,
-        blockchain_interface: Box<dyn BlockchainInterface + Send + Sync>,
+        blockchain_interface: Arc<dyn BlockchainInterface + Send + Sync>,
     ) -> Service {
         let mut clients: Vec<Client> = Vec::new();
 
@@ -106,7 +113,7 @@ impl Service {
     #[cfg(test)]
     pub async fn new_for_test(
         config: &Config,
-        blockchain_interface: Box<dyn BlockchainInterface + Send + Sync>,
+        blockchain_interface: Arc<dyn BlockchainInterface + Send + Sync>,
     ) -> Service {
         blockchain_interface
             .status()
@@ -172,25 +179,68 @@ impl Service {
         self.blockchain_update_time = Some(SystemTime::now());
     }
 
-    /// Update client balances
+    /// Update client balances while holding a mutable reference (startup only).
     pub async fn update_balances(&mut self) {
         if self.clients.is_empty() {
-            // Request latest block header - to determine the blockchain connectivity status
             self.get_block_headers().await;
         } else {
-            // Get client balances
             for client in &mut self.clients {
-                self.blockchain_status =
-                    match client.update_balance(&*self.blockchain_interface).await {
-                        Ok(_) => BlockchainConnectionStatus::Connected,
-                        Err(e) => {
-                            log::warn!("update_balance - failed {:?}", e);
-                            BlockchainConnectionStatus::Failed
-                        }
-                    };
+                self.blockchain_status = match client
+                    .update_balance(self.blockchain_interface.as_ref())
+                    .await
+                {
+                    Ok(_) => BlockchainConnectionStatus::Connected,
+                    Err(e) => {
+                        log::warn!("update_balance - failed {:?}", e);
+                        BlockchainConnectionStatus::Failed
+                    }
+                };
                 self.blockchain_update_time = Some(SystemTime::now());
             }
         }
+    }
+
+    /// Refresh balances without holding the service lock during blockchain I/O.
+    pub async fn refresh_balances(service: &RwLock<Service>) {
+        let (blockchain, addresses) = {
+            let service = service.read().await;
+            (
+                Arc::clone(&service.blockchain_interface),
+                service
+                    .clients
+                    .iter()
+                    .map(|client| client.get_address())
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        if addresses.is_empty() {
+            let mut service = service.write().await;
+            service.get_block_headers().await;
+            return;
+        }
+
+        let mut chain_updates = Vec::with_capacity(addresses.len());
+        for address in addresses {
+            let balance = blockchain.get_balance(&address).await;
+            let utxo = blockchain.get_utxo(&address).await;
+            chain_updates.push((balance, utxo));
+        }
+
+        let mut service = service.write().await;
+        let mut status = BlockchainConnectionStatus::Connected;
+        for (client, (balance_result, utxo_result)) in service.clients.iter_mut().zip(chain_updates)
+        {
+            match (balance_result, utxo_result) {
+                (Ok(balance), Ok(utxo)) => client.apply_chain_state(balance, utxo),
+                (Err(e), _) | (_, Err(e)) => {
+                    log::warn!("update_balance - failed {:?}", e);
+                    status = BlockchainConnectionStatus::Failed;
+                }
+            }
+        }
+        service.blockchain_status = status;
+        service.blockchain_update_time = Some(SystemTime::now());
     }
 
     /// Given a client_id return true if it is valid
@@ -232,6 +282,10 @@ impl Service {
         self.clients.len()
     }
 
+    pub fn blockchain_interface(&self) -> Arc<dyn BlockchainInterface + Send + Sync> {
+        Arc::clone(&self.blockchain_interface)
+    }
+
     pub fn admin_auth_required(&self) -> bool {
         self.admin_api_key.is_some()
     }
@@ -263,61 +317,71 @@ impl Service {
         client.funding_balance_error(fund_request)
     }
 
-    /// Given txid and no_of_outpoints return the outpoints as JSON string
-    fn get_outpoints(&self, hash: Hash256, no_of_outpoints: u32) -> Vec<OutPoint> {
-        (1..no_of_outpoints + 1)
-            .map(|index| OutPoint { hash, index })
-            .collect()
-    }
-
-    /// Create funding outpoints based on the provided arguments
-    pub async fn create_funding_outpoints(
+    /// Build and sign funding transactions, updating local UTXO state.
+    pub fn prepare_funding_outpoints(
         &mut self,
         fund_request: &FundRequest,
-    ) -> Result<FundingResponse, String> {
+    ) -> Result<PreparedFunding, String> {
         let client = self
             .clients
             .iter_mut()
             .find(|x| x.client_id == fund_request.client_id)
             .ok_or_else(|| format!("Unknown client_id {}", fund_request.client_id))?;
 
-        let mut response = FundingResponse::default();
         if fund_request.no_of_outpoints > 1 && fund_request.multiple_tx {
-            response.txs = client.create_multiple_funding_txs(fund_request)?;
+            let txs = client.create_multiple_funding_txs(fund_request)?;
+            Ok(PreparedFunding {
+                txs,
+                no_of_outpoints: fund_request.no_of_outpoints,
+                multiple_tx: true,
+            })
+        } else {
+            let tx = client.create_funding_tx(fund_request)?;
+            Ok(PreparedFunding {
+                txs: vec![tx],
+                no_of_outpoints: fund_request.no_of_outpoints,
+                multiple_tx: false,
+            })
+        }
+    }
 
-            for a_tx in &response.txs {
-                let tx_as_str = tx_as_hexstr(a_tx)?;
+    /// Broadcast prepared funding transactions without holding the service lock.
+    pub async fn broadcast_prepared_funding(
+        blockchain: Arc<dyn BlockchainInterface + Send + Sync>,
+        prepared: PreparedFunding,
+    ) -> Result<FundingResponse, String> {
+        let mut response = FundingResponse::default();
+        if prepared.multiple_tx {
+            for tx in &prepared.txs {
+                let tx_as_str = tx_as_hexstr(tx)?;
                 log::info!("tx_as_str = {}", &tx_as_str);
-
-                match self.blockchain_interface.broadcast_tx(a_tx).await {
-                    Ok(_hash) => {
-                        response.outpoints.push(OutPoint {
-                            hash: a_tx.hash(),
-                            index: 1,
-                        });
-                    }
-                    Err(e) => {
-                        log::warn!("Failed to broadcast funding transaction: {:?}", e);
-                        return Err("Failed to broadcast funding transaction.".to_string());
-                    }
-                }
+                blockchain.broadcast_tx(tx).await.map_err(|e| {
+                    log::warn!("Failed to broadcast funding transaction: {:?}", e);
+                    "Failed to broadcast funding transaction.".to_string()
+                })?;
+                response.outpoints.push(OutPoint {
+                    hash: tx.hash(),
+                    index: 1,
+                });
             }
+            response.txs = prepared.txs;
             Ok(response)
         } else {
-            let b_tx = client.create_funding_tx(fund_request)?;
-            response.txs.push(b_tx.clone());
-
-            match self.blockchain_interface.broadcast_tx(&b_tx).await {
-                Ok(_hash) => {
-                    let hash = b_tx.hash();
-                    response.outpoints = self.get_outpoints(hash, fund_request.no_of_outpoints);
-                    Ok(response)
-                }
-                Err(e) => {
-                    log::warn!("Failed to broadcast funding transaction: {:?}", e);
-                    Err("Failed to broadcast funding transaction.".to_string())
-                }
-            }
+            let tx = prepared
+                .txs
+                .into_iter()
+                .next()
+                .ok_or_else(|| "No funding transaction prepared.".to_string())?;
+            response.txs.push(tx.clone());
+            blockchain.broadcast_tx(&tx).await.map_err(|e| {
+                log::warn!("Failed to broadcast funding transaction: {:?}", e);
+                "Failed to broadcast funding transaction.".to_string()
+            })?;
+            let hash = tx.hash();
+            response.outpoints = (1..prepared.no_of_outpoints + 1)
+                .map(|index| OutPoint { hash, index })
+                .collect();
+            Ok(response)
         }
     }
 }
