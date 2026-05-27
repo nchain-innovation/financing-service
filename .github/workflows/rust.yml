@@ -20,6 +20,9 @@ jobs:
       run: cargo fmt --all -- --check
     - name: Clippy
       run: cargo clippy --verbose -- -D warnings
+    - uses: taiki-e/install-action@cargo-audit
+    - name: Audit dependencies
+      run: cargo audit
     - name: Build
       run: cargo build --verbose
     - name: Run tests

@@ -45,7 +45,7 @@ Admin       ──REST──▶       │                │
 * Optional per-client `api_key` authentication
 * Balance checks against total wallet balance and single-UTXO availability
 * Docker image with `/health` liveness check
-* CI: build, test, `cargo fmt --check`, `cargo clippy -- -D warnings`
+* CI: build, test, `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo audit`
 * Pinned `chain-gang` git dependency and committed `Cargo.lock` for reproducible builds
 * 41 automated tests (unit, integration, REST API)
 
@@ -62,7 +62,6 @@ Admin       ──REST──▶       │                │
 ## Open items
 
 * UTXO consolidation (multi-input funding transactions)
-* Add `cargo audit` to CI
 * Protect `POST /client` (e.g. admin key or existing-client auth)
 * Reduce sensitive data in logs (full tx hex at `info` level)
 * Clean up remaining startup-path panics (`Client::new`, config parse failures)

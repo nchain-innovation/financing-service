@@ -53,6 +53,13 @@ Run Clippy with warnings denied:
 cargo clippy -- -D warnings
 ```
 
+Audit dependencies for known vulnerabilities:
+
+```bash
+cargo install cargo-audit --locked
+cargo audit
+```
+
 These checks run automatically in GitHub Actions (`.github/workflows/rust.yml`) on push and pull request to `main`.
 
 ## Dependencies
