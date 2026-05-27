@@ -98,9 +98,7 @@ impl Client {
 
     /// Return the smallest unspent that is greater than given satoshi
     fn get_smallest_unspent(&self, satoshi: u64) -> Option<&UtxoEntry> {
-        self.unspent
-            .iter()
-            .find(|utxo| utxo.value > satoshi as i64)
+        self.unspent.iter().find(|utxo| utxo.value > satoshi as i64)
     }
 
     fn total_unspent(&self) -> i64 {
@@ -259,7 +257,9 @@ mod tests {
     use super::*;
     use crate::{
         config::ClientConfig,
-        test_support::{test_blockchain_interface, test_config, LOCKING_SCRIPT_HEX, TEST_CLIENT_ID},
+        test_support::{
+            test_blockchain_interface, test_config, LOCKING_SCRIPT_HEX, TEST_CLIENT_ID,
+        },
         util::tx_as_hexstr,
     };
 

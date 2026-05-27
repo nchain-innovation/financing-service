@@ -6,8 +6,7 @@ use serde::Deserialize;
 use crate::{
     client::FundRequest,
     responses::{
-        error_response, json_ok, AddressResponse, BalanceResponse, HealthResponse,
-        SuccessResponse,
+        error_response, json_ok, AddressResponse, BalanceResponse, HealthResponse, SuccessResponse,
     },
     service::Service,
 };
@@ -231,11 +230,7 @@ mod tests {
         },
     };
 
-    async fn build_app() -> impl ActixService<
-        Request,
-        Response = ServiceResponse,
-        Error = Error,
-    > {
+    async fn build_app() -> impl ActixService<Request, Response = ServiceResponse, Error = Error> {
         let config = test_config(&unique_dynamic_config_path());
         let blockchain = test_blockchain_interface(&config).await;
         let financing_service = Service::new_for_test(&config, blockchain).await;
@@ -258,7 +253,12 @@ mod tests {
         .await
     }
 
-    fn fund_body(client_id: &str, satoshi: u64, no_of_outpoints: u32, locking_script: &str) -> Value {
+    fn fund_body(
+        client_id: &str,
+        satoshi: u64,
+        no_of_outpoints: u32,
+        locking_script: &str,
+    ) -> Value {
         json!({
             "client_id": client_id,
             "satoshi": satoshi,
@@ -280,11 +280,8 @@ mod tests {
     #[actix_web::test]
     async fn test_health() {
         let app = build_app().await;
-        let resp = test::call_service(
-            &app,
-            test::TestRequest::get().uri("/health").to_request(),
-        )
-        .await;
+        let resp =
+            test::call_service(&app, test::TestRequest::get().uri("/health").to_request()).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body: Value = test::read_body_json(resp).await;
         assert_eq!(body["status"], "ok");
@@ -293,11 +290,8 @@ mod tests {
     #[actix_web::test]
     async fn test_status() {
         let app = build_app().await;
-        let resp = test::call_service(
-            &app,
-            test::TestRequest::get().uri("/status").to_request(),
-        )
-        .await;
+        let resp =
+            test::call_service(&app, test::TestRequest::get().uri("/status").to_request()).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body: Value = test::read_body_json(resp).await;
         assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
@@ -539,7 +533,12 @@ mod tests {
             &app,
             test::TestRequest::post()
                 .uri("/fund")
-                .set_json(fund_body(TEST_CLIENT_ID, 100_000_000, 1, LOCKING_SCRIPT_HEX))
+                .set_json(fund_body(
+                    TEST_CLIENT_ID,
+                    100_000_000,
+                    1,
+                    LOCKING_SCRIPT_HEX,
+                ))
                 .to_request(),
         )
         .await;
