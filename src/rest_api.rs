@@ -223,3 +223,347 @@ pub async fn balance(data: web::Data<AppState>, info: web::Path<String>) -> impl
         None => error_response(format!("Unknown client_id {client_id}")),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use actix_http::Request;
+    use actix_web::{dev::Service as ActixService, dev::ServiceResponse, Error};
+    use actix_web::{http::StatusCode, test, web, App};
+    use async_mutex::Mutex;
+    use serde_json::{json, Value};
+
+    use crate::{
+        rest_api::{
+            add_client, balance, delete_client, get_address, get_funds, index, status, AppState,
+        },
+        service::Service,
+        test_support::{
+            test_blockchain_interface, test_config, unique_dynamic_config_path, LOCKING_SCRIPT_HEX,
+            TEST_ADDRESS, TEST_CLIENT_ID, TEST_WIF,
+        },
+    };
+
+    async fn build_app() -> impl ActixService<
+        Request,
+        Response = ServiceResponse,
+        Error = Error,
+    > {
+        let config = test_config(&unique_dynamic_config_path());
+        let blockchain = test_blockchain_interface(&config).await;
+        let financing_service = Service::new_for_test(&config, blockchain).await;
+        let app_state = web::Data::new(AppState {
+            service: Mutex::new(financing_service),
+        });
+
+        test::init_service(
+            App::new()
+                .app_data(app_state)
+                .service(index)
+                .service(status)
+                .service(balance)
+                .service(get_funds)
+                .service(add_client)
+                .service(delete_client)
+                .service(get_address),
+        )
+        .await
+    }
+
+    fn fund_body(client_id: &str, satoshi: u64, no_of_outpoints: u32, locking_script: &str) -> Value {
+        json!({
+            "client_id": client_id,
+            "satoshi": satoshi,
+            "no_of_outpoints": no_of_outpoints,
+            "multiple_tx": false,
+            "locking_script": locking_script,
+        })
+    }
+
+    #[actix_web::test]
+    async fn test_index() {
+        let app = build_app().await;
+        let resp = test::call_service(&app, test::TestRequest::get().uri("/").to_request()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = test::read_body(resp).await;
+        assert_eq!(body, "Financing Service REST API");
+    }
+
+    #[actix_web::test]
+    async fn test_status() {
+        let app = build_app().await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get().uri("/status").to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+        assert!(body["blockchain_status"].is_string());
+    }
+
+    #[actix_web::test]
+    async fn test_balance_unknown_client() {
+        let app = build_app().await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/client/unknown/balance")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body: Value = test::read_body_json(resp).await;
+        assert!(body["description"]
+            .as_str()
+            .unwrap()
+            .contains("Unknown client_id"));
+    }
+
+    #[actix_web::test]
+    async fn test_balance_success() {
+        let app = build_app().await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/client/{TEST_CLIENT_ID}/balance"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = test::read_body_json(resp).await;
+        assert!(body["confirmed"].as_i64().unwrap() > 0);
+    }
+
+    #[actix_web::test]
+    async fn test_address_success() {
+        let app = build_app().await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/client/{TEST_CLIENT_ID}/address"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["address"], TEST_ADDRESS);
+    }
+
+    #[actix_web::test]
+    async fn test_address_unknown_client() {
+        let app = build_app().await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/client/unknown/address")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[actix_web::test]
+    async fn test_add_client_success() {
+        let app = build_app().await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/client")
+                .set_json(json!({
+                    "client_id": "client2",
+                    "wif": TEST_WIF,
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["status"], "Success");
+    }
+
+    #[actix_web::test]
+    async fn test_add_client_duplicate() {
+        let app = build_app().await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/client")
+                .set_json(json!({
+                    "client_id": TEST_CLIENT_ID,
+                    "wif": TEST_WIF,
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body: Value = test::read_body_json(resp).await;
+        assert!(body["description"]
+            .as_str()
+            .unwrap()
+            .contains("already exists"));
+    }
+
+    #[actix_web::test]
+    async fn test_add_client_invalid_wif() {
+        let app = build_app().await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/client")
+                .set_json(json!({
+                    "client_id": "client3",
+                    "wif": "not-a-valid-wif",
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body: Value = test::read_body_json(resp).await;
+        assert!(body["description"]
+            .as_str()
+            .unwrap()
+            .contains("not a valid WIF key"));
+    }
+
+    #[actix_web::test]
+    async fn test_delete_client_success() {
+        let app = build_app().await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::delete()
+                .uri(&format!("/client/{TEST_CLIENT_ID}"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["status"], "Success");
+    }
+
+    #[actix_web::test]
+    async fn test_delete_client_unknown() {
+        let app = build_app().await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::delete()
+                .uri("/client/unknown")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[actix_web::test]
+    async fn test_fund_unknown_client() {
+        let app = build_app().await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/fund")
+                .set_json(fund_body("unknown", 123, 1, LOCKING_SCRIPT_HEX))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body: Value = test::read_body_json(resp).await;
+        assert!(body["description"]
+            .as_str()
+            .unwrap()
+            .contains("Unknown client_id"));
+    }
+
+    #[actix_web::test]
+    async fn test_fund_invalid_satoshi() {
+        let app = build_app().await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/fund")
+                .set_json(fund_body(TEST_CLIENT_ID, 0, 1, LOCKING_SCRIPT_HEX))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body: Value = test::read_body_json(resp).await;
+        assert!(body["description"]
+            .as_str()
+            .unwrap()
+            .contains("Invalid satoshi"));
+    }
+
+    #[actix_web::test]
+    async fn test_fund_invalid_no_of_outpoints() {
+        let app = build_app().await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/fund")
+                .set_json(fund_body(TEST_CLIENT_ID, 123, 0, LOCKING_SCRIPT_HEX))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body: Value = test::read_body_json(resp).await;
+        assert!(body["description"]
+            .as_str()
+            .unwrap()
+            .contains("Invalid no_of_outpoints"));
+    }
+
+    #[actix_web::test]
+    async fn test_fund_invalid_locking_script() {
+        let app = build_app().await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/fund")
+                .set_json(fund_body(TEST_CLIENT_ID, 123, 1, "not-hex"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body: Value = test::read_body_json(resp).await;
+        assert!(body["description"]
+            .as_str()
+            .unwrap()
+            .contains("locking_script"));
+    }
+
+    #[actix_web::test]
+    async fn test_fund_insufficient_balance() {
+        let app = build_app().await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/fund")
+                .set_json(fund_body(TEST_CLIENT_ID, 50_000_000, 1, LOCKING_SCRIPT_HEX))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body: Value = test::read_body_json(resp).await;
+        assert!(body["description"]
+            .as_str()
+            .unwrap()
+            .contains("Insufficent client balance"));
+    }
+
+    #[actix_web::test]
+    async fn test_fund_success() {
+        let app = build_app().await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/fund")
+                .set_json(fund_body(TEST_CLIENT_ID, 123, 1, LOCKING_SCRIPT_HEX))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["outpoints"].as_array().unwrap().len(), 1);
+        assert_eq!(body["txs"].as_array().unwrap().len(), 1);
+        assert!(body["outpoints"][0]["hash"].as_str().unwrap().len() > 0);
+    }
+}

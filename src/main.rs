@@ -13,6 +13,9 @@ mod rest_api;
 mod service;
 mod util;
 
+#[cfg(test)]
+mod test_support;
+
 use crate::{
     config::{get_config, Config},
     rest_api::{

@@ -216,130 +216,34 @@ impl Client {
 mod tests {
     use super::*;
     use crate::{
-        config::{BlockchainInterfaceConfig, ClientConfig, Config},
+        config::ClientConfig,
+        test_support::{test_blockchain_interface, test_config, LOCKING_SCRIPT_HEX, TEST_CLIENT_ID},
         util::tx_as_hexstr,
     };
-    use chain_gang::interface::{BlockchainInterface, TestInterface, UtxoEntry};
-    use log::debug;
-
-    async fn setup_blockchain(config: &Config) -> Box<dyn BlockchainInterface + Send + Sync> {
-        let mut blockchain_interface = TestInterface::new();
-        blockchain_interface.set_network(&config.get_network().unwrap());
-
-        let utxo = vec![
-            UtxoEntry {
-                height: 1514933,
-                tx_pos: 0,
-                tx_hash: "f67272e5c1408ecbeb8da543437c125ee1a17110317d44d13eafe31b771b795e"
-                    .to_string(),
-                value: 240,
-            },
-            UtxoEntry {
-                height: 1514939,
-                tx_pos: 1,
-                tx_hash: "b3ec9a52a1fe1689a998c869c2ae38d64d08ece8aaf218286461f330f6fd2ca8"
-                    .to_string(),
-                value: 100,
-            },
-            UtxoEntry {
-                height: 1514939,
-                tx_pos: 1,
-                tx_hash: "76f9302ab84fc5da40de02617c10f1a26dff7007c2bfffa9d0845e57d47fa82f"
-                    .to_string(),
-                value: 100,
-            },
-            UtxoEntry {
-                height: 1514939,
-                tx_pos: 1,
-                tx_hash: "447ee285748e88d8b875ce09026815578f0474ec3f1babcd5ba917ecb9f1dd7a"
-                    .to_string(),
-                value: 100,
-            },
-            UtxoEntry {
-                height: 1514939,
-                tx_pos: 2,
-                tx_hash: "447ee285748e88d8b875ce09026815578f0474ec3f1babcd5ba917ecb9f1dd7a"
-                    .to_string(),
-                value: 100,
-            },
-            UtxoEntry {
-                height: 1516841,
-                tx_pos: 0,
-                tx_hash: "70d0365df8062e5af41f8e8f2e42bafde3cabbaebd1fc94e94fa5559e87777b2"
-                    .to_string(),
-                value: 39080962,
-            },
-            UtxoEntry {
-                height: 1517272,
-                tx_pos: 0,
-                tx_hash: "51b349bda57674a02ea5b90b43f2204dd6df330d751d646d74d76b19348bf5be"
-                    .to_string(),
-                value: 39327675,
-            },
-            UtxoEntry {
-                height: 1517429,
-                tx_pos: 0,
-                tx_hash: "e533109de9df0184299e2199fa8f74baae7d99e4b39d3dea1e957e2f26636578"
-                    .to_string(),
-                value: 9564208,
-            },
-            UtxoEntry {
-                height: 1517429,
-                tx_pos: 1,
-                tx_hash: "e533109de9df0184299e2199fa8f74baae7d99e4b39d3dea1e957e2f26636578"
-                    .to_string(),
-                value: 123,
-            },
-        ];
-
-        blockchain_interface
-            .set_utxo("n1jaAsKZfE6kufLy5DAtAyQ1RzGXwMeNAF", &utxo)
-            .await;
-
-        blockchain_interface.set_height(1517571).await;
-        Box::new(blockchain_interface)
-    }
 
     #[tokio::test]
     async fn test_create_tx() {
-        // Create a test config
-        let config = Config {
-            blockchain_interface: BlockchainInterfaceConfig {
-                interface_type: "test".to_string(),
-                network_type: "testnet".to_string(),
-                url: None,
-            },
+        let config = test_config("/tmp/financing-service-client-test-dynamic.toml");
 
-            client: vec![ClientConfig {
-                client_id: "id1".to_string(),
-                wif_key: "cTYmKQzX3CvHJAxe2sctsQaHG8ktiEnpXgyyycVXGg5pRcLJEeLd".to_string(),
-            }]
-            .into(),
-            ..Default::default()
-        };
-
-        // Set up test blockchain
-        let blockchain_interface = setup_blockchain(&config).await;
+        let blockchain_interface = test_blockchain_interface(&config).await;
 
         let client_config = config.client.unwrap();
         let mut client = Client::new(&client_config[0]);
 
         let result = client.update_balance(&*blockchain_interface).await;
-        assert!(&result.is_ok());
+        assert!(result.is_ok());
 
-        let locking_script =
-            hex::decode("76a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac").unwrap();
+        let locking_script = hex::decode(LOCKING_SCRIPT_HEX).unwrap();
 
         let fund_request = FundRequest {
-            client_id: "client1".to_string(),
+            client_id: TEST_CLIENT_ID.to_string(),
             satoshi: 123,
             no_of_outpoints: 1,
             multiple_tx: false,
-            locking_script: locking_script,
+            locking_script,
         };
         let tx = client.create_funding_tx(&fund_request).unwrap();
 
-        debug!("tx = {:?}", &tx);
         assert_eq!(
             tx_as_hexstr(&tx).unwrap(),
             "0100000001786563262f7e951eea3d9db3e4997daeba748ffa99219e298401dfe99d1033e5000000006b483045022100c7a22fbf24470b2c96b82ce1bfd5896f515e3f0f509f307e94f699baefe0f8c3022044ddbb29952769c67ba117762ee628d299846039a6d90bc59618c770b226bfc2412103a8ae071ddd8690b94755c7112ca304bcac45c15904cc013f0ad6c2ea0b1019b2ffffffff02c7ec9100000000001976a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac7b000000000000001976a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac00000000"
@@ -348,10 +252,30 @@ mod tests {
 
     #[tokio::test]
     async fn test_invalid_wif_key() {
-        let client_config: ClientConfig = ClientConfig {
-            client_id: "id1".to_string(),
+        let client_config = ClientConfig {
+            client_id: TEST_CLIENT_ID.to_string(),
             wif_key: "EGa6cZHpfLZmUzXbkvq72s15rbiUonkrQAhDU4FG".to_string(),
         };
         assert!(Client::try_new(&client_config).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_create_funding_tx_no_utxo() {
+        let client_config = ClientConfig {
+            client_id: TEST_CLIENT_ID.to_string(),
+            wif_key: crate::test_support::TEST_WIF.to_string(),
+        };
+        let mut client = Client::new(&client_config);
+        let fund_request = FundRequest {
+            client_id: TEST_CLIENT_ID.to_string(),
+            satoshi: 123,
+            no_of_outpoints: 1,
+            multiple_tx: false,
+            locking_script: hex::decode(LOCKING_SCRIPT_HEX).unwrap(),
+        };
+
+        let result = client.create_funding_tx(&fund_request);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("No suitable UTXO"));
     }
 }

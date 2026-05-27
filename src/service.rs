@@ -87,38 +87,57 @@ pub struct Service {
 }
 
 impl Service {
-    /// Create a new Service from the provided config
-    pub async fn new(config: &Config) -> Service {
+    async fn build(
+        config: &Config,
+        blockchain_interface: Box<dyn BlockchainInterface + Send + Sync>,
+    ) -> Service {
         let mut clients: Vec<Client> = Vec::new();
-        let blockchain_interface = blockchain_factory(config);
-
-        // Check we can connect to blockchain
-        blockchain_interface
-            .status()
-            .await
-            .expect("Unable to connect to blockchain, ensure that the service is running.");
 
         if let Some(clients_config) = &config.client {
             for client_config in clients_config {
-                let new_client = Client::new(client_config);
-                clients.push(new_client);
+                clients.push(Client::new(client_config));
             }
         }
 
-        // Add the dynamic clients
         let dynamic_config = DynamicConfig::new(config);
         for client_config in &dynamic_config.contents.clients {
-            let new_client = Client::new(client_config);
-            clients.push(new_client);
+            clients.push(Client::new(client_config));
         }
 
-        let mut service = Service {
+        Service {
             blockchain_status: BlockchainConnectionStatus::Unknown,
             blockchain_update_time: None,
             blockchain_interface,
             clients,
             dynamic_config,
-        };
+        }
+    }
+
+    /// Create a new Service from the provided config
+    pub async fn new(config: &Config) -> Service {
+        let blockchain_interface = blockchain_factory(config);
+
+        blockchain_interface
+            .status()
+            .await
+            .expect("Unable to connect to blockchain, ensure that the service is running.");
+
+        let mut service = Self::build(config, blockchain_interface).await;
+        service.update_balances().await;
+        service
+    }
+
+    #[cfg(test)]
+    pub async fn new_for_test(
+        config: &Config,
+        blockchain_interface: Box<dyn BlockchainInterface + Send + Sync>,
+    ) -> Service {
+        blockchain_interface
+            .status()
+            .await
+            .expect("Unable to connect to test blockchain.");
+
+        let mut service = Self::build(config, blockchain_interface).await;
         service.update_balances().await;
         service
     }
