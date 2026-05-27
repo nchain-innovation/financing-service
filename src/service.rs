@@ -1,7 +1,7 @@
 use std::{sync::Arc, time::SystemTime};
 
 use chain_gang::{
-    interface::{Balance, BlockchainInterface},
+    interface::{Balance, BlockchainInterface, Utxo},
     messages::{OutPoint, Tx},
 };
 use chrono::prelude::DateTime;
@@ -222,25 +222,54 @@ impl Service {
 
         let mut chain_updates = Vec::with_capacity(addresses.len());
         for address in addresses {
-            let balance = blockchain.get_balance(&address).await;
-            let utxo = blockchain.get_utxo(&address).await;
-            chain_updates.push((balance, utxo));
+            chain_updates.push(fetch_chain_state(blockchain.as_ref(), &address).await);
         }
 
         let mut service = service.write().await;
         let mut status = BlockchainConnectionStatus::Connected;
-        for (client, (balance_result, utxo_result)) in service.clients.iter_mut().zip(chain_updates)
-        {
-            match (balance_result, utxo_result) {
-                (Ok(balance), Ok(utxo)) => client.apply_chain_state(balance, utxo),
-                (Err(e), _) | (_, Err(e)) => {
-                    log::warn!("update_balance - failed {:?}", e);
+        for (client, chain_state) in service.clients.iter_mut().zip(chain_updates) {
+            match chain_state {
+                Ok((balance, utxo)) => client.apply_chain_state(balance, utxo),
+                Err(e) => {
+                    log::warn!("update_balance - failed {}", e);
                     status = BlockchainConnectionStatus::Failed;
                 }
             }
         }
         service.blockchain_status = status;
         service.blockchain_update_time = Some(SystemTime::now());
+    }
+
+    /// Refresh one client's balance and UTXO set from the blockchain before funding.
+    pub async fn refresh_client_chain_state(
+        service: &RwLock<Service>,
+        client_id: &str,
+    ) -> Result<(), String> {
+        let (blockchain, address) = {
+            let service = service.read().await;
+            if !service.is_client_id_valid(client_id) {
+                return Err(format!("Unknown client_id {client_id}"));
+            }
+            (
+                service.blockchain_interface(),
+                service
+                    .get_address(client_id)
+                    .ok_or_else(|| format!("Unknown client_id {client_id}"))?,
+            )
+        };
+
+        let chain_state = fetch_chain_state(blockchain.as_ref(), &address).await?;
+
+        let mut service = service.write().await;
+        let client = service
+            .clients
+            .iter_mut()
+            .find(|client| client.client_id == client_id)
+            .ok_or_else(|| format!("Unknown client_id {client_id}"))?;
+        client.apply_chain_state(chain_state.0, chain_state.1);
+        service.blockchain_status = BlockchainConnectionStatus::Connected;
+        service.blockchain_update_time = Some(SystemTime::now());
+        Ok(())
     }
 
     /// Given a client_id return true if it is valid
@@ -385,5 +414,62 @@ impl Service {
                 .collect();
             Ok(response)
         }
+    }
+}
+
+async fn fetch_chain_state(
+    blockchain: &dyn BlockchainInterface,
+    address: &str,
+) -> Result<(Balance, Utxo), String> {
+    let balance = blockchain
+        .get_balance(address)
+        .await
+        .map_err(|e| format!("get_balance failed: {e:?}"))?;
+    let utxo = blockchain
+        .get_utxo(address)
+        .await
+        .map_err(|e| format!("get_utxo failed: {e:?}"))?;
+    Ok((balance, utxo))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{
+        test_blockchain_interface, test_config, unique_dynamic_config_path, TEST_CLIENT_ID,
+    };
+
+    #[tokio::test]
+    async fn refresh_client_chain_state_restores_stale_utxo_cache() {
+        let config = test_config(&unique_dynamic_config_path());
+        let blockchain = test_blockchain_interface(&config).await;
+        let service = RwLock::new(Service::new_for_test(&config, blockchain).await);
+
+        {
+            let mut service = service.write().await;
+            let client = service
+                .clients
+                .iter_mut()
+                .find(|client| client.client_id == TEST_CLIENT_ID)
+                .expect("test client");
+            client.apply_chain_state(Balance::default(), Vec::new());
+        }
+
+        Service::refresh_client_chain_state(&service, TEST_CLIENT_ID)
+            .await
+            .expect("refresh should succeed");
+
+        let service = service.read().await;
+        let balance = service.get_balance(TEST_CLIENT_ID).expect("test client");
+        assert!(balance.confirmed > 0);
+        assert!(service
+            .funding_balance_error(&FundRequest {
+                client_id: TEST_CLIENT_ID.to_string(),
+                satoshi: 123,
+                no_of_outpoints: 1,
+                multiple_tx: false,
+                locking_script: hex::decode(crate::test_support::LOCKING_SCRIPT_HEX).unwrap(),
+            })
+            .is_none());
     }
 }

@@ -107,15 +107,23 @@ pub async fn get_funds(
         locking_script: locking_script_as_bytes,
     };
 
-    let (blockchain, prepared) = {
-        let mut service = data.service.write().await;
-
+    {
+        let service = data.service.read().await;
         if !service.is_client_id_valid(client_id) {
             return error_response(format!("Unknown client_id {client_id}"));
         }
         if let Some(response) = authorize_client(&req, client_id, &service) {
             return response;
         }
+    }
+
+    if let Err(description) = Service::refresh_client_chain_state(&data.service, client_id).await {
+        log::warn!("refresh_client_chain_state failed: {}", description);
+        return error_response(description);
+    }
+
+    let (blockchain, prepared) = {
+        let mut service = data.service.write().await;
 
         if let Some(description) = service.funding_balance_error(&fund_request) {
             log::info!("insufficient funds: {}", &description);
