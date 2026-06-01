@@ -33,6 +33,7 @@ The FS is designed to be as simple as possible, in that light it:
 * FS supports optional per-client API key authentication and an optional admin key for `POST /client`. Clients without an `api_key` rely on network isolation (firewalls, private networks, reverse proxies). See [Configuration](docs/Configuration.md) and [Supported endpoints](docs/SupportedEndpoints.md).
 * FS supports secret references (`env:VAR`), environment variable overrides, and `wif_env` / `api_key_env` when adding clients at runtime. See [Configuration](docs/Configuration.md#secret-management).
 * FS supports optional per-IP HTTP rate limiting (disabled by default). See [Configuration](docs/Configuration.md#rate-limiting).
+* FS supports optional OpenTelemetry trace export via OTLP (disabled by default). Each HTTP request creates a span; traces include resource metadata and request fields but not secrets or request bodies. See [Configuration](docs/Configuration.md#telemetry).
 
 ## Use cases
 
@@ -138,7 +139,7 @@ To build and publish the image to Docker Hub, run the following command:
 For details of the REST API endpoints provided by this service see [here](docs/SupportedEndpoints.md)
 
 ## Configuration
-For service and client configuration, including per-client `api_key` authentication, see [here](docs/Configuration.md)
+For service and client configuration, including per-client `api_key` authentication and optional OpenTelemetry, see [here](docs/Configuration.md)
 
 ## Project status
 For architecture, implementation status, and known limitations, see [Project.md](docs/Project.md)

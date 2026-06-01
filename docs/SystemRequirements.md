@@ -8,7 +8,7 @@ For API behaviour see [SupportedEndpoints.md](SupportedEndpoints.md). For config
 
 These requirements apply to the Financing Service (FS) as delivered in this repository: a REST API that creates Bitcoin SV funding transaction outpoints for configured client wallets.
 
-**In scope:** REST API, wallet/funding logic, blockchain interfaces (WhatsOnChain, UaaS, test), configuration, authentication, rate limiting, Docker deployment, and CI quality gates.
+**In scope:** REST API, wallet/funding logic, blockchain interfaces (WhatsOnChain, UaaS, test), configuration, authentication, rate limiting, optional OpenTelemetry trace export, Docker deployment, and CI quality gates.
 
 **Out of scope:** HTTPS termination (deployment layer), HD (BIP-32) wallets, client-side funding-transaction caching, trusted-proxy rate-limit key extraction, and rollback of on-chain transactions after partial `multiple_tx` failure.
 
@@ -99,6 +99,17 @@ Requirement IDs appear in test function names (for example `sr_fund_008_*`) or a
 | SR-CFG-004 | Rate limiting configuration with `enabled = true` and invalid `requests_per_second` (zero) SHALL fail validation at startup. | Must | **AT:** `config::tests::rate_limit_config_rejects_zero_requests_per_second_when_enabled` |
 | SR-CFG-005 | The Docker image SHALL include a health check against `GET /health`. | Must | **AT:** `system_requirements::tests::sr_cfg_005_dockerfile_healthcheck_calls_health_endpoint` |
 | SR-CFG-006 | Logging level SHALL be configurable via `[logging].level`. | Must | **AT:** `config::tests::sr_cfg_006_get_log_level_accepts_configured_levels` |
+| SR-CFG-007 | Telemetry configuration SHALL be validated at startup. | Must | **AT:** `config::tests::sr_cfg_007_load_config_validates_telemetry_config` |
+
+## Observability requirements — OpenTelemetry
+
+| ID | Requirement | Priority | Verification |
+|----|-------------|----------|--------------|
+| SR-TELE-001 | OpenTelemetry trace export via OTLP SHALL be optional and disabled by default. | Must | **AT:** `telemetry::tests::telemetry_defaults_to_disabled_without_otel_exporter_env` |
+| SR-TELE-002 | When telemetry export is enabled, the service SHALL create a trace span per HTTP request. | Must | **AT:** `system_requirements::tests::sr_tele_002_main_wraps_tracing_logger` |
+| SR-TELE-003 | Telemetry SHALL be configurable via `[telemetry]` and standard `OTEL_*` environment variables. | Must | **AT:** `telemetry::tests::otel_traces_exporter_env_enables_telemetry`, `effective_service_name_prefers_otel_service_name_env`, `effective_otlp_endpoint_uses_standard_env_vars` |
+| SR-TELE-004 | Enabled export SHALL attach `service.name` and `service.version` resource attributes to traces. | Must | **AT:** `system_requirements::tests::sr_tele_004_telemetry_sets_service_resource_attributes` |
+| SR-TELE-005 | Telemetry behaviour SHALL be documented in Configuration.md and README.md. | Must | **AT:** `system_requirements::tests::sr_tele_005_readme_and_configuration_document_opentelemetry` |
 
 ## Non-functional requirements
 
@@ -122,6 +133,7 @@ Requirement IDs appear in test function names (for example `sr_fund_008_*`) or a
 | SR-LIM-003 | On-chain transactions from partial `multiple_tx` failure cannot be rolled back. | **AT:** `service::tests::partial_broadcast_error_lists_successful_txids` |
 | SR-LIM-004 | Rate limiting behind a reverse proxy applies to the proxy IP unless a custom key extractor is implemented. | **AT:** `rate_limit::tests::sr_lim_004_rate_limit_uses_peer_ip_key_extractor` |
 | SR-LIM-005 | Same-client concurrent funding may contend for the same UTXO; one request may fail and trigger resync. | **AT:** `system_requirements::tests::sr_lim_005_same_client_concurrency_is_covered_by_service_tests`, `service::tests::concurrent_fund_requests_for_same_client_do_not_block` |
+| SR-LIM-006 | OpenTelemetry export is traces only; metrics and OTLP log export are not supported. | **AT:** `system_requirements::tests::sr_lim_006_opentelemetry_exports_traces_only` |
 
 ## Verification summary
 
@@ -134,7 +146,7 @@ cargo audit
 cargo test
 ```
 
-These commands mirror the GitHub Actions workflow (`.github/workflows/rust.yml`). The `cargo test` step executes all requirement tests above (currently **105** tests).
+These commands mirror the GitHub Actions workflow (`.github/workflows/rust.yml`). The `cargo test` step executes all requirement tests above (currently **114** tests).
 
 ## Related documentation
 

@@ -492,4 +492,48 @@ filename = "./data/dynamic.toml"
         let config: Config = toml::from_str(&content).unwrap();
         assert_eq!(config.service.utxo_refresh_period, 60);
     }
+
+    #[test]
+    fn sr_cfg_007_load_config_validates_telemetry_config() {
+        let dir = std::env::temp_dir().join(format!(
+            "financing-service-telemetry-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[blockchain_interface]
+interface_type = "test"
+network_type = "testnet"
+
+[web_interface]
+address = "127.0.0.1"
+port = 8080
+
+[logging]
+level = "info"
+
+[telemetry]
+enabled = true
+otlp_endpoint = ""
+
+[service]
+utxo_refresh_period = 60
+
+[dynamic_config]
+filename = "./data/dynamic.toml"
+"#,
+        )
+        .unwrap();
+
+        unsafe { env::remove_var("FS_CONFIG") };
+        let err = load_config("FS_CONFIG", path.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("telemetry.otlp_endpoint"));
+    }
 }

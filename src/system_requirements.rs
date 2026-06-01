@@ -83,4 +83,38 @@ mod tests {
         let source = include_str!("service.rs");
         assert!(source.contains("concurrent_fund_requests_for_same_client_do_not_block"));
     }
+
+    #[test]
+    fn sr_tele_002_main_wraps_tracing_logger() {
+        let source = include_str!("main.rs");
+        assert!(source.contains("tracing_actix_web::TracingLogger"));
+        assert!(source.contains("telemetry::init"));
+    }
+
+    #[test]
+    fn sr_tele_004_telemetry_sets_service_resource_attributes() {
+        let source = include_str!("telemetry.rs");
+        assert!(source.contains("service.name"));
+        assert!(source.contains("service.version"));
+        assert!(source.contains("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn sr_tele_005_readme_and_configuration_document_opentelemetry() {
+        let readme = std::fs::read_to_string("README.md").unwrap();
+        assert!(readme.contains("OpenTelemetry"));
+        assert!(readme.contains("Configuration.md#telemetry"));
+
+        let configuration = std::fs::read_to_string("docs/Configuration.md").unwrap();
+        assert!(configuration.contains("## [telemetry]"));
+        assert!(configuration.contains("OTEL_EXPORTER_OTLP_ENDPOINT"));
+    }
+
+    #[test]
+    fn sr_lim_006_opentelemetry_exports_traces_only() {
+        let manifest = std::fs::read_to_string("Cargo.toml").unwrap();
+        assert!(manifest.contains("opentelemetry-otlp"));
+        assert!(manifest.contains("features = [\"grpc-tonic\", \"trace\"]"));
+        assert!(!manifest.contains("metrics"));
+    }
 }

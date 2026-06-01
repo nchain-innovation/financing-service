@@ -62,7 +62,7 @@ Admin       ──REST──▶       │                │
 * Docker image with `/health` liveness check
 * CI: build, test, `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo audit`
 * Pinned `chain-gang` git dependency and committed `Cargo.lock` for reproducible builds
-* 105 automated tests (unit, integration, REST API, system requirements)
+* 114 automated tests (unit, integration, REST API, system requirements)
 
 ## Known limitations
 
