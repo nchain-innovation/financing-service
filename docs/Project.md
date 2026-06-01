@@ -46,6 +46,7 @@ Admin       ──REST──▶       │                │
 | `blockchain_factory.rs` | Pluggable blockchain backends |
 | `dynamic_config.rs` | Persist runtime-added clients |
 | `rate_limit.rs` | Per-IP HTTP rate limiting middleware |
+| `telemetry.rs` | Tracing subscriber and OpenTelemetry OTLP export |
 
 ## Implemented
 
@@ -55,6 +56,7 @@ Admin       ──REST──▶       │                │
 * Optional per-client `api_key` authentication
 * Optional `admin_api_key` for `POST /client`
 * Secret references via `env:VAR`, environment overrides, and `wif_env` / `api_key_env` on `POST /client`
+* Optional OpenTelemetry trace export via OTLP (configurable, disabled by default)
 * Configurable per-IP HTTP rate limiting with `/health` exempt
 * Balance checks against total wallet balance; funding combines multiple UTXOs when needed; balance endpoint refreshes from chain on each request; `multiple_tx` partial failures return structured successful transaction data; concurrent fund requests for the same client use read-only planning and commit UTXO updates only after broadcast
 * Docker image with `/health` liveness check

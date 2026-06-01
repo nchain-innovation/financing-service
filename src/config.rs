@@ -29,6 +29,17 @@ pub struct LoggingConfig {
     pub level: String,
 }
 
+/// OpenTelemetry trace export configuration.
+#[derive(Debug, Default, Deserialize, Clone)]
+pub struct TelemetryConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub service_name: Option<String>,
+    #[serde(default)]
+    pub otlp_endpoint: Option<String>,
+}
+
 #[derive(Debug, Default, Deserialize, Clone)]
 pub struct ServiceConfig {
     pub utxo_refresh_period: u64,
@@ -110,6 +121,8 @@ pub struct Config {
     pub blockchain_interface: BlockchainInterfaceConfig,
     pub web_interface: WebInterfaceConfig,
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub telemetry: TelemetryConfig,
     pub service: ServiceConfig,
     pub client: Option<Vec<ClientConfig>>,
     pub dynamic_config: DynamicConfigConfig,
@@ -224,6 +237,7 @@ pub fn web_bind_address(config: &Config) -> (Ipv4Addr, u16) {
 pub fn load_config(env_var: &str, filename: &str) -> Result<Config, String> {
     let config = get_config(env_var, filename)?;
     config.web_interface.rate_limit.validate()?;
+    config.telemetry.validate()?;
     warn_plaintext_secrets(&config);
     config.resolve_secrets()
 }

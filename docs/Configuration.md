@@ -79,6 +79,44 @@ The logging level can be one of:
 * `debug` — detailed information
 * `trace` — very verbose information
 
+## [telemetry]
+
+Optional OpenTelemetry trace export via OTLP (gRPC). Disabled by default.
+
+```toml
+[telemetry]
+enabled = true
+service_name = "financing-service"
+otlp_endpoint = "http://localhost:4317"
+```
+
+* `enabled` — export traces to an OTLP collector (default: `false`)
+* `service_name` — `service.name` resource attribute (default: `financing-service`)
+* `otlp_endpoint` — OTLP gRPC endpoint (default: `http://localhost:4317`)
+
+When enabled, the service:
+
+* Creates a span per HTTP request via `tracing-actix-web` (OpenTelemetry semantic conventions)
+* Exports traces in batches to the configured collector
+* Bridges existing `log` crate output through `tracing` to include `trace_id` in logs
+
+Standard OpenTelemetry environment variables are also supported:
+
+| Variable | Purpose |
+|----------|---------|
+| `OTEL_TRACES_EXPORTER=otlp` | Enable export when `telemetry.enabled` is `false` |
+| `OTEL_SERVICE_NAME` | Overrides `telemetry.service_name` |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Overrides `telemetry.otlp_endpoint` |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | Trace-specific OTLP endpoint |
+
+Example with the OpenTelemetry Collector:
+
+```bash
+docker run -p 4317:4317 otel/opentelemetry-collector:latest
+```
+
+Then enable telemetry in config or set `OTEL_TRACES_EXPORTER=otlp` and `OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317`.
+
 ## [service]
 
 Configures the period between UTXO refresh requests from the blockchain (in seconds).

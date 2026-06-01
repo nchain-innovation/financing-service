@@ -14,6 +14,7 @@ mod responses;
 mod rest_api;
 mod secrets;
 mod service;
+mod telemetry;
 mod util;
 
 #[cfg(test)]
@@ -44,9 +45,9 @@ async fn main() -> std::io::Result<()> {
         std::io::Error::new(std::io::ErrorKind::InvalidData, e)
     })?;
 
-    simple_logger::init_with_level(log_level).map_err(|e| {
-        eprintln!("Unable to initialize logger: {e}");
-        std::io::Error::other(e.to_string())
+    let _telemetry = telemetry::init(&config.telemetry, log_level).map_err(|e| {
+        eprintln!("Unable to initialise telemetry: {e}");
+        std::io::Error::new(std::io::ErrorKind::InvalidData, e)
     })?;
 
     let service = Service::new(&config).await.map_err(|e| {
@@ -99,6 +100,7 @@ async fn main() -> std::io::Result<()> {
     let governor_config = governor_config.clone();
     HttpServer::new(move || {
         App::new()
+            .wrap(tracing_actix_web::TracingLogger::default())
             .wrap(Governor::new(&governor_config))
             .app_data(app_state.clone())
             .service(index)

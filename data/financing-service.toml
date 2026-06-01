@@ -14,6 +14,11 @@ port = 8080
 [logging]
 level = "info"
 
+# [telemetry]
+# enabled = true
+# service_name = "financing-service"
+# otlp_endpoint = "http://localhost:4317"
+
 [service]
 utxo_refresh_period = 60
 
