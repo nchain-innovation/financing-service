@@ -4,20 +4,28 @@ title Financing Service Overview
 interface FS_API
 package "Financing Service" {
     FS_API - [FinancingService] : provides
-    [Chain-Gang\n(BSV library)] 
-    file "configuration\n(financing_service_toml)" as fs_toml
-   
-    [FinancingService] ..> fs_toml: read at startup
+    [Chain-Gang\n(BSV library)]
+    file "configuration\n(financing-service.toml)" as fs_toml
 
+    [FinancingService] ..> fs_toml : read at startup
 }
 
 cloud "Blockchain" {
 }
-[FinancingService] ..> [Chain-Gang\n(BSV library)]: uses
 
-[Chain-Gang\n(BSV library)] ..> [WhatsOnChain] : uses WoCInterface
+[FinancingService] ..> [Chain-Gang\n(BSV library)] : uses
+
+[Chain-Gang\n(BSV library)] ..> [WhatsOnChain] : WoC interface\n(interface_type = woc)
+
+[Chain-Gang\n(BSV library)] ..> [UTXO as a Service\n(UaaS)] : UaaS interface\n(interface_type = uaas)\n<<optional>>
 
 [WhatsOnChain] ..> Blockchain
+[UTXO as a Service\n(UaaS)] ..> Blockchain
 
+note bottom of fs_toml
+  One blockchain interface is selected at startup via
+  [blockchain_interface].interface_type (woc, uaas, or test).
+  UaaS requires a configured service URL.
+end note
 
 @enduml

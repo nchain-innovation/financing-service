@@ -67,7 +67,7 @@ The service reads its configuration on startup, maintains per-client wallet stat
 
 Before returning a balance or building a funding transaction, the service refreshes UTXO state from the blockchain. Concurrent fund requests for the same client use read-only planning under a shared lock and commit UTXO updates only after a transaction is broadcast successfully.
 
-The service uses the `chain-gang` library's WoCInterface to interact with the BSV blockchain.
+The service uses the `chain-gang` library to interact with the BSV blockchain via a configurable interface: WhatsOnChain (WoC) by default in sample config, or optionally UTXO as a Service (UaaS).
 
 
 ## Getting Started
