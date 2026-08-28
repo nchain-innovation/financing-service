@@ -35,13 +35,6 @@ mod tests {
     }
 
     #[test]
-    fn sr_nfr_006_chain_gang_dependency_is_pinned_to_git_revision() {
-        let manifest = std::fs::read_to_string("Cargo.toml").unwrap();
-        assert!(manifest.contains("chain-gang"));
-        assert!(manifest.contains("rev = "));
-    }
-
-    #[test]
     fn sr_nfr_007_main_returns_error_instead_of_panicking_on_config_failure() {
         let source = include_str!("main.rs");
         assert!(

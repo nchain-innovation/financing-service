@@ -16,7 +16,7 @@ hex = "0.4.3"
 async-mutex = "1.4.1"
 async-trait = "0.1.92"
 http = "1.5.0"
-chain-gang = { version = "0.8.0", git = "https://github.com/nchain-innovation/chain-gang.git", rev = "793e37d4da5cfd8cacfcbf8f635c37ab3b410de9", features = ["interface"] }
+chain-gang = { version = "0.10.1", features = ["interface"] }
 log = { version = "0.4.34", features = ["max_level_trace", "release_max_level_warn"] }
 opentelemetry = { version = "0.32", features = ["trace"] }
 opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic", "trace"] }
