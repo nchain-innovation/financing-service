@@ -245,7 +245,7 @@ pub fn load_config(env_var: &str, filename: &str) -> Result<Config, String> {
 
 /// Read the config from the provided file
 fn read_config(filename: &str) -> Result<Config, String> {
-    debug!("read_config = {}", &filename);
+    debug!("read_config = {}", filename);
     // Given filename read the config
     let content = std::fs::read_to_string(filename).map_err(|e| e.to_string())?;
     let config = toml::from_str(&content).map_err(|e| e.to_string())?;
