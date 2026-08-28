@@ -6,7 +6,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-actix-web = "4.15.0"
+actix-web = { version = "4.15.0", default-features = false, features = ["macros", "compress-brotli", "compress-gzip", "compress-zstd", "cookies", "unicode", "compat", "ws"] }
 serde = { version = "1.0.229", features =["derive"] }
 toml = "1.1.4"
 serde_json = "1.0.151"
