@@ -145,8 +145,11 @@ impl TelemetryConfig {
 mod tests {
     use super::*;
 
+    use crate::test_support::env_lock;
+
     #[test]
     fn telemetry_defaults_to_disabled_without_otel_exporter_env() {
+        let _env = env_lock();
         unsafe { env::remove_var("OTEL_TRACES_EXPORTER") };
         let config = TelemetryConfig::default();
         assert!(!config.is_enabled());
@@ -154,6 +157,7 @@ mod tests {
 
     #[test]
     fn otel_traces_exporter_env_enables_telemetry() {
+        let _env = env_lock();
         unsafe { env::set_var("OTEL_TRACES_EXPORTER", "otlp") };
         let config = TelemetryConfig::default();
         assert!(config.is_enabled());
@@ -162,6 +166,7 @@ mod tests {
 
     #[test]
     fn effective_service_name_prefers_otel_service_name_env() {
+        let _env = env_lock();
         unsafe { env::set_var("OTEL_SERVICE_NAME", "from-env") };
         let config = TelemetryConfig {
             service_name: Some("from-config".to_string()),
@@ -173,6 +178,7 @@ mod tests {
 
     #[test]
     fn effective_otlp_endpoint_uses_standard_env_vars() {
+        let _env = env_lock();
         unsafe { env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4317") };
         let config = TelemetryConfig::default();
         assert_eq!(
