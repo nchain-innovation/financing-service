@@ -1,6 +1,6 @@
 use std::sync::{
     atomic::{AtomicU32, Ordering},
-    Arc,
+    Arc, Mutex, MutexGuard,
 };
 
 use async_trait::async_trait;
@@ -12,6 +12,19 @@ use chain_gang::{
 };
 
 use crate::config::{BlockchainInterfaceConfig, ClientConfig, Config, DynamicConfigConfig};
+
+/// Serialises the tests that mutate environment variables. The environment is
+/// process-global state shared by every test thread, so without this one test
+/// can set or remove a variable inside another test's window.
+static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+/// Takes the environment lock, ignoring poisoning so that a panic in one test
+/// does not cascade into every other test that touches the environment.
+pub fn env_lock() -> MutexGuard<'static, ()> {
+    ENV_MUTEX
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 pub const TEST_WIF: &str = "cTYmKQzX3CvHJAxe2sctsQaHG8ktiEnpXgyyycVXGg5pRcLJEeLd";
 pub const TEST_CLIENT_ID: &str = "id1";

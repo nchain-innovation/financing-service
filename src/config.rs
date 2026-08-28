@@ -272,8 +272,11 @@ mod tests {
     use super::*;
     use chain_gang::network::Network;
 
+    use crate::test_support::env_lock;
+
     #[test]
     fn resolve_secrets_replaces_env_references() {
+        let _env = env_lock();
         unsafe { env::set_var("FS_TEST_CONFIG_WIF", "test-wif-value") };
         unsafe { env::set_var("FS_TEST_CONFIG_API_KEY", "test-api-key") };
         unsafe { env::set_var("FS_TEST_CONFIG_ADMIN", "admin-from-env") };
@@ -306,6 +309,7 @@ mod tests {
 
     #[test]
     fn resolve_secrets_applies_client_env_overrides() {
+        let _env = env_lock();
         unsafe { env::set_var("FS_CLIENT_ID1_WIF", "override-wif") };
         let config = Config {
             client: Some(vec![ClientConfig {
@@ -322,6 +326,7 @@ mod tests {
 
     #[test]
     fn sr_sec_008_resolve_secrets_applies_client_api_key_env_override() {
+        let _env = env_lock();
         unsafe { env::set_var("FS_CLIENT_ID1_API_KEY", "override-api-key") };
         let config = Config {
             client: Some(vec![ClientConfig {
@@ -355,6 +360,7 @@ mod tests {
 
     #[test]
     fn sr_cfg_001_load_config_reads_toml_file() {
+        let _env = env_lock();
         let dir = std::env::temp_dir().join(format!(
             "financing-service-cfg-{}-{}",
             std::process::id(),
@@ -396,6 +402,7 @@ filename = "./data/dynamic.toml"
 
     #[test]
     fn sr_cfg_002_get_config_reads_fs_config_json() {
+        let _env = env_lock();
         unsafe {
             env::set_var(
                 "FS_CONFIG",
@@ -409,6 +416,7 @@ filename = "./data/dynamic.toml"
 
     #[test]
     fn sr_cfg_003_web_bind_address_uses_all_interfaces_in_docker() {
+        let _env = env_lock();
         unsafe { env::set_var("APP_ENV", "docker") };
         let config = Config {
             web_interface: WebInterfaceConfig {
@@ -481,6 +489,7 @@ filename = "./data/dynamic.toml"
 
     #[test]
     fn sr_nfr_007_load_config_returns_error_for_invalid_file() {
+        let _env = env_lock();
         unsafe { env::remove_var("FS_CONFIG") };
         let err = load_config("FS_CONFIG", "definitely-missing-config.toml").unwrap_err();
         assert!(err.contains("Error reading config file"));
@@ -495,6 +504,7 @@ filename = "./data/dynamic.toml"
 
     #[test]
     fn sr_cfg_007_load_config_validates_telemetry_config() {
+        let _env = env_lock();
         let dir = std::env::temp_dir().join(format!(
             "financing-service-telemetry-{}-{}",
             std::process::id(),
