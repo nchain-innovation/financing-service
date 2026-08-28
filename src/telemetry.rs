@@ -4,7 +4,7 @@ use log::Level;
 use opentelemetry::{global, trace::TracerProvider as _, KeyValue};
 use opentelemetry_otlp::{SpanExporter, WithExportConfig};
 use opentelemetry_sdk::{
-    propagation::TraceContextPropagator, resource::Resource, runtime, trace::TracerProvider,
+    propagation::TraceContextPropagator, resource::Resource, trace::SdkTracerProvider,
 };
 use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -13,7 +13,7 @@ use crate::config::TelemetryConfig;
 
 /// Keeps the tracer provider alive and flushes spans on shutdown.
 pub struct TelemetryGuard {
-    provider: TracerProvider,
+    provider: SdkTracerProvider,
 }
 
 impl Drop for TelemetryGuard {
@@ -49,13 +49,15 @@ pub fn init(config: &TelemetryConfig, log_level: Level) -> Result<Option<Telemet
         .build()
         .map_err(|e| format!("failed to create OTLP trace exporter: {e}"))?;
 
-    let resource = Resource::new(vec![
-        KeyValue::new("service.name", service_name.clone()),
-        KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
-    ]);
+    let resource = Resource::builder()
+        .with_attributes(vec![
+            KeyValue::new("service.name", service_name.clone()),
+            KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
+        ])
+        .build();
 
-    let provider = TracerProvider::builder()
-        .with_batch_exporter(exporter, runtime::Tokio)
+    let provider = SdkTracerProvider::builder()
+        .with_batch_exporter(exporter)
         .with_resource(resource)
         .build();
 
@@ -81,8 +83,12 @@ pub fn init(config: &TelemetryConfig, log_level: Level) -> Result<Option<Telemet
 }
 
 fn bridge_log_crate() -> Result<(), String> {
-    tracing_log::LogTracer::init()
-        .map_err(|e| format!("failed to bridge log crate to tracing: {e}"))
+    // `try_init()` above already installs the log -> tracing bridge via
+    // tracing-subscriber's `tracing-log` feature, so this call is a no-op that
+    // reports "logger already initialised". Ignore that and keep the bridge for
+    // the case where the feature is ever turned off.
+    let _ = tracing_log::LogTracer::init();
+    Ok(())
 }
 
 fn log_level_filter(level: Level) -> &'static str {

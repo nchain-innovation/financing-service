@@ -34,7 +34,7 @@ impl DynamicConfig {
         let contents: FileContents = match read_dynamic_config(&filename) {
             Ok(contents) => contents,
             Err(e) => {
-                println!("Dynamic Config Error {:?} in {}", e, &filename);
+                println!("Dynamic Config Error {:?} in {}", e, filename);
                 FileContents::default()
             }
         };

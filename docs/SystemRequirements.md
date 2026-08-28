@@ -120,7 +120,6 @@ Requirement IDs appear in test function names (for example `sr_fund_008_*`) or a
 | SR-NFR-003 | Dependencies SHALL pass `cargo audit` without known vulnerabilities (or with documented exceptions). | Must | **AT:** `system_requirements::tests::sr_nfr_003_ci_runs_cargo_audit` |
 | SR-NFR-004 | All automated tests SHALL pass on supported platforms in CI. | Must | **AT:** `system_requirements::tests::sr_nfr_004_ci_runs_cargo_test` |
 | SR-NFR-005 | `Cargo.lock` SHALL be committed for reproducible builds. | Must | **AT:** `system_requirements::tests::sr_nfr_005_cargo_lock_is_committed` |
-| SR-NFR-006 | The `chain-gang` dependency SHALL be pinned to a specific git revision. | Must | **AT:** `system_requirements::tests::sr_nfr_006_chain_gang_dependency_is_pinned_to_git_revision` |
 | SR-NFR-007 | Startup configuration or secret resolution errors SHALL return an error from `main` rather than panic. | Must | **AT:** `system_requirements::tests::sr_nfr_007_main_returns_error_instead_of_panicking_on_config_failure`, `config::tests::sr_nfr_007_load_config_returns_error_for_invalid_file` |
 | SR-NFR-008 | The service SHALL maintain an in-memory UTXO cache per client and persist runtime-added clients to the dynamic config file. | Must | **AT:** `dynamic_config::tests::sr_clnt_004_and_sr_nfr_008_add_client_persists_to_dynamic_config_file`, `sr_nfr_008_remove_client_updates_dynamic_config_file`, `client::tests::sr_fund_010_plan_funding_tx_leaves_utxo_cache_unchanged_until_commit` |
 
