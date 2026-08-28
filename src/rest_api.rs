@@ -137,7 +137,7 @@ pub async fn get_funds(
             ));
         }
     };
-    debug!("locking_script_as_bytes = {:?}", &locking_script_as_bytes);
+    debug!("locking_script_as_bytes = {:?}", locking_script_as_bytes);
 
     let fund_request = FundRequest {
         client_id: client_id.to_string(),
@@ -166,7 +166,7 @@ pub async fn get_funds(
                 Err(description) => error_response(description),
             },
             Err(error) => {
-                debug!("fund_with_multiple_transactions error = {:?}", &error);
+                debug!("fund_with_multiple_transactions error = {:?}", error);
                 if let Some(partial) = error.partial {
                     match partial.to_response() {
                         Ok(response) => {
@@ -182,7 +182,7 @@ pub async fn get_funds(
     }
 
     if let Some(description) = data.service.funding_balance_error(&fund_request).await {
-        log::info!("insufficient funds: {}", &description);
+        log::info!("insufficient funds: {}", description);
         return error_response(description);
     }
 
@@ -192,7 +192,7 @@ pub async fn get_funds(
             Err(description) => error_response(description),
         },
         Err(description) => {
-            debug!("execute_funding error = {:?}", &description);
+            debug!("execute_funding error = {:?}", description);
             error_response(description)
         }
     }
@@ -241,7 +241,7 @@ pub async fn delete_client(
     info: web::Path<String>,
 ) -> impl Responder {
     let client_id: String = info.to_string();
-    log::info!("delete_client {}", &client_id);
+    log::info!("delete_client {}", client_id);
 
     if !data.service.is_client_id_valid(&client_id).await {
         return error_response(format!("Unknown client_id {client_id}"));
@@ -264,7 +264,7 @@ pub async fn get_address(
     info: web::Path<String>,
 ) -> impl Responder {
     let client_id: String = info.to_string();
-    log::info!("get address {}", &client_id);
+    log::info!("get address {}", client_id);
 
     if !data.service.is_client_id_valid(&client_id).await {
         return error_response(format!("Unknown client_id {client_id}"));
@@ -287,7 +287,7 @@ pub async fn balance(
     info: web::Path<String>,
 ) -> impl Responder {
     let client_id: String = info.to_string();
-    log::info!("get balance {}", &client_id);
+    log::info!("get balance {}", client_id);
 
     if !data.service.is_client_id_valid(&client_id).await {
         return error_response(format!("Unknown client_id {client_id}"));
@@ -815,7 +815,7 @@ mod tests {
         let body: Value = test::read_body_json(resp).await;
         assert_eq!(body["outpoints"].as_array().unwrap().len(), 1);
         assert_eq!(body["txs"].as_array().unwrap().len(), 1);
-        assert!(body["outpoints"][0]["hash"].as_str().unwrap().len() > 0);
+        assert!(!body["outpoints"][0]["hash"].as_str().unwrap().is_empty());
     }
 
     #[actix_web::test]
