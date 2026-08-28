@@ -83,8 +83,12 @@ pub fn init(config: &TelemetryConfig, log_level: Level) -> Result<Option<Telemet
 }
 
 fn bridge_log_crate() -> Result<(), String> {
-    tracing_log::LogTracer::init()
-        .map_err(|e| format!("failed to bridge log crate to tracing: {e}"))
+    // `try_init()` above already installs the log -> tracing bridge via
+    // tracing-subscriber's `tracing-log` feature, so this call is a no-op that
+    // reports "logger already initialised". Ignore that and keep the bridge for
+    // the case where the feature is ever turned off.
+    let _ = tracing_log::LogTracer::init();
+    Ok(())
 }
 
 fn log_level_filter(level: Level) -> &'static str {
