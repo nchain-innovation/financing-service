@@ -1,0 +1,47 @@
+# Overlay: reach a wild-bit-lab node by container name.
+#
+#   docker compose -f docker/docker-compose.yml \
+#                  -f docker/woc/docker-compose.wbl.yml \
+#                  --profile woc up --build
+#
+# wild-bit-lab publishes node RPC on host 18332 but not ZMQ on 28332, so the
+# base file's WOC_BSV_HOST=host.docker.internal cannot reach the ZMQ feed no
+# matter how the node is configured. This overlay attaches the woc services that
+# talk to the node to wild-bit-lab's own network and addresses it as `node1`,
+# where both RPC and ZMQ are reachable on the container ports.
+#
+# The network is declared external: if wild-bit-lab is not running you get an
+# immediate `network regtest_network ... could not be found` rather than a
+# half-started stack, and `down` here never removes it -- wild-bit-lab owns it.
+#
+# Each service below re-lists `default` alongside `wbl`: a service-level
+# `networks` key in an overlay replaces the implicit default membership, and
+# dropping it would cut the service off from scylla, rabbitmq and aerospikedb.
+#
+# See docker/README.md, "Local Development Against wild-bit-lab".
+
+services:
+  woc-api:
+    networks: [default, wbl]
+    environment:
+      BSV_host: "${WOC_BSV_HOST:-node1}"
+
+  utxo-store:
+    networks: [default, wbl]
+    environment:
+      bitcoind_host: "${WOC_BSV_HOST:-node1}"
+
+  utxos-mempool:
+    networks: [default, wbl]
+    environment:
+      bitcoind_host: "${WOC_BSV_HOST:-node1}"
+
+  chain-listener:
+    networks: [default, wbl]
+    environment:
+      public_hosts: "node-local:${WOC_BSV_HOST:-node1}:${WOC_BSV_ZMQ_PORT:-28332}"
+
+networks:
+  wbl:
+    external: true
+    name: "${WBL_NETWORK:-regtest_network}"

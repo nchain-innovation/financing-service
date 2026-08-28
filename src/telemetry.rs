@@ -34,7 +34,6 @@ pub fn init(config: &TelemetryConfig, log_level: Level) -> Result<Option<Telemet
             .with(tracing_subscriber::fmt::layer())
             .try_init()
             .map_err(|e| format!("failed to initialise tracing subscriber: {e}"))?;
-        bridge_log_crate()?;
         return Ok(None);
     }
 
@@ -70,7 +69,6 @@ pub fn init(config: &TelemetryConfig, log_level: Level) -> Result<Option<Telemet
         .try_init()
         .map_err(|e| format!("failed to initialise tracing subscriber: {e}"))?;
 
-    bridge_log_crate()?;
     log::info!(
         "OpenTelemetry enabled (service.name={}, otlp.endpoint={})",
         service_name,
@@ -78,11 +76,6 @@ pub fn init(config: &TelemetryConfig, log_level: Level) -> Result<Option<Telemet
     );
 
     Ok(Some(TelemetryGuard { provider }))
-}
-
-fn bridge_log_crate() -> Result<(), String> {
-    tracing_log::LogTracer::init()
-        .map_err(|e| format!("failed to bridge log crate to tracing: {e}"))
 }
 
 fn log_level_filter(level: Level) -> &'static str {
@@ -138,6 +131,25 @@ impl TelemetryConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression test: `init` used to call `LogTracer::init` after `try_init`
+    /// had already installed the bridge, so startup failed with
+    /// "attempted to set a logger after the logging system was already initialized".
+    ///
+    /// This installs the process-global subscriber, so it must be the only test
+    /// in this binary that calls `init`.
+    #[test]
+    fn init_succeeds_with_telemetry_disabled() {
+        unsafe { env::remove_var("OTEL_TRACES_EXPORTER") };
+        let config = TelemetryConfig::default();
+        assert!(!config.is_enabled());
+
+        let guard = init(&config, Level::Info).expect("telemetry init failed");
+        assert!(guard.is_none(), "no OTLP guard expected when export is off");
+
+        // The log crate must reach tracing rather than being unbridged.
+        assert!(log::log_enabled!(Level::Info));
+    }
 
     #[test]
     fn telemetry_defaults_to_disabled_without_otel_exporter_env() {

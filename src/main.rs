@@ -16,6 +16,7 @@ mod secrets;
 mod service;
 mod telemetry;
 mod util;
+mod woc_interface;
 
 #[cfg(test)]
 mod test_support;

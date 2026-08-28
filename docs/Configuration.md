@@ -17,7 +17,39 @@ network_type = "testnet"
 # url = "http://localhost:5010"  # required for uaas
 ```
 
-Supported `network_type` values: `mainnet`, `testnet`, `stn`.
+Supported `network_type` values: `mainnet`, `testnet`, `stn`, `regtest`.
+
+`regtest` maps onto chain-gang's testnet network: chain-gang has no dedicated regtest variant, and regtest
+shares testnet's base58 version bytes (`0x6f` for P2PKH, `0xc4` for P2SH), so WIFs and addresses encode
+correctly against a regtest chain.
+
+`url` names the node or service to connect to. It is consumed by `interface_type = "uaas"`, and by
+`interface_type = "woc"` to select **which** WhatsOnChain instance to use:
+
+| `url` | Behaviour |
+| --- | --- |
+| unset | Public WhatsOnChain (`https://api.whatsonchain.com`), via this crate's `WocPublicInterface` |
+| set | A self-hosted woc-api at that base URL, via this crate's `WocLocalInterface` |
+
+The two are separate implementations of this crate's `WocInterface` trait because they speak different
+dialects: public WhatsOnChain serves `/v1/bsv/{network}/...`, while a self-hosted instance serves one network
+and drops that prefix. Both are driven by the same `WocClient`. The service logs which one it selected at
+startup.
+
+Inside Docker the URL is the Compose service name and container port; from a host `cargo run` it is the
+published port:
+
+```toml
+[blockchain_interface]
+interface_type = "woc"
+network_type = "regtest"
+url = "http://woc-api:8084"      # in Docker
+# url = "http://localhost:5010"  # host `cargo run`
+```
+
+The client WIF must match the network — a mainnet WIF against a regtest instance yields a mainnet address
+that the instance rejects. See [docker/README.md](../docker/README.md) for the stack that provides a local
+node and WoC.
 
 ## [web_interface]
 

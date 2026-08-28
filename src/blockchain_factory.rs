@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
-use chain_gang::interface::{BlockchainInterface, TestInterface, UaaSInterface, WocInterface};
+use chain_gang::interface::{BlockchainInterface, TestInterface, UaaSInterface};
 
 use crate::config::Config;
+use crate::woc_interface::{WocClient, WocLocalInterface, WocPublicInterface};
 
 /// Takes a config and returns the appropriate configured object that implements BlockchainInterface
 pub fn blockchain_factory(
@@ -13,11 +14,20 @@ pub fn blockchain_factory(
         .map_err(|_| "Unable to decode network from config".to_string())?;
 
     match config.blockchain_interface.interface_type.as_str() {
-        "woc" => {
-            let mut interface = WocInterface::new();
-            interface.set_network(&network);
-            Ok(Arc::new(interface))
-        }
+        "woc" => match config.blockchain_interface.url.as_deref() {
+            Some(url) if !url.is_empty() => {
+                log::info!("using self-hosted WhatsOnChain at {url}");
+                let mut client = WocClient::new(WocLocalInterface::new(url));
+                client.set_network(&network);
+                Ok(Arc::new(client))
+            }
+            _ => {
+                log::info!("using public WhatsOnChain");
+                let mut client = WocClient::new(WocPublicInterface::new());
+                client.set_network(&network);
+                Ok(Arc::new(client))
+            }
+        },
         "test" => {
             let mut interface = TestInterface::new();
             interface.set_network(&network);

@@ -142,6 +142,7 @@ impl Config {
             "mainnet" => Ok(Network::BSV_Mainnet),
             "testnet" => Ok(Network::BSV_Testnet),
             "stn" => Ok(Network::BSV_STN),
+            "regtest" => Ok(Network::BSV_Testnet),
             _ => Err("unable to decode network"),
         }
     }
@@ -442,11 +443,12 @@ filename = "./data/dynamic.toml"
     }
 
     #[test]
-    fn sr_bchn_002_get_network_supports_mainnet_testnet_and_stn() {
+    fn sr_bchn_002_get_network_supports_mainnet_testnet_stn_and_regtest() {
         for (network_type, expected) in [
             ("mainnet", Network::BSV_Mainnet),
             ("testnet", Network::BSV_Testnet),
             ("stn", Network::BSV_STN),
+            ("regtest", Network::BSV_Testnet),
         ] {
             let config = Config {
                 blockchain_interface: BlockchainInterfaceConfig {
@@ -457,6 +459,18 @@ filename = "./data/dynamic.toml"
             };
             assert_eq!(config.get_network().unwrap(), expected);
         }
+    }
+
+    #[test]
+    fn sr_bchn_002_get_network_rejects_unknown_network_type() {
+        let config = Config {
+            blockchain_interface: BlockchainInterfaceConfig {
+                network_type: "nosuchnet".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(config.get_network(), Err("unable to decode network"));
     }
 
     #[test]

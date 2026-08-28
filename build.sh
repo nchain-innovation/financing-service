@@ -1,3 +1,3 @@
 #!/bin/bash
 
-docker build --tag "financing-service-rust" --file Dockerfile .
+docker build --tag "financing-service-rust" --file docker/Dockerfile .

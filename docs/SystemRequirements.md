@@ -67,7 +67,7 @@ Requirement IDs appear in test function names (for example `sr_fund_008_*`) or a
 | ID | Requirement | Priority | Verification |
 |----|-------------|----------|--------------|
 | SR-BCHN-001 | The service SHALL support blockchain backends `woc`, `uaas`, and `test` via configuration. | Must | **AT:** `blockchain_factory::tests::sr_bchn_001_blockchain_factory_supports_woc_test_and_uaas`, `sr_bchn_001_blockchain_factory_rejects_unknown_interface_type` |
-| SR-BCHN-002 | The service SHALL support network types `mainnet`, `testnet`, and `stn`. | Must | **AT:** `config::tests::sr_bchn_002_get_network_supports_mainnet_testnet_and_stn` |
+| SR-BCHN-002 | The service SHALL support network types `mainnet`, `testnet`, `stn`, and `regtest` (which maps onto testnet, as chain-gang has no regtest variant and regtest shares testnet's base58 version bytes). | Must | **AT:** `config::tests::sr_bchn_002_get_network_supports_mainnet_testnet_stn_and_regtest`, `config::tests::sr_bchn_002_get_network_rejects_unknown_network_type` |
 | SR-BCHN-003 | The service SHALL periodically refresh all client UTXO balances at the interval configured by `service.utxo_refresh_period` (seconds). | Must | **AT:** `config::tests::sr_bchn_003_sample_config_sets_utxo_refresh_period` |
 | SR-BCHN-004 | `/health` SHALL NOT depend on blockchain connectivity (liveness only). | Must | **AT:** `rest_api::tests::test_health` |
 

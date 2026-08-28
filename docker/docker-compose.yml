@@ -1,0 +1,232 @@
+# Build and run the financing service.
+#
+#   docker compose -f docker/docker-compose.yml up --build
+#
+# The build context is the project root, so the compose file can be run from
+# anywhere in the repository.
+#
+# This file on its own is self-contained: it needs nothing but Docker.
+#
+# A local WhatsOnChain stack is available behind the `woc` profile, which is
+# inactive unless it is asked for by name:
+#
+#   docker compose -f docker/docker-compose.yml --profile woc up --build
+#
+# For local development against a BSV regtest node, the nodes themselves are run
+# manually from the wild-bit-lab repository -- nothing here starts one. See
+# docker/README.md.
+
+name: financing-service
+
+services:
+  financing-service:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: financing-service
+    container_name: financing-service
+    restart: unless-stopped
+    ports:
+      # Published port is overridable so the full wild-bit-lab stack can run
+      # alongside: its block explorer also publishes host 8080. The container
+      # port and the image's baked HEALTHCHECK stay on 8080 either way.
+      - "${FS_HTTP_PORT:-8080}:8080"
+    volumes:
+      # Config and dynamic client state. APP_ENV=docker (set in the image)
+      # makes the service listen on 0.0.0.0 regardless of web_interface.address.
+      - ../data:/app/bin/data
+    environment:
+      # The service reads data/financing-service.toml from the mounted volume.
+      # Set FS_CONFIG to supply the whole config inline as JSON instead.
+      # Secrets are passed through from the host environment or docker/.env when
+      # set, and left unset otherwise so that `env:VAR_NAME` references in the
+      # config still resolve. Add one line per client as needed, e.g.
+      # FS_CLIENT_ID1_WIF, FS_CLIENT_ID1_API_KEY.
+      - FS_ADMIN_API_KEY
+      # OpenTelemetry export (only used when [telemetry] is enabled in config).
+      # - OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://otel-collector:4317
+    env_file:
+      - path: .env
+        required: false
+
+  # ---------------------------------------------------------------------------
+  # WhatsOnChain profile (`--profile woc`)
+  # ---------------------------------------------------------------------------
+  # A local WhatsOnChain API stack, ported from the woc-stack reference. Every
+  # service below is gated behind the `woc` profile, so the base stack above is
+  # unaffected unless the profile is explicitly requested:
+  #
+  #   docker compose -f docker/docker-compose.yml --profile woc up --build
+  #
+  # The stack indexes an existing BSV node -- it does not run one. Point it at
+  # your node with WOC_BSV_HOST; the default reaches a node on the Docker host.
+  # See docker/README.md.
+
+  woc-api:
+    image: ghcr.io/teranode-group/woc-api
+    container_name: woc-api
+    platform: linux/amd64
+    pull_policy: always
+    restart: unless-stopped
+    profiles: ["woc"]
+    ports:
+      # The image serves on 8084; only the host side is adjustable.
+      - "${WOC_API_PORT:-5010}:8084"
+    environment:
+      log_level: "info"
+      redis_cache_enabled: false
+      BSV_host: "${WOC_BSV_HOST:-host.docker.internal}"
+      BSV_port: "${WOC_BSV_PORT:-18332}"
+      mongoCache: false
+      opReturnSearch: false
+      bstoreAddress: bstore:7021
+      utxoStorePriorityForUI: false
+      woc_stats_enabled: false
+      woc_stats_address: woc-stats:7020
+      utxoStoreEnabled: true
+      utxosMempoolEnabled: true
+      utxoStoreAddress: utxo-store:7031
+      utxosMempoolAddress: utxos-mempool:7213
+      block_headers_save_enabled: true
+      block_headers_save_latest_enabled: true
+      block_headers_save_to_file_timer: 3
+      bstoreEnabled: false
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - utxo-store
+      - utxos-mempool
+
+  utxo-store:
+    image: ghcr.io/teranode-group/utxo-store-v3
+    container_name: utxo-store
+    platform: linux/amd64
+    pull_policy: always
+    restart: unless-stopped
+    profiles: ["woc"]
+    volumes:
+      - woc-utxo-store:/app/data
+    depends_on:
+      scylla:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      log_level: "info"
+      scylla_host: scylla
+      rabbit_mq_url: amqp://guest:guest@rabbitmq:5672
+      bitcoind_host: "${WOC_BSV_HOST:-host.docker.internal}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  utxos-mempool:
+    image: ghcr.io/teranode-group/utxos-mempool
+    container_name: utxos-mempool
+    platform: linux/amd64
+    pull_policy: always
+    restart: unless-stopped
+    profiles: ["woc"]
+    depends_on:
+      aerospikedb:
+        condition: service_healthy
+    environment:
+      log_level: "error"
+      aerospike_address: aerospikedb:3000
+      bitcoind_host: "${WOC_BSV_HOST:-host.docker.internal}"
+      bitcoind_port: "${WOC_BSV_PORT:-18332}"
+      bitcoind_password: "${WOC_BSV_PASSWORD:-bitcoin}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  chain-listener:
+    image: ghcr.io/teranode-group/chain-listener
+    container_name: chain-listener
+    platform: linux/amd64
+    pull_policy: always
+    restart: unless-stopped
+    profiles: ["woc"]
+    volumes:
+      - woc-chain-listener:/app/data
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      log_level: "info"
+      rabbit_mq_url: amqp://guest:guest@rabbitmq:5672
+      # Node ZMQ endpoint, as `<label>:<host>:<port>`.
+      public_hosts: "node-local:${WOC_BSV_HOST:-host.docker.internal}:${WOC_BSV_ZMQ_PORT:-28332}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  scylla:
+    image: scylladb/scylla:5.2
+    container_name: scylla
+    restart: unless-stopped
+    profiles: ["woc"]
+    command: ["--smp", "1", "--memory", "1536M", "--overprovisioned", "1"]
+    volumes:
+      - woc-scylla:/var/lib/scylla
+    healthcheck:
+      # `nodetool status` reports UN as soon as gossip is up, which is seconds
+      # before the CQL transport binds 9042 -- long enough for utxo-store to
+      # start and die on "connection refused". Query over CQL instead, which is
+      # the interface utxo-store actually uses.
+      test: ["CMD-SHELL", "cqlsh -e 'select now() from system.local' >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 60s
+
+  rabbitmq:
+    build:
+      context: woc/rabbitmq
+      dockerfile: Dockerfile
+    container_name: rabbitmq
+    restart: unless-stopped
+    profiles: ["woc"]
+    volumes:
+      - ./woc/rabbitmq/definitions.dev.json:/opt/rabbitmq/definitions.json:ro
+      - ./woc/rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 30s
+      timeout: 30s
+      retries: 3
+
+  aerospikedb:
+    image: aerospike/aerospike-server
+    container_name: aerospikedb
+    restart: unless-stopped
+    profiles: ["woc"]
+    labels:
+      com.aerospike.description: "This label is for all containers for the Aerospike service"
+    # Mounted as a Compose secret, not over /etc/aerospike/aerospike.conf: the
+    # image's entrypoint regenerates that path from its own template on every
+    # start, so a file mounted there is either overwritten or -- when read-only
+    # -- fails the container with "Read-only file system".
+    secrets:
+      - source: aerospike-conf
+        target: aerospike.conf
+    command: ["--config-file", "/run/secrets/aerospike.conf"]
+    healthcheck:
+      test: ["CMD-SHELL", "asinfo -v 'statistics' -h 127.0.0.1 | grep -q 'cluster_size'"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+
+secrets:
+  aerospike-conf:
+    file: woc/aerospike/aerospike.conf
+
+volumes:
+  woc-scylla:
+  woc-utxo-store:
+  woc-chain-listener:

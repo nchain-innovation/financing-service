@@ -51,7 +51,7 @@ mod tests {
 
     #[test]
     fn sr_cfg_005_dockerfile_healthcheck_calls_health_endpoint() {
-        let dockerfile = std::fs::read_to_string("Dockerfile").unwrap();
+        let dockerfile = std::fs::read_to_string("docker/Dockerfile").unwrap();
         assert!(dockerfile.contains("HEALTHCHECK"));
         assert!(dockerfile.contains("/health"));
     }

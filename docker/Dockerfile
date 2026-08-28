@@ -1,6 +1,5 @@
 FROM rust:bookworm AS builder
 
-COPY ./data /app/data
 COPY . /app/rust
 
 WORKDIR /app/rust
@@ -15,7 +14,8 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/bin/financing-service /app/bin/financing-service
-# COPY --from=builder /app/data /app/bin/data
+# data/ is bind-mounted at runtime (see docker/docker-compose.yml); the image
+# only needs the mount point to exist.
 RUN mkdir /app/bin/data
 WORKDIR /app/bin
 

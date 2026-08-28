@@ -76,20 +76,10 @@ The project can either be run as an executable or as a docker container (smallis
 
 
 ## Docker
-Encapsulating the service in Docker removes the need to install the project dependencies on the host machine.
-Only Docker is required to build and run the service.
-### 1) Build The Docker Image
-To build the docker image associated with the service run the following comand in the project directory.
-```bash
-./build.sh
-```
-This builds the Docker image `financing-service-rust`. The image includes a health check against `GET /health`.
-### 2) To Run the Image
-To start the Docker container:
-```bash
-./run.sh
-```
-This will provide a REST API at http://localhost:8080
+Encapsulating the service in Docker removes the need to install the project dependencies on the host
+machine; only Docker is required to build and run the service. The `Dockerfile`, Compose files, and the
+local development profile all live in the [docker](docker) directory, which has its own
+[README](docker/README.md) covering how to build, run, and publish the image.
 
 
 ## To Build the Service
@@ -118,21 +108,6 @@ cargo clippy -- -D warnings
 ```
 
 These checks also run in GitHub Actions on push and pull request.
-
-## Building and Publishing Docker Images
-
-This project creates the Docker image: `financing-service` which is published to Docker Hub.  This makes it accessible for use by other projects and applications within the ecosystem.
-
-To build and publish the image to Docker Hub, run the following command:
-```
-./multi-build.sh
-```
-
-**Requirements**
-
-- **Docker Buildx:** The script requires Docker's Buildx extension to be set as the active builder. Ensure Buildx is properly installed and selected as the current Docker engine. For help, see [Docker Buildx](https://docs.docker.com/build/builders/)  
-
-- **Publishing Permissions:** Only members of the `rndprototyping` team within the `nChain` Docker Hub organisation are authorised to publish images with the appropriate tags. Ensure you are logged in with the necessary permissions before running the script, else this will fail.
 
 
 ## Supported endpoints

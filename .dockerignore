@@ -1,0 +1,9 @@
+/target
+/certs
+/.git
+/.github
+/docs
+/data/dynamic*.toml
+out.txt
+tree.txt
+.DS_Store
