@@ -52,6 +52,10 @@ docker compose -f docker/docker-compose.yml --profile woc up --build
 The WoC API is published at http://localhost:5010. From inside the stack it is `http://woc-api:8084` — the
 container port is fixed by the image, so `WOC_API_PORT` only moves the host side.
 
+Starting the profile does not by itself point the financing service at it: set `network_type` and `url` in
+`data/financing-service.toml` as well, per
+[Pointing the service at the local WoC](#pointing-the-service-at-the-local-woc).
+
 Note the routes carry **no `/v1/bsv/<network>` prefix**, unlike public WhatsOnChain — this build serves a
 single network, so the paths are bare:
 
@@ -156,7 +160,26 @@ Restart the nodes, then confirm REST answers `200`:
 curl -s -o /dev/null -w '%{http_code}\n' http://localhost:18332/rest/chaininfo.json
 ```
 
-### 4. Start the stack with the wild-bit-lab overlay
+### 4. Point the service at the local WoC
+
+The service does not infer this from the profile — edit `[blockchain_interface]` in
+`data/financing-service.toml` before starting the stack, setting `network_type` to the node's network and
+`url` to the woc-api the profile brings up:
+
+```toml
+[blockchain_interface]
+interface_type = "woc"
+network_type = "regtest"
+url = "http://woc-api:8084"
+```
+
+`woc-api:8084` is the Compose service name and container port, which is how the financing service reaches it
+across the project network; a host `cargo run` uses the published port, `http://localhost:5010`. Leave `url`
+unset and the service talks to public WhatsOnChain instead — see
+[Pointing the service at the local WoC](#pointing-the-service-at-the-local-woc). The startup log says which
+one it chose.
+
+### 5. Start the stack with the wild-bit-lab overlay
 
 wild-bit-lab publishes node RPC on host 18332, but **not** ZMQ on 28332 — so the default
 `WOC_BSV_HOST=host.docker.internal` cannot reach the ZMQ feed no matter how the node is configured.

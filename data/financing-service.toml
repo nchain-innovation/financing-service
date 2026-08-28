@@ -1,11 +1,7 @@
 [blockchain_interface]
 interface_type = "woc"
-network_type = "regtest"
-# Self-hosted woc-api (the `woc` Docker profile). Service name and container
-# port, because the service reaches it across the Compose network.
-# For a non-Docker `cargo run`, use the published host port instead:
-#   url = "http://localhost:5010"
-#   url = "http://woc-api:8084"
+network_type = "testnet"
+# url = "http://localhost:5010"
 
 [web_interface]
 address = "127.0.0.1"
