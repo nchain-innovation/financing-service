@@ -1,2 +1,5 @@
 * 1.6.1 - Uses chain-gang for signing
 * 2.0.0 - First Public release
+* 2.1.0 - Renamed to financing-service, configurable UTXO refresh period, CI build and test
+* 2.2.0 - Secrets resolved from environment, per-client and admin API keys, per-IP rate limiting, concurrent funding, system requirements document
+* 3.0.0 - Breaking: HTTP/2 no longer served (actix-web http2 feature removed to drop the h2 0.3 crate flagged by RUSTSEC-2026-0258) and SR-NFR-006 withdrawn. Also: optional OpenTelemetry trace export via OTLP, dependency updates including OpenTelemetry 0.32 and chain-gang 0.10.1 from crates.io, telemetry startup fix, rotated test key

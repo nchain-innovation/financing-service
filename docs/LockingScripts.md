@@ -7,9 +7,9 @@ OP_DUP OP_HASH160 ddc574807c3035ab43553a22c0b9df1f55737fae OP_EQUALVERIFY OP_CHE
 ```
 This when encoded into hex has the form
 ```
-76 A9 xxx 88 AC -> 76a9ddc574807c3035ab43553a22c0b9df1f55737fae88ac
+76 A9 14 xxx 88 AC -> 76a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac
 ```
-So the fund call is expecting the script as a hex string, in this case `76a9ddc574807c3035ab43553a22c0b9df1f55737fae88ac`. 
+So the fund call is expecting the script as a hex string, in this case `76a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac`. 
 
 ## Locking scripts - Python 
 In the `tx-engine` code we have:

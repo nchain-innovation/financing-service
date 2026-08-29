@@ -794,17 +794,15 @@ dependencies = [
 
 [[package]]
 name = "financing-service"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "actix-governor",
  "actix-http",
  "actix-web",
- "async-mutex",
  "async-trait",
  "chain-gang",
  "chrono",
  "hex",
- "http 1.5.0",
  "log",
  "opentelemetry",
  "opentelemetry-otlp",
@@ -813,7 +811,6 @@ dependencies = [
  "serde_json",
  "tokio",
  "toml",
- "tracing",
  "tracing-actix-web",
  "tracing-log",
  "tracing-opentelemetry",
