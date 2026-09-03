@@ -57,6 +57,11 @@ pub struct BalanceResponse {
 pub struct OutpointResponse {
     pub hash: String,
     pub index: u32,
+    /// Value of this output, read from the broadcast transaction.
+    pub satoshi: i64,
+    /// Locking script of this output as hex, read from the broadcast
+    /// transaction.
+    pub locking_script: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -122,6 +127,8 @@ mod tests {
             outpoints: vec![OutpointResponse {
                 hash: "abc123".to_string(),
                 index: 1,
+                satoshi: 123,
+                locking_script: "76a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac".to_string(),
             }],
             txs: vec![TxResponse {
                 tx: "010000".to_string(),

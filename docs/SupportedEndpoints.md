@@ -115,10 +115,19 @@ curl -H "Authorization: Bearer your-client-api-key" \
 
 ```json
 {
-    "outpoints": [{"hash": "11e1128551854896dba1af5ebd75f7fb712ae88684cae59e86f89b158de86697", "index": 1}],
+    "outpoints": [{
+        "hash": "11e1128551854896dba1af5ebd75f7fb712ae88684cae59e86f89b158de86697",
+        "index": 1,
+        "satoshi": 123,
+        "locking_script": "76a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac"
+    }],
     "txs": [{"tx": "0100000001..."}]
 }
 ```
+
+`satoshi` and `locking_script` describe the output this outpoint refers to. **They are read from the transaction that was broadcast, not echoed from the request**, so a client can verify what was actually paid rather than assume the request was honoured.
+
+That matters when spending the outpoint: a BSV (BIP-143) signature commits to both the previous output's value and its locking script, so if either differed from what the client assumed, the signature would not verify and the node would reject the spending transaction with a script error that says nothing about the funding value being wrong.
 
 Common error responses:
 
@@ -132,7 +141,7 @@ Common error responses:
 ```json
 {
     "description": "Failed to broadcast funding transaction 2 of 3: Failed to broadcast funding transaction. 1 transaction(s) were broadcast successfully: 11e11285...",
-    "outpoints": [{"hash": "11e1128551854896dba1af5ebd75f7fb712ae88684cae59e86f89b158de86697", "index": 1}],
+    "outpoints": [{"hash": "11e1128551854896dba1af5ebd75f7fb712ae88684cae59e86f89b158de86697", "index": 1, "satoshi": 123, "locking_script": "76a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac"}],
     "txs": [{"tx": "0100000001..."}]
 }
 ```
