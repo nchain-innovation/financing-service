@@ -14,8 +14,8 @@ use crate::{
     config::{ClientConfig, Config},
     dynamic_config::DynamicConfig,
     responses::{
-        BlockchainConnectionStatus, FundingResponseJson, OutpointResponse, StatusResponse,
-        TxResponse,
+        BlockchainConnectionStatus, CodedError, ErrorCode, FundingResponseJson, OutpointResponse,
+        StatusResponse, TxResponse,
     },
     util::tx_as_hexstr,
 };
@@ -28,20 +28,25 @@ pub struct FundingResponse {
 
 #[derive(Debug)]
 pub struct MultipleTxFundError {
+    pub code: ErrorCode,
     pub description: String,
     pub partial: Option<FundingResponse>,
 }
 
 impl MultipleTxFundError {
-    pub fn complete(description: impl Into<String>) -> Self {
+    pub fn complete(code: ErrorCode, description: impl Into<String>) -> Self {
         Self {
+            code,
             description: description.into(),
             partial: None,
         }
     }
 
+    /// Some transactions broadcast and some did not; the successful ones are
+    /// carried in `partial` so the caller can return them to the client.
     pub fn partial(description: impl Into<String>, completed: FundingResponse) -> Self {
         Self {
+            code: ErrorCode::PartialBroadcast,
             description: description.into(),
             partial: Some(completed),
         }
@@ -409,7 +414,7 @@ impl Service {
         Ok(())
     }
 
-    pub async fn funding_balance_error(&self, fund_request: &FundRequest) -> Option<String> {
+    pub async fn funding_balance_error(&self, fund_request: &FundRequest) -> Option<CodedError> {
         let client = self.client_handle(&fund_request.client_id).await?;
         let guard = client.read().await;
         guard.funding_balance_error(fund_request)
@@ -454,19 +459,21 @@ impl Service {
     pub async fn execute_funding(
         service: &Arc<Service>,
         fund_request: &FundRequest,
-    ) -> Result<FundingResponse, String> {
-        if let Some(description) = service.funding_balance_error(fund_request).await {
-            return Err(description);
+    ) -> Result<FundingResponse, CodedError> {
+        if let Some(error) = service.funding_balance_error(fund_request).await {
+            return Err(error);
         }
 
-        let (blockchain, prepared) = Self::prepare_funding_outpoints(service, fund_request).await?;
+        let (blockchain, prepared) = Self::prepare_funding_outpoints(service, fund_request)
+            .await
+            .map_err(CodedError::internal)?;
         match Self::broadcast_prepared_funding(blockchain, &prepared).await {
             Ok(response) => {
                 if let Err(description) = Self::commit_prepared_funding(service, &prepared).await {
                     log::warn!("commit_prepared_funding failed: {}", description);
                     let _ =
                         Self::refresh_client_chain_state(service, &fund_request.client_id).await;
-                    return Err(description);
+                    return Err(CodedError::internal(description));
                 }
                 Ok(response)
             }
@@ -482,8 +489,8 @@ impl Service {
         service: &Arc<Service>,
         fund_request: &FundRequest,
     ) -> Result<FundingResponse, MultipleTxFundError> {
-        if let Some(description) = service.funding_balance_error(fund_request).await {
-            return Err(MultipleTxFundError::complete(description));
+        if let Some(error) = service.funding_balance_error(fund_request).await {
+            return Err(MultipleTxFundError::complete(error.code, error.description));
         }
 
         let per_tx_request = FundRequest {
@@ -506,7 +513,10 @@ impl Service {
                                 Self::commit_prepared_funding(service, &prepared).await
                             {
                                 resync_after_multiple_tx_failure(service, fund_request).await;
-                                return Err(MultipleTxFundError::complete(description));
+                                return Err(MultipleTxFundError::complete(
+                                    ErrorCode::Internal,
+                                    description,
+                                ));
                             }
                             combined.outpoints.extend(partial.outpoints);
                             combined.txs.extend(partial.txs);
@@ -514,7 +524,10 @@ impl Service {
                         Err(cause) => {
                             if tx_index == 0 {
                                 resync_after_multiple_tx_failure(service, fund_request).await;
-                                return Err(MultipleTxFundError::complete(cause));
+                                return Err(MultipleTxFundError::complete(
+                                    cause.code,
+                                    cause.description,
+                                ));
                             }
                             resync_after_multiple_tx_failure(service, fund_request).await;
                             return Err(partial_broadcast_error(
@@ -528,7 +541,7 @@ impl Service {
                 }
                 Err(cause) => {
                     if tx_index == 0 {
-                        return Err(MultipleTxFundError::complete(cause));
+                        return Err(MultipleTxFundError::complete(ErrorCode::Internal, cause));
                     }
                     resync_after_multiple_tx_failure(service, fund_request).await;
                     return Err(partial_broadcast_error(
@@ -548,19 +561,25 @@ impl Service {
     pub async fn broadcast_prepared_funding(
         blockchain: Arc<dyn BlockchainInterface + Send + Sync>,
         prepared: &PreparedFunding,
-    ) -> Result<FundingResponse, String> {
+    ) -> Result<FundingResponse, CodedError> {
         let tx = prepared
             .txs
             .first()
             .cloned()
-            .ok_or_else(|| "No funding transaction prepared.".to_string())?;
+            .ok_or_else(|| CodedError::internal("No funding transaction prepared."))?;
         let mut response = FundingResponse::default();
         response.txs.push(tx.clone());
         log::info!("broadcasting funding tx {}", tx.hash().encode());
-        log::debug!("funding tx hex = {}", tx_as_hexstr(&tx)?);
+        log::debug!(
+            "funding tx hex = {}",
+            tx_as_hexstr(&tx).map_err(CodedError::internal)?
+        );
         blockchain.broadcast_tx(&tx).await.map_err(|e| {
             log::warn!("Failed to broadcast funding transaction: {:?}", e);
-            "Failed to broadcast funding transaction.".to_string()
+            CodedError::new(
+                ErrorCode::BroadcastFailed,
+                "Failed to broadcast funding transaction.",
+            )
         })?;
         let hash = tx.hash();
         response.outpoints = (1..prepared.no_of_outpoints + 1)
@@ -581,7 +600,7 @@ fn partial_broadcast_error(
     failed_at: u32,
     total: u32,
     broadcast: &FundingResponse,
-    cause: String,
+    cause: impl std::fmt::Display,
 ) -> MultipleTxFundError {
     let succeeded = broadcast.outpoints.len() as u32;
     let mut message =
@@ -598,7 +617,7 @@ fn partial_broadcast_error(
         ));
         return MultipleTxFundError::partial(message, broadcast.clone());
     }
-    MultipleTxFundError::complete(message)
+    MultipleTxFundError::complete(ErrorCode::BroadcastFailed, message)
 }
 
 async fn fetch_chain_state(
@@ -806,8 +825,10 @@ mod tests {
     async fn fund_single_transaction(
         service: &Arc<Service>,
         fund_request: &FundRequest,
-    ) -> Result<FundingResponse, String> {
-        Service::refresh_client_chain_state(service, &fund_request.client_id).await?;
+    ) -> Result<FundingResponse, CodedError> {
+        Service::refresh_client_chain_state(service, &fund_request.client_id)
+            .await
+            .map_err(CodedError::internal)?;
         Service::execute_funding(service, fund_request).await
     }
 }

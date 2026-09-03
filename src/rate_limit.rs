@@ -14,7 +14,7 @@ use actix_web::{
 };
 
 use crate::config::RateLimitConfig;
-use crate::responses::ErrorResponse;
+use crate::responses::{ErrorCode, ErrorResponse};
 
 const HEALTH_PATH: &str = "/health";
 const HEALTH_WHITELIST_KEY: &str = "__health__";
@@ -48,6 +48,7 @@ impl KeyExtractor for FinancingServiceKeyExtractor {
         response
             .content_type(ContentType::json())
             .json(ErrorResponse {
+                code: ErrorCode::RateLimited,
                 description: format!("Rate limit exceeded, retry in {wait_time}s"),
             })
     }

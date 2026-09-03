@@ -8,8 +8,8 @@ use crate::{
     client::FundRequest,
     config::ClientConfig,
     responses::{
-        error_response, json_ok, partial_funding_error_response, AddressResponse, BalanceResponse,
-        HealthResponse, SuccessResponse,
+        coded_error_response, error_response, json_ok, partial_funding_error_response,
+        AddressResponse, BalanceResponse, ErrorCode, HealthResponse, SuccessResponse,
     },
     secrets::{secret_reference, validate_env_var_name},
     service::Service,
@@ -123,18 +123,25 @@ pub async fn get_funds(
     let locking_script = &info.locking_script;
 
     if satoshi == 0 {
-        return error_response(format!("Invalid satoshi value '{satoshi}'"));
+        return error_response(
+            ErrorCode::InvalidRequest,
+            format!("Invalid satoshi value '{satoshi}'"),
+        );
     }
     if no_of_outpoints == 0 {
-        return error_response(format!("Invalid no_of_outpoints value '{no_of_outpoints}'"));
+        return error_response(
+            ErrorCode::InvalidRequest,
+            format!("Invalid no_of_outpoints value '{no_of_outpoints}'"),
+        );
     }
 
     let locking_script_as_bytes = match hex::decode(locking_script) {
         Ok(bytes) => bytes,
         Err(_) => {
-            return error_response(format!(
-                "Unable to convert locking_script to bytes '{locking_script}'"
-            ));
+            return error_response(
+                ErrorCode::InvalidRequest,
+                format!("Unable to convert locking_script to bytes '{locking_script}'"),
+            );
         }
     };
     debug!("locking_script_as_bytes = {:?}", locking_script_as_bytes);
@@ -148,7 +155,10 @@ pub async fn get_funds(
     };
 
     if !data.service.is_client_id_valid(client_id).await {
-        return error_response(format!("Unknown client_id {client_id}"));
+        return error_response(
+            ErrorCode::UnknownClient,
+            format!("Unknown client_id {client_id}"),
+        );
     }
     if let Some(response) = authorize_client(&req, client_id, &data.service).await {
         return response;
@@ -156,14 +166,14 @@ pub async fn get_funds(
 
     if let Err(description) = Service::refresh_client_chain_state(&data.service, client_id).await {
         log::warn!("refresh_client_chain_state failed: {}", description);
-        return error_response(description);
+        return error_response(ErrorCode::ChainUnavailable, description);
     }
 
     if fund_request.no_of_outpoints > 1 && fund_request.multiple_tx {
         return match Service::fund_with_multiple_transactions(&data.service, &fund_request).await {
             Ok(funding_response) => match funding_response.to_response() {
                 Ok(response) => json_ok(&response),
-                Err(description) => error_response(description),
+                Err(description) => error_response(ErrorCode::Internal, description),
             },
             Err(error) => {
                 debug!("fund_with_multiple_transactions error = {:?}", error);
@@ -172,28 +182,28 @@ pub async fn get_funds(
                         Ok(response) => {
                             partial_funding_error_response(error.description, &response)
                         }
-                        Err(description) => error_response(description),
+                        Err(description) => error_response(ErrorCode::Internal, description),
                     }
                 } else {
-                    error_response(error.description)
+                    error_response(error.code, error.description)
                 }
             }
         };
     }
 
-    if let Some(description) = data.service.funding_balance_error(&fund_request).await {
-        log::info!("insufficient funds: {}", description);
-        return error_response(description);
+    if let Some(error) = data.service.funding_balance_error(&fund_request).await {
+        log::info!("insufficient funds: {}", error.description);
+        return coded_error_response(error);
     }
 
     match Service::execute_funding(&data.service, &fund_request).await {
         Ok(funding_response) => match funding_response.to_response() {
             Ok(response) => json_ok(&response),
-            Err(description) => error_response(description),
+            Err(description) => error_response(ErrorCode::Internal, description),
         },
-        Err(description) => {
-            debug!("execute_funding error = {:?}", description);
-            error_response(description)
+        Err(error) => {
+            debug!("execute_funding error = {:?}", error);
+            coded_error_response(error)
         }
     }
 }
@@ -216,18 +226,21 @@ pub async fn add_client(
     }
     let client_config = match info.into_inner().into_client_config() {
         Ok(client_config) => client_config,
-        Err(description) => return error_response(description),
+        Err(description) => return error_response(ErrorCode::InvalidRequest, description),
     };
     let client_id = &client_config.client_id;
     log::info!("add_client {}", client_id);
 
     if data.service.is_client_id_valid(client_id).await {
-        return error_response(format!("Client already exists: {client_id}"));
+        return error_response(
+            ErrorCode::ClientExists,
+            format!("Client already exists: {client_id}"),
+        );
     }
 
     match data.service.add_client(&client_config).await {
         Ok(()) => json_ok(&SuccessResponse::new()),
-        Err(description) => error_response(description),
+        Err(description) => error_response(ErrorCode::Internal, description),
     }
 }
 
@@ -244,7 +257,10 @@ pub async fn delete_client(
     log::info!("delete_client {}", client_id);
 
     if !data.service.is_client_id_valid(&client_id).await {
-        return error_response(format!("Unknown client_id {client_id}"));
+        return error_response(
+            ErrorCode::UnknownClient,
+            format!("Unknown client_id {client_id}"),
+        );
     }
     if let Some(response) = authorize_client(&req, &client_id, &data.service).await {
         return response;
@@ -252,7 +268,7 @@ pub async fn delete_client(
 
     match data.service.delete_client(&client_id).await {
         Ok(()) => json_ok(&SuccessResponse::new()),
-        Err(description) => error_response(description),
+        Err(description) => error_response(ErrorCode::Internal, description),
     }
 }
 
@@ -267,7 +283,10 @@ pub async fn get_address(
     log::info!("get address {}", client_id);
 
     if !data.service.is_client_id_valid(&client_id).await {
-        return error_response(format!("Unknown client_id {client_id}"));
+        return error_response(
+            ErrorCode::UnknownClient,
+            format!("Unknown client_id {client_id}"),
+        );
     }
     if let Some(response) = authorize_client(&req, &client_id, &data.service).await {
         return response;
@@ -275,7 +294,10 @@ pub async fn get_address(
 
     match data.service.get_address(&client_id).await {
         Some(address) => json_ok(&AddressResponse { address }),
-        None => error_response(format!("Unknown client_id {client_id}")),
+        None => error_response(
+            ErrorCode::UnknownClient,
+            format!("Unknown client_id {client_id}"),
+        ),
     }
 }
 
@@ -290,7 +312,10 @@ pub async fn balance(
     log::info!("get balance {}", client_id);
 
     if !data.service.is_client_id_valid(&client_id).await {
-        return error_response(format!("Unknown client_id {client_id}"));
+        return error_response(
+            ErrorCode::UnknownClient,
+            format!("Unknown client_id {client_id}"),
+        );
     }
     if let Some(response) = authorize_client(&req, &client_id, &data.service).await {
         return response;
@@ -298,7 +323,7 @@ pub async fn balance(
 
     if let Err(description) = Service::refresh_client_chain_state(&data.service, &client_id).await {
         log::warn!("refresh_client_chain_state failed: {}", description);
-        return error_response(description);
+        return error_response(ErrorCode::ChainUnavailable, description);
     }
 
     match data.service.get_balance(&client_id).await {
@@ -306,7 +331,10 @@ pub async fn balance(
             confirmed: balance.confirmed,
             unconfirmed: balance.unconfirmed,
         }),
-        None => error_response(format!("Unknown client_id {client_id}")),
+        None => error_response(
+            ErrorCode::UnknownClient,
+            format!("Unknown client_id {client_id}"),
+        ),
     }
 }
 
@@ -501,6 +529,7 @@ mod tests {
         .await;
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
         let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["code"], "unknown_client");
         assert!(body["description"]
             .as_str()
             .unwrap()
@@ -693,6 +722,7 @@ mod tests {
         .await;
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
         let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["code"], "invalid_request");
         assert!(body["description"]
             .as_str()
             .unwrap()
@@ -712,6 +742,7 @@ mod tests {
         .await;
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
         let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["code"], "invalid_request");
         assert!(body["description"]
             .as_str()
             .unwrap()
@@ -731,6 +762,7 @@ mod tests {
         .await;
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
         let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["code"], "invalid_request");
         assert!(body["description"]
             .as_str()
             .unwrap()
@@ -755,10 +787,11 @@ mod tests {
         .await;
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
         let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["code"], "insufficient_balance");
         assert!(body["description"]
             .as_str()
             .unwrap()
-            .contains("Insufficent client balance"));
+            .contains("Insufficient client balance"));
     }
 
     #[actix_web::test]

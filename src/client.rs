@@ -16,6 +16,7 @@ use chain_gang::{
 };
 
 use crate::config::ClientConfig;
+use crate::responses::{CodedError, ErrorCode};
 
 #[derive(Clone, Debug)]
 pub struct FundingSpendPlan {
@@ -233,18 +234,24 @@ impl Client {
         self.unspent.sort_by_key(|utxo| utxo.value);
     }
 
-    /// Return a description when the client cannot fund the request.
-    pub fn funding_balance_error(&self, fund_request: &FundRequest) -> Option<String> {
+    /// Return a coded error when the client cannot fund the request.
+    pub fn funding_balance_error(&self, fund_request: &FundRequest) -> Option<CodedError> {
         if self.unspent.is_empty() {
-            return Some("No UTXOs available for funding.".to_string());
+            return Some(CodedError::new(
+                ErrorCode::NoSuitableUtxo,
+                "No UTXOs available for funding.",
+            ));
         }
 
         let total_cost = Self::estimate_total_cost(fund_request, 1);
         let total_available = self.total_unspent();
 
         if total_available <= total_cost as i64 {
-            return Some(format!(
-                "Insufficent client balance: {total_available} satoshi available, {total_cost} required."
+            return Some(CodedError::new(
+                ErrorCode::InsufficientBalance,
+                format!(
+                    "Insufficient client balance: {total_available} satoshi available, {total_cost} required."
+                ),
             ));
         }
 
@@ -253,9 +260,12 @@ impl Client {
                 + Self::estimate_fee(fund_request.locking_script.len() as u64, 1, 1);
             let suitable_utxos = self.count_utxos_above(per_tx_cost);
             if suitable_utxos < fund_request.no_of_outpoints as usize {
-                return Some(format!(
-                    "Not enough UTXOs for {} separate funding transactions: {suitable_utxos} suitable UTXOs, {} required.",
-                    fund_request.no_of_outpoints, fund_request.no_of_outpoints
+                return Some(CodedError::new(
+                    ErrorCode::NoSuitableUtxo,
+                    format!(
+                        "Not enough UTXOs for {} separate funding transactions: {suitable_utxos} suitable UTXOs, {} required.",
+                        fund_request.no_of_outpoints, fund_request.no_of_outpoints
+                    ),
                 ));
             }
             return None;
@@ -265,8 +275,11 @@ impl Client {
             let largest = self.get_largest_unspent().unwrap_or(0);
             let max_inputs = self.unspent.len() as u32;
             let required_with_all_inputs = Self::estimate_total_cost(fund_request, max_inputs);
-            return Some(format!(
-                "Unable to select UTXOs for funding transaction: largest UTXO is {largest} satoshi, {required_with_all_inputs} required including fees."
+            return Some(CodedError::new(
+                ErrorCode::NoSuitableUtxo,
+                format!(
+                    "Unable to select UTXOs for funding transaction: largest UTXO is {largest} satoshi, {required_with_all_inputs} required including fees."
+                ),
             ));
         }
 
@@ -515,8 +528,9 @@ mod tests {
         let error = client
             .funding_balance_error(&sample_fund_request(123))
             .unwrap();
-        assert!(error.contains("Insufficent client balance"));
-        assert!(error.contains("100 satoshi available"));
+        assert_eq!(error.code, ErrorCode::InsufficientBalance);
+        assert!(error.description.contains("Insufficient client balance"));
+        assert!(error.description.contains("100 satoshi available"));
     }
 
     #[test]
@@ -556,8 +570,9 @@ mod tests {
             locking_script: hex::decode(LOCKING_SCRIPT_HEX).unwrap(),
         };
         let error = client.funding_balance_error(&fund_request).unwrap();
-        assert!(error.contains("Not enough UTXOs"));
-        assert!(error.contains("2 suitable UTXOs, 3 required"));
+        assert_eq!(error.code, ErrorCode::NoSuitableUtxo);
+        assert!(error.description.contains("Not enough UTXOs"));
+        assert!(error.description.contains("2 suitable UTXOs, 3 required"));
     }
 
     #[test]
