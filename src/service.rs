@@ -232,27 +232,37 @@ impl Service {
         self.clients.read().await.values().cloned().collect()
     }
 
-    pub async fn add_client(&self, client_config: &ClientConfig) -> Result<(), String> {
+    pub async fn add_client(&self, client_config: &ClientConfig) -> Result<(), CodedError> {
         crate::secrets::warn_plaintext_client_secrets(
             &client_config.client_id,
             &client_config.wif_key,
             client_config.api_key.as_deref(),
         );
-        let resolved = client_config.clone().resolve_secrets()?;
-        let new_client = Arc::new(RwLock::new(Client::try_new(&resolved)?));
+        // A bad secret reference or an unusable WIF is a problem with the
+        // submitted client, not a service fault.
+        let resolved = client_config
+            .clone()
+            .resolve_secrets()
+            .map_err(|e| CodedError::new(ErrorCode::InvalidRequest, e))?;
+        let new_client = Arc::new(RwLock::new(
+            Client::try_new(&resolved)
+                .map_err(|e| CodedError::new(ErrorCode::InvalidRequest, e))?,
+        ));
         {
             let mut clients = self.clients.write().await;
             if clients.contains_key(&client_config.client_id) {
-                return Err(format!(
-                    "Client already exists: {}",
-                    client_config.client_id
+                return Err(CodedError::new(
+                    ErrorCode::ClientExists,
+                    format!("Client already exists: {}", client_config.client_id),
                 ));
             }
             clients.insert(client_config.client_id.clone(), Arc::clone(&new_client));
         }
+        // Persisting failed, so undo the in-memory insert. This one really is
+        // a service fault.
         if let Err(error) = self.dynamic_config.lock().await.add(client_config) {
             self.clients.write().await.remove(&client_config.client_id);
-            return Err(error);
+            return Err(CodedError::internal(error));
         }
         Ok(())
     }
