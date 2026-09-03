@@ -13,6 +13,7 @@ use crate::{
     client::{Client, FundRequest, FundingSpendPlan},
     config::{ClientConfig, Config},
     dynamic_config::DynamicConfig,
+    idempotency::{IdempotencyStore, RecordKey},
     responses::{
         BlockchainConnectionStatus, CodedError, ErrorCode, FundingResponseJson, OutpointResponse,
         StatusResponse, TxResponse,
@@ -105,6 +106,7 @@ pub struct Service {
     clients: RwLock<HashMap<String, Arc<RwLock<Client>>>>,
     dynamic_config: Mutex<DynamicConfig>,
     admin_api_key: Option<String>,
+    idempotency: Mutex<IdempotencyStore>,
 }
 
 impl Service {
@@ -149,7 +151,42 @@ impl Service {
                 .admin_api_key
                 .clone()
                 .filter(|key| !key.is_empty()),
+            idempotency: Mutex::new(IdempotencyStore::new(
+                config.idempotency.ttl(),
+                config.idempotency.max_entries,
+            )),
         })
+    }
+
+    /// Claim an idempotency key for a funding request.
+    ///
+    /// The lock is taken and released inside this call, so it is never held
+    /// across a broadcast.
+    pub async fn reserve_idempotency(
+        &self,
+        key: RecordKey,
+        fingerprint: &str,
+    ) -> crate::idempotency::Reservation {
+        self.idempotency.lock().await.reserve(key, fingerprint)
+    }
+
+    /// Retain a funding outcome so a retry with the same key replays it.
+    pub async fn complete_idempotency(
+        &self,
+        key: RecordKey,
+        fingerprint: &str,
+        outcome: crate::idempotency::Outcome,
+    ) {
+        self.idempotency
+            .lock()
+            .await
+            .complete(key, fingerprint, outcome);
+    }
+
+    /// Drop a reservation because nothing was broadcast, letting the client
+    /// retry the same key.
+    pub async fn release_idempotency(&self, key: &RecordKey) {
+        self.idempotency.lock().await.release(key);
     }
 
     /// Create a new Service from the provided config

@@ -44,6 +44,12 @@ pub enum ErrorCode {
     /// The caller exceeded the configured request rate. Retryable after the
     /// interval given in the description.
     RateLimited,
+    /// A request carrying this `idempotency_key` is still being processed.
+    /// Retry shortly; the completed response will then be replayed.
+    KeyInProgress,
+    /// This `idempotency_key` was already used with a materially different
+    /// request. Use a fresh key.
+    IdempotencyKeyReused,
 }
 
 #[derive(Serialize)]
@@ -122,7 +128,7 @@ pub struct BalanceResponse {
     pub unconfirmed: i64,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Clone, Debug, PartialEq)]
 pub struct OutpointResponse {
     pub hash: String,
     pub index: u32,
@@ -133,12 +139,12 @@ pub struct OutpointResponse {
     pub locking_script: String,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Clone, Debug, PartialEq)]
 pub struct TxResponse {
     pub tx: String,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Clone, Debug, PartialEq)]
 pub struct FundingResponseJson {
     pub outpoints: Vec<OutpointResponse>,
     pub txs: Vec<TxResponse>,
@@ -215,6 +221,8 @@ mod tests {
             (ErrorCode::Internal, "internal"),
             (ErrorCode::Unauthorized, "unauthorized"),
             (ErrorCode::RateLimited, "rate_limited"),
+            (ErrorCode::KeyInProgress, "key_in_progress"),
+            (ErrorCode::IdempotencyKeyReused, "idempotency_key_reused"),
         ];
         for (code, expected) in cases {
             assert_eq!(

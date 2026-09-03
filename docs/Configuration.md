@@ -144,6 +144,21 @@ Configures the period between UTXO refresh requests from the blockchain (in seco
 utxo_refresh_period = 60
 ```
 
+## [idempotency]
+
+Optional. Controls how long `POST /fund` idempotency records are retained; see [Idempotency](SupportedEndpoints.md#idempotency) for what they do. Both fields have defaults, so the section can be omitted entirely.
+
+```toml
+[idempotency]
+ttl_seconds = 600
+max_entries = 10000
+```
+
+* `ttl_seconds` — how long a completed record stays replayable. Should comfortably exceed your clients' retry window; too short and a legitimate retry funds a second time. Default `600`.
+* `max_entries` — upper bound on retained records, so a client sending a fresh key on every request cannot grow the store without limit. When full, the oldest record is dropped. Default `10000`.
+
+Records are held **in memory only** and are lost when the service restarts, so a retry that spans a restart can still produce a second funding transaction.
+
 ## [dynamic_config]
 
 Path to the file used to persist clients added at runtime via `POST /client`. Dynamically added clients may include an `api_key` field in the same format as static `[[client]]` entries.

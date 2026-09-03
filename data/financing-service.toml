@@ -28,3 +28,9 @@ filename = "./data/dynamic.toml"
 # [[client]]
 # client_id = "id1"
 # wif_key = ""
+
+# Retention for POST /fund idempotency records. Optional; these are the
+# defaults. Records are held in memory only and are lost on restart.
+# [idempotency]
+# ttl_seconds = 600
+# max_entries = 10000

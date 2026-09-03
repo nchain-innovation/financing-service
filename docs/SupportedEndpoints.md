@@ -130,6 +130,35 @@ curl -H "Authorization: Bearer your-client-api-key" \
 `satoshi` and `locking_script` describe the output this outpoint refers to. **They are read from the transaction that was broadcast, not echoed from the request**, so a client can verify what was actually paid rather than assume the request was honoured.
 
 That matters when spending the outpoint: a BSV (BIP-143) signature commits to both the previous output's value and its locking script, so if either differed from what the client assumed, the signature would not verify and the node would reject the spending transaction with a script error that says nothing about the funding value being wrong.
+### Idempotency
+
+`POST /fund` broadcasts a funding transaction and then returns the outpoint in the response body. If that response is lost — a client timeout, a dropped connection — the transaction is already on chain and the client has no record of the outpoint. A plain retry funds a **second** time, and the first output is stranded: locked to a key the client may no longer be able to name.
+
+Send an optional `idempotency_key` to prevent that:
+
+```json
+{"client_id": "client1", "satoshi": 123, "no_of_outpoints": 1, "multiple_tx": false,
+ "locking_script": "76a914...88ac", "idempotency_key": "any-unique-string"}
+```
+
+The first call reserves the key and, once the transaction is broadcast, retains the response against it. A retry carrying the same key replays that response without funding again. Omitting the field preserves the previous behaviour exactly.
+
+| Situation | Result |
+|---|---|
+| New key | Funds normally, and the response is retained |
+| Same key, same request, already funded | Replays the first response; nothing is broadcast |
+| Same key, still being processed | `422` `key_in_progress` — retry shortly |
+| Same key, materially different request | `422` `idempotency_key_reused` — use a fresh key |
+| Refused before anything was built (`insufficient_balance`, `no_suitable_utxo`) | The key is freed, so it can be retried |
+
+A partly-successful `multiple_tx` batch is retained too, and a retry is answered the same way as the first call — the transactions that reached the chain are reported rather than being funded a second time.
+
+Keys are scoped per `client_id`, so two clients may choose the same string without colliding.
+
+**Two limits worth knowing:**
+
+* **Records are held in memory and are lost when the service restarts.** A retry that spans a restart can still produce a second funding transaction. Retention is bounded by `[idempotency] ttl_seconds` (default 600) and `max_entries` (default 10000); see [Configuration](Configuration.md).
+* **After a failure that may have spent something, the key is not freed** — only the refusals listed above free it. Any other failure leaves the key reserved until its TTL expires, and a retry with it returns `key_in_progress`. This is deliberate: a broadcast may have reached the node before the connection dropped, so releasing the key could cause the duplicate this mechanism exists to prevent. Use a fresh key if you need to retry sooner.
 
 ### Error responses
 
@@ -157,6 +186,8 @@ Every error response carries a machine-readable `code` alongside the human-reada
 | `internal` | Unexpected internal failure | Report it |
 | `unauthorized` | Authentication missing or invalid (HTTP 401) | Fix credentials |
 | `rate_limited` | Request rate exceeded | Retry after the interval in `description` |
+| `key_in_progress` | A request with this `idempotency_key` is still being processed | Retry shortly |
+| `idempotency_key_reused` | This `idempotency_key` was used with a different request | Use a fresh key |
 
 Examples:
 

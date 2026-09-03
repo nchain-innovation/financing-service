@@ -7,6 +7,7 @@ use crate::{
     auth::{authorize_admin, authorize_client},
     client::FundRequest,
     config::ClientConfig,
+    idempotency::{request_fingerprint, Outcome, RecordKey, Reservation},
     responses::{
         coded_error_response, error_response, json_ok, partial_funding_error_response,
         AddressResponse, BalanceResponse, ErrorCode, HealthResponse, SuccessResponse,
@@ -22,6 +23,11 @@ pub struct FundingRequest {
     no_of_outpoints: u32,
     multiple_tx: bool,
     locking_script: String,
+    /// Optional. When set, a retry carrying the same key replays the response
+    /// of the first call instead of funding again. Omitting it preserves the
+    /// previous behaviour.
+    #[serde(default)]
+    idempotency_key: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -169,10 +175,56 @@ pub async fn get_funds(
         return error_response(ErrorCode::ChainUnavailable, description);
     }
 
+    // Claim the idempotency key, if the client supplied one, before anything
+    // is prepared or broadcast. Reserving first is what makes a concurrent
+    // duplicate visible rather than letting two calls both fund.
+    let fingerprint = request_fingerprint(satoshi, no_of_outpoints, multiple_tx, locking_script);
+    let record = info
+        .idempotency_key
+        .as_deref()
+        .map(|key| (RecordKey::new(client_id.clone(), key), fingerprint.clone()));
+
+    if let Some((key, fingerprint)) = &record {
+        match data
+            .service
+            .reserve_idempotency(key.clone(), fingerprint)
+            .await
+        {
+            Reservation::Proceed => {}
+            Reservation::Replay(outcome) => {
+                log::info!("replaying funding response for idempotency_key");
+                return replay(outcome);
+            }
+            Reservation::InProgress => {
+                return error_response(
+                    ErrorCode::KeyInProgress,
+                    "A request with this idempotency_key is still being processed. Retry shortly.",
+                );
+            }
+            Reservation::Reused => {
+                return error_response(
+                    ErrorCode::IdempotencyKeyReused,
+                    "This idempotency_key was already used with a different request. Use a fresh key.",
+                );
+            }
+        }
+    }
+
     if fund_request.no_of_outpoints > 1 && fund_request.multiple_tx {
         return match Service::fund_with_multiple_transactions(&data.service, &fund_request).await {
             Ok(funding_response) => match funding_response.to_response() {
-                Ok(response) => json_ok(&response),
+                Ok(response) => {
+                    if let Some((key, fingerprint)) = &record {
+                        data.service
+                            .complete_idempotency(
+                                key.clone(),
+                                fingerprint,
+                                Outcome::Funded(response.clone()),
+                            )
+                            .await;
+                    }
+                    json_ok(&response)
+                }
                 Err(description) => error_response(ErrorCode::Internal, description),
             },
             Err(error) => {
@@ -180,11 +232,27 @@ pub async fn get_funds(
                 if let Some(partial) = error.partial {
                     match partial.to_response() {
                         Ok(response) => {
+                            // Some transactions are on chain. Retain that so a
+                            // retry is answered with what happened instead of
+                            // funding the successful ones a second time.
+                            if let Some((key, fingerprint)) = &record {
+                                data.service
+                                    .complete_idempotency(
+                                        key.clone(),
+                                        fingerprint,
+                                        Outcome::PartiallyFunded {
+                                            description: error.description.clone(),
+                                            response: response.clone(),
+                                        },
+                                    )
+                                    .await;
+                            }
                             partial_funding_error_response(error.description, &response)
                         }
                         Err(description) => error_response(ErrorCode::Internal, description),
                     }
                 } else {
+                    release_if_nothing_was_spent(&data.service, &record, error.code).await;
                     error_response(error.code, error.description)
                 }
             }
@@ -193,17 +261,68 @@ pub async fn get_funds(
 
     if let Some(error) = data.service.funding_balance_error(&fund_request).await {
         log::info!("insufficient funds: {}", error.description);
+        release_if_nothing_was_spent(&data.service, &record, error.code).await;
         return coded_error_response(error);
     }
 
     match Service::execute_funding(&data.service, &fund_request).await {
         Ok(funding_response) => match funding_response.to_response() {
-            Ok(response) => json_ok(&response),
+            Ok(response) => {
+                if let Some((key, fingerprint)) = &record {
+                    data.service
+                        .complete_idempotency(
+                            key.clone(),
+                            fingerprint,
+                            Outcome::Funded(response.clone()),
+                        )
+                        .await;
+                }
+                json_ok(&response)
+            }
             Err(description) => error_response(ErrorCode::Internal, description),
         },
         Err(error) => {
             debug!("execute_funding error = {:?}", error);
+            release_if_nothing_was_spent(&data.service, &record, error.code).await;
             coded_error_response(error)
+        }
+    }
+}
+
+/// Answer a retry with the outcome the first call produced.
+fn replay(outcome: Outcome) -> HttpResponse {
+    match outcome {
+        Outcome::Funded(response) => json_ok(&response),
+        Outcome::PartiallyFunded {
+            description,
+            response,
+        } => partial_funding_error_response(description, &response),
+    }
+}
+
+/// Free the idempotency key only when the failure cannot have spent anything,
+/// so the client may retry with the same key.
+///
+/// This is deliberately conservative. `insufficient_balance` and
+/// `no_suitable_utxo` are decided before a transaction is built, so releasing
+/// is safe. Every other failure is ambiguous from here -- a broadcast may have
+/// reached the node before the connection dropped, and a commit failure means
+/// the transaction is definitely on chain -- so the reservation is left to
+/// expire rather than risk funding twice. The cost is that the same key cannot
+/// be retried until the TTL elapses; the alternative risks the duplicate this
+/// whole mechanism exists to prevent.
+async fn release_if_nothing_was_spent(
+    service: &Arc<Service>,
+    record: &Option<(RecordKey, String)>,
+    code: ErrorCode,
+) {
+    let certainly_pre_broadcast = matches!(
+        code,
+        ErrorCode::InsufficientBalance | ErrorCode::NoSuitableUtxo
+    );
+    if certainly_pre_broadcast {
+        if let Some((key, _)) = record {
+            service.release_idempotency(key).await;
         }
     }
 }
@@ -357,8 +476,9 @@ mod tests {
         },
         service::Service,
         test_support::{
-            test_blockchain_interface, test_config_with_keys, unique_dynamic_config_path,
-            LOCKING_SCRIPT_HEX, TEST_ADDRESS, TEST_CLIENT_ID, TEST_WIF,
+            test_blockchain_interface, test_config, test_config_with_keys,
+            unique_dynamic_config_path, CountingBlockchain, LOCKING_SCRIPT_HEX, TEST_ADDRESS,
+            TEST_CLIENT_ID, TEST_WIF,
         },
     };
 
@@ -427,6 +547,35 @@ mod tests {
                 .service(get_address),
         )
         .await
+    }
+
+    /// Build an app whose blockchain counts broadcasts, so a test can assert
+    /// that a retry did not reach the chain.
+    async fn build_counting_app() -> (
+        impl ActixService<Request, Response = ServiceResponse, Error = Error>,
+        Arc<CountingBlockchain>,
+    ) {
+        let config = test_config(&unique_dynamic_config_path());
+        let blockchain = CountingBlockchain::new(&config).await;
+        let financing_service = Arc::new(Service::new_for_test(&config, blockchain.clone()).await);
+        let app_state = web::Data::new(AppState {
+            service: financing_service,
+        });
+
+        let app = test::init_service(
+            App::new()
+                .app_data(app_state)
+                .service(index)
+                .service(health)
+                .service(status)
+                .service(balance)
+                .service(get_funds)
+                .service(add_client)
+                .service(delete_client)
+                .service(get_address),
+        )
+        .await;
+        (app, blockchain)
     }
 
     async fn build_app_with_api_key(
@@ -838,6 +987,141 @@ mod tests {
             assert_eq!(outpoint["satoshi"], 123);
             assert_eq!(outpoint["locking_script"], LOCKING_SCRIPT_HEX);
         }
+    }
+
+    fn fund_body_with_key(
+        client_id: &str,
+        satoshi: u64,
+        locking_script: &str,
+        idempotency_key: &str,
+    ) -> Value {
+        json!({
+            "client_id": client_id,
+            "satoshi": satoshi,
+            "no_of_outpoints": 1,
+            "multiple_tx": false,
+            "locking_script": locking_script,
+            "idempotency_key": idempotency_key,
+        })
+    }
+
+    async fn post_fund(
+        app: &impl actix_web::dev::Service<
+            actix_http::Request,
+            Response = actix_web::dev::ServiceResponse,
+            Error = actix_web::Error,
+        >,
+        body: Value,
+    ) -> (StatusCode, Value) {
+        let resp = test::call_service(
+            app,
+            test::TestRequest::post()
+                .uri("/fund")
+                .set_json(body)
+                .to_request(),
+        )
+        .await;
+        let http_status = resp.status();
+        (http_status, test::read_body_json(resp).await)
+    }
+
+    /// The case #39 describes: the funding transaction is on chain but the
+    /// response was lost, so the client retries. The retry must replay the
+    /// first response and must not broadcast again.
+    ///
+    /// Asserted by broadcast count rather than by comparing responses:
+    /// `TestInterface` does not consume UTXOs, so funding twice would produce
+    /// an identical transaction and a response comparison would pass even with
+    /// idempotency removed.
+    #[actix_web::test]
+    async fn sr_fund_retry_with_same_idempotency_key_does_not_broadcast_again() {
+        let (app, chain) = build_counting_app().await;
+        let body = fund_body_with_key(TEST_CLIENT_ID, 123, LOCKING_SCRIPT_HEX, "key-1");
+
+        let (first_status, first) = post_fund(&app, body.clone()).await;
+        assert_eq!(first_status, StatusCode::OK);
+        assert_eq!(chain.broadcast_count(), 1);
+
+        let (retry_status, retry) = post_fund(&app, body).await;
+        assert_eq!(retry_status, StatusCode::OK);
+        assert_eq!(
+            chain.broadcast_count(),
+            1,
+            "the retry must not have broadcast a second funding transaction"
+        );
+        assert_eq!(first["outpoints"], retry["outpoints"]);
+        assert_eq!(first["txs"], retry["txs"]);
+    }
+
+    /// Without a key the previous behaviour stands: every call funds, which is
+    /// the duplicate #39 reports. This is the control for the test above.
+    #[actix_web::test]
+    async fn fund_without_an_idempotency_key_broadcasts_every_time() {
+        let (app, chain) = build_counting_app().await;
+        let body = fund_body(TEST_CLIENT_ID, 123, 1, LOCKING_SCRIPT_HEX);
+
+        post_fund(&app, body.clone()).await;
+        assert_eq!(chain.broadcast_count(), 1);
+        post_fund(&app, body).await;
+        assert_eq!(chain.broadcast_count(), 2);
+    }
+
+    #[actix_web::test]
+    async fn reusing_an_idempotency_key_with_a_different_request_is_rejected() {
+        let app = build_app().await;
+        let (first_status, _) = post_fund(
+            &app,
+            fund_body_with_key(TEST_CLIENT_ID, 123, LOCKING_SCRIPT_HEX, "key-2"),
+        )
+        .await;
+        assert_eq!(first_status, StatusCode::OK);
+
+        // same key, different satoshi value
+        let (http_status, body) = post_fund(
+            &app,
+            fund_body_with_key(TEST_CLIENT_ID, 456, LOCKING_SCRIPT_HEX, "key-2"),
+        )
+        .await;
+        assert_eq!(http_status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["code"], "idempotency_key_reused");
+    }
+
+    /// A refusal decided before any transaction is built must free the key, so
+    /// the client can retry it once the wallet is topped up.
+    #[actix_web::test]
+    async fn a_pre_broadcast_refusal_frees_the_idempotency_key() {
+        let app = build_app().await;
+        let (http_status, body) = post_fund(
+            &app,
+            fund_body_with_key(TEST_CLIENT_ID, 100_000_000, LOCKING_SCRIPT_HEX, "key-3"),
+        )
+        .await;
+        assert_eq!(http_status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["code"], "insufficient_balance");
+
+        // the key is free again, so a viable request with it now succeeds
+        let (retry_status, _) = post_fund(
+            &app,
+            fund_body_with_key(TEST_CLIENT_ID, 123, LOCKING_SCRIPT_HEX, "key-3"),
+        )
+        .await;
+        assert_eq!(retry_status, StatusCode::OK);
+    }
+
+    #[actix_web::test]
+    async fn different_idempotency_keys_each_broadcast() {
+        let (app, chain) = build_counting_app().await;
+        post_fund(
+            &app,
+            fund_body_with_key(TEST_CLIENT_ID, 123, LOCKING_SCRIPT_HEX, "key-4a"),
+        )
+        .await;
+        post_fund(
+            &app,
+            fund_body_with_key(TEST_CLIENT_ID, 123, LOCKING_SCRIPT_HEX, "key-4b"),
+        )
+        .await;
+        assert_eq!(chain.broadcast_count(), 2);
     }
 
     #[actix_web::test]
