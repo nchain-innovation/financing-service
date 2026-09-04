@@ -230,6 +230,8 @@ mod tests {
             outpoints: vec![OutpointResponse {
                 hash: hash.to_string(),
                 index: 1,
+                satoshi: 123,
+                locking_script: "76a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac".to_string(),
             }],
             txs: vec![TxResponse {
                 tx: "0100000001".to_string(),
