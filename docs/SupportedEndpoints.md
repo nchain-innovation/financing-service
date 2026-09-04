@@ -16,20 +16,22 @@ This applies to `POST /fund`, `GET /client/{client_id}/balance`, `GET /client/{c
 Missing or invalid credentials return HTTP `401`:
 
 ```json
-{"description": "Unauthorized"}
+{"code": "unauthorized", "description": "Unauthorized"}
 ```
 
 When `[web_interface.rate_limit]` is enabled, excess requests from the same IP receive HTTP `429`:
 
 ```json
-{"description": "Rate limit exceeded, retry in 1s"}
+{"code": "rate_limited", "description": "Rate limit exceeded, retry in 1s"}
 ```
 
 All JSON error responses use HTTP status `422` with this shape:
 
 ```json
-{"description": "Error message"}
+{"code": "invalid_request", "description": "Error message"}
 ```
+
+The `code` is a stable, machine-readable classification; see [Error responses](#error-responses) for the full set.
 
 Successful JSON responses use HTTP status `200`.
 
@@ -129,17 +131,45 @@ curl -H "Authorization: Bearer your-client-api-key" \
 
 That matters when spending the outpoint: a BSV (BIP-143) signature commits to both the previous output's value and its locking script, so if either differed from what the client assumed, the signature would not verify and the node would reject the spending transaction with a script error that says nothing about the funding value being wrong.
 
-Common error responses:
+### Error responses
 
-* Unauthorized — `{"description": "Unauthorized"}` (missing or invalid `api_key` for the client)
-* Unknown client — `{"description": "Unknown client_id client1"}`
-* Insufficient total balance — `{"description": "Insufficent client balance: 900 satoshi available, 873 required."}`
-* No suitable UTXO set — `{"description": "Unable to select UTXOs for funding transaction: largest UTXO is 300 satoshi, 873 required including fees."}`
-* Invalid input — `{"description": "Invalid satoshi value '0'"}`
+Every error response carries a machine-readable `code` alongside the human-readable `description`:
+
+```json
+{
+    "code": "insufficient_balance",
+    "description": "Insufficient client balance: 900 satoshi available, 873 required."
+}
+```
+
+**The `code` is the contract; the `description` is prose for humans and may be reworded at any time.** Clients should branch on `code` and log `description`. Treat an unrecognised code the way you would have treated the response before codes existed — the set may grow.
+
+| `code` | Meaning | Caller action |
+|---|---|---|
+| `insufficient_balance` | Total balance cannot cover the request | Top the wallet up; retryable after that |
+| `no_suitable_utxo` | Balance is sufficient but no combination of UTXOs fits | Split the wallet's UTXOs; retryable after that |
+| `unknown_client` | No such `client_id` | Fix configuration; never retryable as-is |
+| `client_exists` | `client_id` is already configured | `POST /client` only |
+| `invalid_request` | The request is malformed | Fix the request; never retryable unchanged |
+| `broadcast_failed` | Transaction built and signed, but the node rejected it or was unreachable | Retry may succeed |
+| `partial_broadcast` | Some of the requested transactions broadcast, some did not | Successful ones are in the response body |
+| `chain_unavailable` | The blockchain interface could not be reached | Retryable |
+| `internal` | Unexpected internal failure | Report it |
+| `unauthorized` | Authentication missing or invalid (HTTP 401) | Fix credentials |
+| `rate_limited` | Request rate exceeded | Retry after the interval in `description` |
+
+Examples:
+
+* Unauthorized — `{"code": "unauthorized", "description": "Unauthorized"}` (missing or invalid `api_key` for the client)
+* Unknown client — `{"code": "unknown_client", "description": "Unknown client_id client1"}`
+* Insufficient total balance — `{"code": "insufficient_balance", "description": "Insufficient client balance: 900 satoshi available, 873 required."}`
+* No suitable UTXO set — `{"code": "no_suitable_utxo", "description": "Unable to select UTXOs for funding transaction: largest UTXO is 300 satoshi, 873 required including fees."}`
+* Invalid input — `{"code": "invalid_request", "description": "Invalid satoshi value '0'"}`
 * Partial `multiple_tx` failure — HTTP 422 with successful transactions included when some broadcasts succeed before a later failure:
 
 ```json
 {
+    "code": "partial_broadcast",
     "description": "Failed to broadcast funding transaction 2 of 3: Failed to broadcast funding transaction. 1 transaction(s) were broadcast successfully: 11e11285...",
     "outpoints": [{"hash": "11e1128551854896dba1af5ebd75f7fb712ae88684cae59e86f89b158de86697", "index": 1, "satoshi": 123, "locking_script": "76a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac"}],
     "txs": [{"tx": "0100000001..."}]
@@ -180,7 +210,7 @@ curl -H "Authorization: Bearer your-admin-api-key" \
 
 Common error responses:
 
-* Unauthorized — `{"description": "Unauthorized"}` (missing or invalid admin key)
+* Unauthorized — `{"code": "unauthorized", "description": "Unauthorized"}` (missing or invalid admin key)
 
 ## Delete client
 
