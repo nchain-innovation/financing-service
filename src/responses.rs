@@ -148,6 +148,21 @@ pub struct TxResponse {
 pub struct FundingResponseJson {
     pub outpoints: Vec<OutpointResponse>,
     pub txs: Vec<TxResponse>,
+    /// True when this response is being replayed against a previously used
+    /// `idempotency_key` rather than describing a fresh funding.
+    ///
+    /// Serialised only when true, so an ordinary funding response is
+    /// unchanged; clients should read its absence as false. A client that
+    /// expected fresh funds and receives `"replayed": true` is holding
+    /// outpoints it has already been given, and very likely already spent --
+    /// better to fail on that immediately than to sign over a spent output
+    /// and get an opaque script error from the node.
+    #[serde(skip_serializing_if = "is_false")]
+    pub replayed: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Serialize)]
@@ -156,6 +171,10 @@ pub struct PartialFundingErrorResponse {
     pub description: String,
     pub outpoints: Vec<OutpointResponse>,
     pub txs: Vec<TxResponse>,
+    /// As [`FundingResponseJson::replayed`]. A replayed partial batch matters
+    /// just as much: those transactions are on chain from the first call.
+    #[serde(skip_serializing_if = "is_false")]
+    pub replayed: bool,
 }
 
 pub fn partial_funding_error_response(
@@ -169,6 +188,7 @@ pub fn partial_funding_error_response(
             description: description.into(),
             outpoints: funding.outpoints.clone(),
             txs: funding.txs.clone(),
+            replayed: funding.replayed,
         })
 }
 
@@ -265,6 +285,7 @@ mod tests {
             txs: vec![TxResponse {
                 tx: "010000".to_string(),
             }],
+            replayed: false,
         };
         let response = partial_funding_error_response("partial failure", &funding);
         assert_eq!(

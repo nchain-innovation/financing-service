@@ -146,10 +146,18 @@ The first call reserves the key and, once the transaction is broadcast, retains 
 | Situation | Result |
 |---|---|
 | New key | Funds normally, and the response is retained |
-| Same key, same request, already funded | Replays the first response; nothing is broadcast |
+| Same key, same request, already funded | Replays the first response with `"replayed": true`; nothing is broadcast |
 | Same key, still being processed | `422` `key_in_progress` — retry shortly |
 | Same key, materially different request | `422` `idempotency_key_reused` — use a fresh `idempotency_key` |
 | Refused before anything was built (`insufficient_balance`, `no_suitable_utxo`) | The key is freed, so it can be retried |
+
+**A replayed response is marked.** It carries `"replayed": true`; an ordinary funding response omits the field entirely, so read its absence as false.
+
+```json
+{"outpoints": [...], "txs": [...], "replayed": true}
+```
+
+This matters because a replay is otherwise indistinguishable from a fresh funding: same status, same shape, same outpoints. If you reuse a key by mistake — meaning "fund me again" rather than "tell me how that went" — you are handed outpoints you were already given, and probably already spent. Signing over a spent output fails at broadcast with a script error that says nothing about why. **Treat an unexpected `"replayed": true` as an error in your own key generation, and fail on it immediately.**
 
 A partly-successful `multiple_tx` batch is retained too, and a retry is answered the same way as the first call — the transactions that reached the chain are reported rather than being funded a second time.
 

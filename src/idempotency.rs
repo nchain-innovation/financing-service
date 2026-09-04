@@ -228,6 +228,7 @@ mod tests {
             txs: vec![TxResponse {
                 tx: "0100000001".to_string(),
             }],
+            replayed: false,
         }
     }
 

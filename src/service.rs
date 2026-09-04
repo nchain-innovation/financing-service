@@ -86,7 +86,13 @@ impl FundingResponse {
                 tx: tx_as_hexstr(tx)?,
             });
         }
-        Ok(FundingResponseJson { outpoints, txs })
+        Ok(FundingResponseJson {
+            outpoints,
+            txs,
+            // A freshly built response is never a replay; the flag is set on
+            // the way out of the idempotency store.
+            replayed: false,
+        })
     }
 }
 

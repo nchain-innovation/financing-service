@@ -291,12 +291,21 @@ pub async fn get_funds(
 
 /// Answer a retry with the outcome the first call produced.
 fn replay(outcome: Outcome) -> HttpResponse {
+    // Mark the response as replayed on the way out rather than storing it
+    // that way, so the flag means "you are being served a retained response"
+    // regardless of how many times it is asked for.
     match outcome {
-        Outcome::Funded(response) => json_ok(&response),
+        Outcome::Funded(mut response) => {
+            response.replayed = true;
+            json_ok(&response)
+        }
         Outcome::PartiallyFunded {
             description,
-            response,
-        } => partial_funding_error_response(description, &response),
+            mut response,
+        } => {
+            response.replayed = true;
+            partial_funding_error_response(description, &response)
+        }
     }
 }
 
@@ -1051,6 +1060,38 @@ mod tests {
         );
         assert_eq!(first["outpoints"], retry["outpoints"]);
         assert_eq!(first["txs"], retry["txs"]);
+
+        // The replay is marked, so a client that expected fresh funds can
+        // fail on it instead of spending an outpoint it already spent.
+        assert_eq!(retry["replayed"], true);
+        // and the first response carries no marker at all
+        assert!(
+            first.get("replayed").is_none(),
+            "an ordinary funding response should not carry the marker"
+        );
+    }
+
+    /// The marker is absent rather than false on a normal response, so today's
+    /// response shape is unchanged for clients that do not care about it.
+    #[actix_web::test]
+    async fn a_normal_funding_response_carries_no_replayed_marker() {
+        let app = build_app().await;
+        let (_, body) = post_fund(
+            &app,
+            fund_body_with_key(TEST_CLIENT_ID, 123, LOCKING_SCRIPT_HEX, "key-marker"),
+        )
+        .await;
+        assert!(body.get("replayed").is_none());
+    }
+
+    /// A response replayed without any key involved cannot happen, but a
+    /// response served without a key must never be marked either.
+    #[actix_web::test]
+    async fn funding_without_an_idempotency_key_carries_no_marker() {
+        let app = build_app().await;
+        let (_, body) =
+            post_fund(&app, fund_body(TEST_CLIENT_ID, 123, 1, LOCKING_SCRIPT_HEX)).await;
+        assert!(body.get("replayed").is_none());
     }
 
     /// Without a key the previous behaviour stands: every call funds, which is
