@@ -1,6 +1,6 @@
 # System requirements
 
-System requirements for the Financing Service Rust implementation (v3.0.0), with verification methods for each requirement.
+System requirements for the Financing Service Rust implementation (v4.0.0), with verification methods for each requirement.
 
 For API behaviour see [SupportedEndpoints.md](SupportedEndpoints.md). For configuration see [Configuration.md](Configuration.md). For implementation status see [Project.md](Project.md).
 

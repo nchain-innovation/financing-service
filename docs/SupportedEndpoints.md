@@ -77,7 +77,7 @@ curl http://127.0.0.1:8080/status
 
 ```json
 {
-    "version": "3.0.0",
+    "version": "4.0.0",
     "blockchain_status": "Connected",
     "blockchain_update_time": "2024-11-05 14:42:29"
 }
