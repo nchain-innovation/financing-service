@@ -10,7 +10,7 @@ use crate::{
     idempotency::{request_fingerprint, Outcome, RecordKey, Reservation},
     responses::{
         coded_error_response, error_response, json_ok, partial_funding_error_response,
-        AddressResponse, BalanceResponse, ErrorCode, HealthResponse, SuccessResponse,
+        AddressResponse, BalanceResponse, CodedError, ErrorCode, HealthResponse, SuccessResponse,
     },
     secrets::{secret_reference, validate_env_var_name},
     service::Service,
@@ -20,9 +20,20 @@ use crate::{
 pub struct FundingRequest {
     client_id: String,
     satoshi: u64,
-    no_of_outpoints: u32,
+    /// Required with `locking_script`. Ignored when `locking_scripts` is used,
+    /// where the count comes from the list length; if given there it must
+    /// agree with it.
+    #[serde(default)]
+    no_of_outpoints: Option<u32>,
     multiple_tx: bool,
-    locking_script: String,
+    /// One script applied to every outpoint. Mutually exclusive with
+    /// `locking_scripts`.
+    #[serde(default)]
+    locking_script: Option<String>,
+    /// One script per outpoint, so each is independently spendable. Mutually
+    /// exclusive with `locking_script`.
+    #[serde(default)]
+    locking_scripts: Option<Vec<String>>,
     /// Optional. When set, a retry carrying the same `idempotency_key` replays
     /// the response of the first call instead of funding again. Omitting it
     /// preserves the previous behaviour.
@@ -115,7 +126,10 @@ pub async fn update_clients(data: web::Data<AppState>) -> impl Responder {
 /// Example:
 ///     curl --header "Content-Type: application/json" \
 ///     --request POST \
-///     --data '{"client_id":"id1","satoshi":"123","no_of_outpoints":1,"multiple_tx":false,"locking_script":"00000"}' \
+///     --data '{"client_id":"id1","satoshi":123,"no_of_outpoints":1,"multiple_tx":false,"locking_script":"76a914...88ac"}' \
+///
+/// Or with one script per outpoint:
+///     --data '{"client_id":"id1","satoshi":123,"multiple_tx":false,"locking_scripts":["76a914aa...88ac","76a914bb...88ac"]}' \
 ///    http://127.0.0.1:8080/fund
 
 #[post("/fund")]
@@ -128,9 +142,7 @@ pub async fn get_funds(
 
     let client_id = &info.client_id;
     let satoshi = info.satoshi;
-    let no_of_outpoints = info.no_of_outpoints;
     let multiple_tx = info.multiple_tx;
-    let locking_script = &info.locking_script;
 
     if satoshi == 0 {
         return error_response(
@@ -138,30 +150,24 @@ pub async fn get_funds(
             format!("Invalid satoshi value '{satoshi}'"),
         );
     }
-    if no_of_outpoints == 0 {
-        return error_response(
-            ErrorCode::InvalidRequest,
-            format!("Invalid no_of_outpoints value '{no_of_outpoints}'"),
-        );
-    }
 
-    let locking_script_as_bytes = match hex::decode(locking_script) {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            return error_response(
-                ErrorCode::InvalidRequest,
-                format!("Unable to convert locking_script to bytes '{locking_script}'"),
-            );
-        }
+    // Normalise both request forms into one script per outpoint, so the rest
+    // of the service never has to care which was used.
+    let (no_of_outpoints, locking_scripts) = match resolve_locking_scripts(&info) {
+        Ok(resolved) => resolved,
+        Err(error) => return coded_error_response(error),
     };
-    debug!("locking_script_as_bytes = {:?}", locking_script_as_bytes);
+    let scripts_hex = info
+        .locking_scripts
+        .clone()
+        .unwrap_or_else(|| vec![info.locking_script.clone().unwrap_or_default()]);
 
     let fund_request = FundRequest {
         client_id: client_id.to_string(),
         satoshi,
         no_of_outpoints,
         multiple_tx,
-        locking_script: locking_script_as_bytes,
+        locking_scripts,
     };
 
     if !data.service.is_client_id_valid(client_id).await {
@@ -182,7 +188,7 @@ pub async fn get_funds(
     // Claim the `idempotency_key`, if the client supplied one, before anything
     // is prepared or broadcast. Reserving first is what makes a concurrent
     // duplicate visible rather than letting two calls both fund.
-    let fingerprint = request_fingerprint(satoshi, no_of_outpoints, multiple_tx, locking_script);
+    let fingerprint = request_fingerprint(satoshi, no_of_outpoints, multiple_tx, &scripts_hex);
     let record = info
         .idempotency_key
         .as_deref()
@@ -289,6 +295,62 @@ pub async fn get_funds(
             debug!("execute_funding error = {:?}", error);
             release_if_nothing_was_spent(&data.service, &record, error.code).await;
             coded_error_response(error)
+        }
+    }
+}
+
+/// Work out how many outpoints are wanted and the script for each.
+///
+/// Accepts either `locking_script` with `no_of_outpoints` (one script applied
+/// to every outpoint, the original form) or `locking_scripts` (one per
+/// outpoint). Exactly one of the two must be given.
+fn resolve_locking_scripts(info: &FundingRequest) -> Result<(u32, Vec<Vec<u8>>), CodedError> {
+    let invalid = |message: String| CodedError::new(ErrorCode::InvalidRequest, message);
+    let decode = |hex_script: &str| -> Result<Vec<u8>, CodedError> {
+        hex::decode(hex_script).map_err(|_| {
+            invalid(format!(
+                "Unable to convert locking_script to bytes '{hex_script}'"
+            ))
+        })
+    };
+
+    match (&info.locking_script, &info.locking_scripts) {
+        (Some(_), Some(_)) => Err(invalid(
+            "Provide either locking_script or locking_scripts, not both.".to_string(),
+        )),
+        (None, None) => Err(invalid(
+            "One of locking_script or locking_scripts is required.".to_string(),
+        )),
+        (Some(script), None) => {
+            let count = info.no_of_outpoints.unwrap_or(1);
+            if count == 0 {
+                return Err(invalid("Invalid no_of_outpoints value '0'".to_string()));
+            }
+            let bytes = decode(script)?;
+            // The same script for every outpoint, as before. Note this makes
+            // the outpoints spendable by one key, which is only what you want
+            // when a single owner takes all of them.
+            Ok((count, vec![bytes; count as usize]))
+        }
+        (None, Some(scripts)) => {
+            if scripts.is_empty() {
+                return Err(invalid(
+                    "locking_scripts must contain at least one script.".to_string(),
+                ));
+            }
+            let count = scripts.len() as u32;
+            if let Some(stated) = info.no_of_outpoints {
+                if stated != count {
+                    return Err(invalid(format!(
+                        "no_of_outpoints ({stated}) does not match the number of locking_scripts ({count})."
+                    )));
+                }
+            }
+            let mut decoded = Vec::with_capacity(scripts.len());
+            for script in scripts {
+                decoded.push(decode(script)?);
+            }
+            Ok((count, decoded))
         }
     }
 }
@@ -1169,6 +1231,183 @@ mod tests {
         )
         .await;
         assert_eq!(chain.broadcast_count(), 2);
+    }
+
+    const SCRIPT_A: &str = "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac";
+    const SCRIPT_B: &str = "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac";
+
+    fn decode_tx(tx_hex: &str) -> chain_gang::messages::Tx {
+        use chain_gang::messages::Tx;
+        use chain_gang::util::Serializable;
+        Tx::read(&mut std::io::Cursor::new(hex::decode(tx_hex).unwrap())).unwrap()
+    }
+
+    /// The point of #40: N outpoints from one request, each locked to a
+    /// different script, in a single transaction.
+    #[actix_web::test]
+    async fn sr_fund_locking_scripts_gives_each_outpoint_its_own_script() {
+        let app = build_app().await;
+        let (http_status, body) = post_fund(
+            &app,
+            json!({
+                "client_id": TEST_CLIENT_ID,
+                "satoshi": 123,
+                "multiple_tx": false,
+                "locking_scripts": [SCRIPT_A, SCRIPT_B],
+            }),
+        )
+        .await;
+        assert_eq!(http_status, StatusCode::OK);
+        assert_eq!(body["outpoints"].as_array().unwrap().len(), 2);
+        // one transaction, not two
+        assert_eq!(body["txs"].as_array().unwrap().len(), 1);
+
+        let tx = decode_tx(body["txs"][0]["tx"].as_str().unwrap());
+        let scripts: Vec<String> = body["outpoints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|op| {
+                let out_index = op["index"].as_u64().unwrap() as usize;
+                hex::encode(&tx.outputs[out_index].lock_script.0)
+            })
+            .collect();
+        assert_eq!(scripts, vec![SCRIPT_A.to_string(), SCRIPT_B.to_string()]);
+    }
+
+    /// The original form still applies one script to every outpoint.
+    #[actix_web::test]
+    async fn fund_with_one_locking_script_still_applies_it_to_every_outpoint() {
+        let app = build_app().await;
+        let (http_status, body) = post_fund(
+            &app,
+            json!({
+                "client_id": TEST_CLIENT_ID,
+                "satoshi": 123,
+                "no_of_outpoints": 2,
+                "multiple_tx": false,
+                "locking_script": SCRIPT_A,
+            }),
+        )
+        .await;
+        assert_eq!(http_status, StatusCode::OK);
+        let tx = decode_tx(body["txs"][0]["tx"].as_str().unwrap());
+        for op in body["outpoints"].as_array().unwrap() {
+            let out_index = op["index"].as_u64().unwrap() as usize;
+            assert_eq!(hex::encode(&tx.outputs[out_index].lock_script.0), SCRIPT_A);
+        }
+    }
+
+    #[actix_web::test]
+    async fn fund_rejects_both_locking_script_forms_together() {
+        let app = build_app().await;
+        let (http_status, body) = post_fund(
+            &app,
+            json!({
+                "client_id": TEST_CLIENT_ID,
+                "satoshi": 123,
+                "no_of_outpoints": 1,
+                "multiple_tx": false,
+                "locking_script": SCRIPT_A,
+                "locking_scripts": [SCRIPT_A],
+            }),
+        )
+        .await;
+        assert_eq!(http_status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["code"], "invalid_request");
+        assert!(body["description"].as_str().unwrap().contains("not both"));
+    }
+
+    #[actix_web::test]
+    async fn fund_rejects_neither_locking_script_form() {
+        let app = build_app().await;
+        let (http_status, body) = post_fund(
+            &app,
+            json!({
+                "client_id": TEST_CLIENT_ID,
+                "satoshi": 123,
+                "no_of_outpoints": 1,
+                "multiple_tx": false,
+            }),
+        )
+        .await;
+        assert_eq!(http_status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["code"], "invalid_request");
+    }
+
+    #[actix_web::test]
+    async fn fund_rejects_an_empty_locking_scripts_list() {
+        let app = build_app().await;
+        let (http_status, body) = post_fund(
+            &app,
+            json!({
+                "client_id": TEST_CLIENT_ID,
+                "satoshi": 123,
+                "multiple_tx": false,
+                "locking_scripts": [],
+            }),
+        )
+        .await;
+        assert_eq!(http_status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["code"], "invalid_request");
+    }
+
+    /// A stated count that disagrees with the list is a mistake worth
+    /// reporting rather than silently preferring one of them.
+    #[actix_web::test]
+    async fn fund_rejects_no_of_outpoints_disagreeing_with_locking_scripts() {
+        let app = build_app().await;
+        let (http_status, body) = post_fund(
+            &app,
+            json!({
+                "client_id": TEST_CLIENT_ID,
+                "satoshi": 123,
+                "no_of_outpoints": 3,
+                "multiple_tx": false,
+                "locking_scripts": [SCRIPT_A, SCRIPT_B],
+            }),
+        )
+        .await;
+        assert_eq!(http_status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["code"], "invalid_request");
+        assert!(body["description"]
+            .as_str()
+            .unwrap()
+            .contains("does not match"));
+    }
+
+    /// With multiple_tx each transaction pays its own script.
+    #[actix_web::test]
+    async fn fund_multiple_tx_pays_each_script_from_its_own_transaction() {
+        let (app, chain) = build_counting_app().await;
+        let (http_status, body) = post_fund(
+            &app,
+            json!({
+                "client_id": TEST_CLIENT_ID,
+                "satoshi": 123,
+                "multiple_tx": true,
+                "locking_scripts": [SCRIPT_A, SCRIPT_B],
+            }),
+        )
+        .await;
+        assert_eq!(http_status, StatusCode::OK);
+        assert_eq!(body["txs"].as_array().unwrap().len(), 2);
+        assert_eq!(chain.broadcast_count(), 2);
+
+        let mut seen: Vec<String> = body["txs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| {
+                let tx = decode_tx(t["tx"].as_str().unwrap());
+                // output 1 is the funded output; 0 is change
+                hex::encode(&tx.outputs[1].lock_script.0)
+            })
+            .collect();
+        seen.sort();
+        let mut expected = vec![SCRIPT_A.to_string(), SCRIPT_B.to_string()];
+        expected.sort();
+        assert_eq!(seen, expected);
     }
 
     #[actix_web::test]

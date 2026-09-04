@@ -536,18 +536,24 @@ impl Service {
             return Err(MultipleTxFundError::complete(error.code, error.description));
         }
 
-        let per_tx_request = FundRequest {
-            client_id: fund_request.client_id.clone(),
-            satoshi: fund_request.satoshi,
-            no_of_outpoints: 1,
-            multiple_tx: false,
-            locking_script: fund_request.locking_script.clone(),
-        };
-
         let mut combined = FundingResponse::default();
         let total = fund_request.no_of_outpoints;
 
         for tx_index in 0..total {
+            // Each transaction pays its own script, so build the per-tx
+            // request inside the loop rather than reusing one.
+            let per_tx_request = FundRequest {
+                client_id: fund_request.client_id.clone(),
+                satoshi: fund_request.satoshi,
+                no_of_outpoints: 1,
+                multiple_tx: false,
+                locking_scripts: vec![fund_request
+                    .locking_scripts
+                    .get(tx_index as usize)
+                    .or_else(|| fund_request.locking_scripts.last())
+                    .cloned()
+                    .unwrap_or_default()],
+            };
             match Self::prepare_funding_outpoints(service, &per_tx_request).await {
                 Ok((blockchain, prepared)) => {
                     match Self::broadcast_prepared_funding(blockchain, &prepared).await {
@@ -693,7 +699,7 @@ mod tests {
             satoshi: 123,
             no_of_outpoints: 1,
             multiple_tx: false,
-            locking_script: hex::decode(LOCKING_SCRIPT_HEX).unwrap(),
+            locking_scripts: vec![hex::decode(LOCKING_SCRIPT_HEX).unwrap()],
         }
     }
 
@@ -772,7 +778,7 @@ mod tests {
             satoshi: 123,
             no_of_outpoints: 2,
             multiple_tx: true,
-            locking_script: hex::decode(LOCKING_SCRIPT_HEX).unwrap(),
+            locking_scripts: vec![hex::decode(LOCKING_SCRIPT_HEX).unwrap()],
         };
 
         let response = Service::fund_with_multiple_transactions(&service, &fund_request)
@@ -846,7 +852,7 @@ mod tests {
             satoshi: 123,
             no_of_outpoints: 2,
             multiple_tx: true,
-            locking_script: hex::decode(LOCKING_SCRIPT_HEX).unwrap(),
+            locking_scripts: vec![hex::decode(LOCKING_SCRIPT_HEX).unwrap()],
         };
 
         let error = Service::fund_with_multiple_transactions(&service, &fund_request)
