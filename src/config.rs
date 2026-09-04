@@ -55,7 +55,7 @@ pub struct IdempotencyConfig {
     #[serde(default = "default_idempotency_ttl_seconds")]
     pub ttl_seconds: u64,
     /// Upper bound on retained records, so a client cannot grow the store
-    /// without limit by sending a fresh key every time.
+    /// without limit by sending a fresh `idempotency_key` every time.
     #[serde(default = "default_idempotency_max_entries")]
     pub max_entries: usize,
 }

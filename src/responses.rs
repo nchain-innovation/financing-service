@@ -48,7 +48,7 @@ pub enum ErrorCode {
     /// Retry shortly; the completed response will then be replayed.
     KeyInProgress,
     /// This `idempotency_key` was already used with a materially different
-    /// request. Use a fresh key.
+    /// request. Use a fresh `idempotency_key`.
     IdempotencyKeyReused,
 }
 

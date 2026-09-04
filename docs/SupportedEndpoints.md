@@ -148,7 +148,7 @@ The first call reserves the key and, once the transaction is broadcast, retains 
 | New key | Funds normally, and the response is retained |
 | Same key, same request, already funded | Replays the first response; nothing is broadcast |
 | Same key, still being processed | `422` `key_in_progress` — retry shortly |
-| Same key, materially different request | `422` `idempotency_key_reused` — use a fresh key |
+| Same key, materially different request | `422` `idempotency_key_reused` — use a fresh `idempotency_key` |
 | Refused before anything was built (`insufficient_balance`, `no_suitable_utxo`) | The key is freed, so it can be retried |
 
 A partly-successful `multiple_tx` batch is retained too, and a retry is answered the same way as the first call — the transactions that reached the chain are reported rather than being funded a second time.
@@ -158,7 +158,7 @@ Keys are scoped per `client_id`, so two clients may choose the same string witho
 **Two limits worth knowing:**
 
 * **Records are held in memory and are lost when the service restarts.** A retry that spans a restart can still produce a second funding transaction. Retention is bounded by `[idempotency] ttl_seconds` (default 600) and `max_entries` (default 10000); see [Configuration](Configuration.md).
-* **After a failure that may have spent something, the key is not freed** — only the refusals listed above free it. Any other failure leaves the key reserved until its TTL expires, and a retry with it returns `key_in_progress`. This is deliberate: a broadcast may have reached the node before the connection dropped, so releasing the key could cause the duplicate this mechanism exists to prevent. Use a fresh key if you need to retry sooner.
+* **After a failure that may have spent something, the key is not freed** — only the refusals listed above free it. Any other failure leaves the key reserved until its TTL expires, and a retry with it returns `key_in_progress`. This is deliberate: a broadcast may have reached the node before the connection dropped, so releasing the key could cause the duplicate this mechanism exists to prevent. Use a fresh `idempotency_key` if you need to retry sooner.
 
 ### Error responses
 
@@ -187,7 +187,7 @@ Every error response carries a machine-readable `code` alongside the human-reada
 | `unauthorized` | Authentication missing or invalid (HTTP 401) | Fix credentials |
 | `rate_limited` | Request rate exceeded | Retry after the interval in `description` |
 | `key_in_progress` | A request with this `idempotency_key` is still being processed | Retry shortly |
-| `idempotency_key_reused` | This `idempotency_key` was used with a different request | Use a fresh key |
+| `idempotency_key_reused` | This `idempotency_key` was used with a different request | Use a fresh `idempotency_key` |
 
 Examples:
 

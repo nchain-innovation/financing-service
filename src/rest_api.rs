@@ -204,7 +204,7 @@ pub async fn get_funds(
             Reservation::Reused => {
                 return error_response(
                     ErrorCode::IdempotencyKeyReused,
-                    "This idempotency_key was already used with a different request. Use a fresh key.",
+                    "This idempotency_key was already used with a different request. Use a fresh idempotency_key.",
                 );
             }
         }

@@ -155,7 +155,7 @@ max_entries = 10000
 ```
 
 * `ttl_seconds` — how long a completed record stays replayable. Should comfortably exceed your clients' retry window; too short and a legitimate retry funds a second time. Default `600`.
-* `max_entries` — upper bound on retained records, so a client sending a fresh key on every request cannot grow the store without limit. When full, the oldest record is dropped. Default `10000`.
+* `max_entries` — upper bound on retained records, so a client sending a fresh `idempotency_key` on every request cannot grow the store without limit. When full, the oldest record is dropped. Default `10000`.
 
 Records are held **in memory only** and are lost when the service restarts, so a retry that spans a restart can still produce a second funding transaction.
 
