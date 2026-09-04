@@ -5,12 +5,14 @@
 //! timeout, a dropped connection -- the transaction is already on chain and the
 //! client has no record of the outpoint. A plain retry then produces a *second*
 //! funding transaction, spending more of the wallet, and the first output is
-//! stranded: locked to a key the client may no longer be able to name.
+//! stranded: locked to a P2PKH key the client may no longer be able to name.
+//! (That is a signing key -- not to be confused with the `idempotency_key`
+//! below, which is an opaque string naming a funding request.)
 //!
 //! A client can avoid that by sending an `idempotency_key` with the request.
-//! The first call reserves the key, and once the transaction is broadcast the
-//! response is retained against it. A retry carrying the same key replays that
-//! stored response instead of funding again.
+//! The first call reserves that `idempotency_key`, and once the transaction is
+//! broadcast the response is retained against it. A retry carrying the same
+//! `idempotency_key` replays that stored response instead of funding again.
 //!
 //! Records live in memory only, so they do not survive a restart. A retry that
 //! spans one can still double-fund; that limit is deliberate (it keeps this out
@@ -21,8 +23,10 @@ use std::time::{Duration, Instant};
 
 use crate::responses::FundingResponseJson;
 
-/// Identifies a record. Keys are scoped per client so two clients choosing the
-/// same key cannot collide.
+/// Identifies a record: a client and the `idempotency_key` it supplied.
+///
+/// Scoped per client, so two clients choosing the same `idempotency_key`
+/// string cannot collide.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RecordKey {
     pub client_id: String,
@@ -54,19 +58,19 @@ pub enum Outcome {
     },
 }
 
-/// What the caller should do with a request that carries an idempotency key.
+/// What the caller should do with a request that carries an `idempotency_key`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Reservation {
-    /// The key is new. Proceed with funding; report the outcome via
+    /// This `idempotency_key` is new. Proceed with funding; report the outcome via
     /// [`IdempotencyStore::complete`] or [`IdempotencyStore::release`].
     Proceed,
-    /// This key already reached the chain. Replay the retained outcome
+    /// This `idempotency_key` already reached the chain. Replay the retained outcome
     /// without preparing or broadcasting anything.
     Replay(Outcome),
-    /// A request with this key is still being processed. The caller should not
+    /// A request with this `idempotency_key` is still being processed. The caller should not
     /// fund, because doing so risks the duplicate this exists to prevent.
     InProgress,
-    /// The key was used before with a materially different request, so
+    /// This `idempotency_key` was used before with a materially different request, so
     /// replaying the stored response would answer a question that was not
     /// asked.
     Reused,
@@ -118,7 +122,7 @@ impl IdempotencyStore {
         }
     }
 
-    /// Claim `key` for a request whose identity is `fingerprint`.
+    /// Claim an `idempotency_key` for a request whose identity is `fingerprint`.
     ///
     /// Reserving takes effect immediately, so a concurrent duplicate sees
     /// `InProgress` rather than both callers broadcasting.
@@ -146,7 +150,7 @@ impl IdempotencyStore {
         Reservation::Proceed
     }
 
-    /// Retain `outcome` against `key`, so a later retry replays it.
+    /// Retain `outcome` against this `idempotency_key`, so a later retry replays it.
     ///
     /// Call this once a funding transaction has been broadcast, whether or not
     /// the local UTXO cache was updated afterwards, and whether the batch
@@ -163,10 +167,11 @@ impl IdempotencyStore {
         );
     }
 
-    /// Drop the reservation for `key` because nothing was broadcast.
+    /// Drop the reservation for this `idempotency_key` because nothing was
+    /// broadcast.
     ///
-    /// This lets the client retry the same key, which is the right outcome for
-    /// a request that failed before spending anything.
+    /// This lets the client retry with the same `idempotency_key`, which is the
+    /// right outcome for a request that failed before spending anything.
     pub fn release(&mut self, key: &RecordKey) {
         self.entries.remove(key);
     }
@@ -203,8 +208,9 @@ impl IdempotencyStore {
     }
 }
 
-/// Identity of a funding request, so a key reused with different parameters is
-/// detected rather than silently answered with the earlier response.
+/// Identity of a funding request, so an `idempotency_key` reused with different
+/// parameters is detected rather than silently answered with the earlier
+/// response.
 pub fn request_fingerprint(
     satoshi: u64,
     no_of_outpoints: u32,
@@ -302,7 +308,7 @@ mod tests {
             "fp",
             Outcome::Funded(response("aabb")),
         );
-        // a different client using the same key string is unaffected
+        // a different client using the same idempotency_key string is unaffected
         assert_eq!(
             store.reserve(RecordKey::new("id2", "shared"), "fp"),
             Reservation::Proceed
@@ -315,7 +321,7 @@ mod tests {
         store.reserve(key(), "fp");
         store.complete(key(), "fp", Outcome::Funded(response("aabb")));
         std::thread::sleep(Duration::from_millis(5));
-        // past its TTL, so the key is new again rather than replayable
+        // past its TTL, so the idempotency_key is new again rather than replayable
         assert_eq!(store.reserve(key(), "fp"), Reservation::Proceed);
     }
 

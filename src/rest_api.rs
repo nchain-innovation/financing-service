@@ -23,9 +23,13 @@ pub struct FundingRequest {
     no_of_outpoints: u32,
     multiple_tx: bool,
     locking_script: String,
-    /// Optional. When set, a retry carrying the same key replays the response
-    /// of the first call instead of funding again. Omitting it preserves the
-    /// previous behaviour.
+    /// Optional. When set, a retry carrying the same `idempotency_key` replays
+    /// the response of the first call instead of funding again. Omitting it
+    /// preserves the previous behaviour.
+    ///
+    /// This is unrelated to `wif_key` and `api_key` elsewhere in this service:
+    /// it is an opaque string chosen by the client to name one funding
+    /// request, not a credential or a signing key.
     #[serde(default)]
     idempotency_key: Option<String>,
 }
@@ -175,7 +179,7 @@ pub async fn get_funds(
         return error_response(ErrorCode::ChainUnavailable, description);
     }
 
-    // Claim the idempotency key, if the client supplied one, before anything
+    // Claim the `idempotency_key`, if the client supplied one, before anything
     // is prepared or broadcast. Reserving first is what makes a concurrent
     // duplicate visible rather than letting two calls both fund.
     let fingerprint = request_fingerprint(satoshi, no_of_outpoints, multiple_tx, locking_script);
@@ -309,17 +313,17 @@ fn replay(outcome: Outcome) -> HttpResponse {
     }
 }
 
-/// Free the idempotency key only when the failure cannot have spent anything,
-/// so the client may retry with the same key.
+/// Free the `idempotency_key` only when the failure cannot have spent
+/// anything, so the client may retry with the same `idempotency_key`.
 ///
 /// This is deliberately conservative. `insufficient_balance` and
 /// `no_suitable_utxo` are decided before a transaction is built, so releasing
 /// is safe. Every other failure is ambiguous from here -- a broadcast may have
 /// reached the node before the connection dropped, and a commit failure means
 /// the transaction is definitely on chain -- so the reservation is left to
-/// expire rather than risk funding twice. The cost is that the same key cannot
-/// be retried until the TTL elapses; the alternative risks the duplicate this
-/// whole mechanism exists to prevent.
+/// expire rather than risk funding twice. The cost is that the same
+/// `idempotency_key` cannot be retried until the TTL elapses; the alternative
+/// risks the duplicate this whole mechanism exists to prevent.
 async fn release_if_nothing_was_spent(
     service: &Arc<Service>,
     record: &Option<(RecordKey, String)>,
@@ -1084,8 +1088,8 @@ mod tests {
         assert!(body.get("replayed").is_none());
     }
 
-    /// A response replayed without any key involved cannot happen, but a
-    /// response served without a key must never be marked either.
+    /// A response replayed without any `idempotency_key` involved cannot
+    /// happen, but a response served without one must never be marked either.
     #[actix_web::test]
     async fn funding_without_an_idempotency_key_carries_no_marker() {
         let app = build_app().await;
@@ -1094,8 +1098,9 @@ mod tests {
         assert!(body.get("replayed").is_none());
     }
 
-    /// Without a key the previous behaviour stands: every call funds, which is
-    /// the duplicate #39 reports. This is the control for the test above.
+    /// Without an `idempotency_key` the previous behaviour stands: every call
+    /// funds, which is the duplicate #39 reports. This is the control for the
+    /// test above.
     #[actix_web::test]
     async fn fund_without_an_idempotency_key_broadcasts_every_time() {
         let (app, chain) = build_counting_app().await;
@@ -1117,7 +1122,7 @@ mod tests {
         .await;
         assert_eq!(first_status, StatusCode::OK);
 
-        // same key, different satoshi value
+        // same idempotency_key, different satoshi value
         let (http_status, body) = post_fund(
             &app,
             fund_body_with_key(TEST_CLIENT_ID, 456, LOCKING_SCRIPT_HEX, "key-2"),
@@ -1127,8 +1132,9 @@ mod tests {
         assert_eq!(body["code"], "idempotency_key_reused");
     }
 
-    /// A refusal decided before any transaction is built must free the key, so
-    /// the client can retry it once the wallet is topped up.
+    /// A refusal decided before any transaction is built must free the
+    /// `idempotency_key`, so the client can retry it once the wallet is topped
+    /// up.
     #[actix_web::test]
     async fn a_pre_broadcast_refusal_frees_the_idempotency_key() {
         let app = build_app().await;
@@ -1140,7 +1146,7 @@ mod tests {
         assert_eq!(http_status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(body["code"], "insufficient_balance");
 
-        // the key is free again, so a viable request with it now succeeds
+        // the idempotency_key is free again, so a viable request with it now succeeds
         let (retry_status, _) = post_fund(
             &app,
             fund_body_with_key(TEST_CLIENT_ID, 123, LOCKING_SCRIPT_HEX, "key-3"),
