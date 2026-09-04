@@ -50,14 +50,30 @@ impl MultipleTxFundError {
 
 impl FundingResponse {
     pub fn to_response(&self) -> Result<FundingResponseJson, String> {
-        let outpoints = self
-            .outpoints
-            .iter()
-            .map(|op| OutpointResponse {
-                hash: op.hash.encode(),
+        // The value and locking script are read from the transaction that
+        // actually pays each outpoint, not echoed from the request. A client
+        // signing this outpoint commits to both under BIP-143, so it needs to
+        // be able to verify what was paid rather than be told what was asked
+        // for.
+        let mut outpoints = Vec::with_capacity(self.outpoints.len());
+        for op in &self.outpoints {
+            let hash = op.hash.encode();
+            let tx = self
+                .txs
+                .iter()
+                .find(|tx| tx.hash() == op.hash)
+                .ok_or_else(|| format!("No transaction in response for outpoint {hash}"))?;
+            let output = tx
+                .outputs
+                .get(op.index as usize)
+                .ok_or_else(|| format!("Transaction {hash} has no output at index {}", op.index))?;
+            outpoints.push(OutpointResponse {
+                hash,
                 index: op.index,
-            })
-            .collect();
+                satoshi: output.satoshis,
+                locking_script: hex::encode(&output.lock_script.0),
+            });
+        }
         let mut txs = Vec::with_capacity(self.txs.len());
         for tx in &self.txs {
             txs.push(TxResponse {

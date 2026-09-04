@@ -798,6 +798,13 @@ mod tests {
         let body: Value = test::read_body_json(resp).await;
         assert_eq!(body["txs"].as_array().unwrap().len(), 2);
         assert_eq!(body["outpoints"].as_array().unwrap().len(), 2);
+        // With multiple_tx each outpoint comes from a different transaction,
+        // so this also covers the value and script being matched to the right
+        // one rather than to the first in the list.
+        for outpoint in body["outpoints"].as_array().unwrap() {
+            assert_eq!(outpoint["satoshi"], 123);
+            assert_eq!(outpoint["locking_script"], LOCKING_SCRIPT_HEX);
+        }
     }
 
     #[actix_web::test]
@@ -816,6 +823,45 @@ mod tests {
         assert_eq!(body["outpoints"].as_array().unwrap().len(), 1);
         assert_eq!(body["txs"].as_array().unwrap().len(), 1);
         assert!(!body["outpoints"][0]["hash"].as_str().unwrap().is_empty());
+        assert_eq!(body["outpoints"][0]["satoshi"], 123);
+        assert_eq!(body["outpoints"][0]["locking_script"], LOCKING_SCRIPT_HEX);
+    }
+
+    /// The point of returning `satoshi` and `locking_script` is that a client
+    /// can verify what was paid rather than assume the request was honoured.
+    /// So assert they agree with the transaction actually broadcast, decoded
+    /// from the response, rather than merely echoing the request.
+    #[actix_web::test]
+    async fn sr_fund_outpoints_report_the_value_and_script_of_the_broadcast_tx() {
+        use chain_gang::messages::Tx;
+        use chain_gang::util::Serializable;
+
+        let app = build_app().await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/fund")
+                .set_json(fund_body(TEST_CLIENT_ID, 123, 1, LOCKING_SCRIPT_HEX))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = test::read_body_json(resp).await;
+
+        let tx_hex = body["txs"][0]["tx"].as_str().unwrap();
+        let tx = Tx::read(&mut std::io::Cursor::new(hex::decode(tx_hex).unwrap())).unwrap();
+
+        let outpoint = &body["outpoints"][0];
+        let output_index = outpoint["index"].as_u64().unwrap() as usize;
+        let output = &tx.outputs[output_index];
+
+        assert_eq!(outpoint["satoshi"].as_i64().unwrap(), output.satoshis);
+        assert_eq!(
+            outpoint["locking_script"].as_str().unwrap(),
+            hex::encode(&output.lock_script.0)
+        );
+        // and the requested value really is what was paid
+        assert_eq!(output.satoshis, 123);
     }
 
     #[actix_web::test]
