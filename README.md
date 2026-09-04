@@ -20,7 +20,7 @@ The FS is designed to be as simple as possible, in that light it:
 * FS only accesses the funding key required to sign the transaction that provides the funds the client wishes to spend.
 * FS does not access the client's key, instead the client provides the locking script (script_pubkey).
 
-* FS uses WhatsOnChain or UTXO as a Service (UaaS) interfaces to access the blockchain.
+* FS uses WhatsOnChain or UTXO as a Service (UaaS) interfaces to access the blockchain. Both reach mainnet, testnet and STN; neither reaches regtest. See [which interface reaches which network](docs/Configuration.md#which-interface-reaches-which-network).
 * FS maintains an in-memory UTXO cache per client, refreshed periodically from the blockchain and before funding and balance requests. Clients added at runtime are persisted to a dynamic config file.
 * FS is configurable; it reads its configuration on startup.
 

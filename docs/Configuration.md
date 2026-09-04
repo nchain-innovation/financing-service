@@ -19,6 +19,24 @@ network_type = "testnet"
 
 Supported `network_type` values: `mainnet`, `testnet`, `stn`.
 
+### Which interface reaches which network
+
+The interface you choose constrains which networks you can reach, and this is usually the deciding factor for a local deployment.
+
+| `interface_type` | Reaches | mainnet | testnet | stn | regtest |
+|---|---|---|---|---|---|
+| `woc` | WhatsOnChain, a public API | ✅ | ✅ | ✅ | ❌ |
+| `uaas` | a UTXO as a Service instance (set `url`) | ✅ | ✅ | ✅ | ❌ |
+| `test` | nothing — an in-process stub | — | — | — | — |
+
+**`regtest` is not supported by any interface.** `network_type = "regtest"` is not an accepted value either, so it fails at startup with `unable to decode network`. There is currently no way to run this service against a local regtest chain; see [issue #44](https://github.com/nchain-innovation/financing-service/issues/44).
+
+**`test` is a fixture, not a backend.** It is an in-process stub used by the unit tests, with a UTXO set injected directly by the test harness. It has no network of its own, so the `network_type` you set alongside it only affects address encoding. It is also not runnable as a configured backend today: a default-constructed stub panics on the first balance query (see [chain-gang#139](https://github.com/nchain-innovation/chain-gang/issues/139)).
+
+### A note on the default port
+
+`[web_interface] port` defaults to `8080`, which several other nChain services also default to — mapi-lite among them. If you are running this alongside one of those, change the port here or there; nothing will respond on a port that another process already holds.
+
 ## [web_interface]
 
 Configures the REST API endpoint for the service.
