@@ -45,6 +45,54 @@ pub struct ServiceConfig {
     pub utxo_refresh_period: u64,
 }
 
+/// Retention policy for `POST /fund` idempotency records.
+///
+/// Records are held in memory only, so they do not survive a restart -- a
+/// retry that spans one can still produce a second funding transaction.
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+pub struct IdempotencyConfig {
+    /// How long a completed record stays replayable, in seconds.
+    #[serde(default = "default_idempotency_ttl_seconds")]
+    pub ttl_seconds: u64,
+    /// Upper bound on retained records, so a client cannot grow the store
+    /// without limit by sending a fresh `idempotency_key` every time.
+    #[serde(default = "default_idempotency_max_entries")]
+    pub max_entries: usize,
+}
+
+impl Default for IdempotencyConfig {
+    fn default() -> Self {
+        IdempotencyConfig {
+            ttl_seconds: default_idempotency_ttl_seconds(),
+            max_entries: default_idempotency_max_entries(),
+        }
+    }
+}
+
+fn default_idempotency_ttl_seconds() -> u64 {
+    600
+}
+
+fn default_idempotency_max_entries() -> usize {
+    10_000
+}
+
+impl IdempotencyConfig {
+    pub fn ttl(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.ttl_seconds)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.ttl_seconds == 0 {
+            return Err("idempotency.ttl_seconds must be greater than zero".to_string());
+        }
+        if self.max_entries == 0 {
+            return Err("idempotency.max_entries must be greater than zero".to_string());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Default, Deserialize, Clone)]
 pub struct DynamicConfigConfig {
     pub filename: String,
@@ -126,6 +174,8 @@ pub struct Config {
     pub service: ServiceConfig,
     pub client: Option<Vec<ClientConfig>>,
     pub dynamic_config: DynamicConfigConfig,
+    #[serde(default)]
+    pub idempotency: IdempotencyConfig,
 }
 
 impl ClientConfig {
@@ -238,6 +288,7 @@ pub fn load_config(env_var: &str, filename: &str) -> Result<Config, String> {
     let config = get_config(env_var, filename)?;
     config.web_interface.rate_limit.validate()?;
     config.telemetry.validate()?;
+    config.idempotency.validate()?;
     warn_plaintext_secrets(&config);
     config.resolve_secrets()
 }

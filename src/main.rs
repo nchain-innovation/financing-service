@@ -9,6 +9,7 @@ mod blockchain_factory;
 mod client;
 mod config;
 mod dynamic_config;
+mod idempotency;
 mod rate_limit;
 mod responses;
 mod rest_api;
