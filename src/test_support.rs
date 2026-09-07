@@ -49,6 +49,8 @@ pub fn test_config_with_keys(
             interface_type: "test".to_string(),
             network_type: "testnet".to_string(),
             url: None,
+            rpc_user: None,
+            rpc_password: None,
         },
         web_interface: crate::config::WebInterfaceConfig {
             address: std::net::Ipv4Addr::LOCALHOST,

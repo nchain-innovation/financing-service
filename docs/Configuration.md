@@ -8,16 +8,18 @@ The file is composed of the following sections:
 
 ## [blockchain_interface]
 
-Configures the blockchain interface. Supported `interface_type` values: `woc`, `uaas`, `test`.
+Configures the blockchain interface. Supported `interface_type` values: `woc`, `uaas`, `rpc`, `test`.
 
 ```toml
 [blockchain_interface]
 interface_type = "woc"
 network_type = "testnet"
-# url = "http://localhost:5010"  # required for uaas
+# url = "http://localhost:5010"  # required for uaas, and for rpc (host:port)
+# rpc_user = "rpcuser"                    # required for rpc
+# rpc_password = "env:FS_RPC_PASSWORD"    # required for rpc
 ```
 
-Supported `network_type` values: `mainnet`, `testnet`, `stn`.
+Supported `network_type` values: `mainnet`, `testnet`, `stn`, `regtest`.
 
 ### Which interface reaches which network
 
@@ -27,9 +29,34 @@ The interface you choose constrains which networks you can reach, and this is us
 |---|---|---|---|---|---|
 | `woc` | WhatsOnChain, a public API | ✅ | ✅ | ✅ | ❌ |
 | `uaas` | a UTXO as a Service instance (set `url`) | ✅ | ✅ | ✅ | ❌ |
+| `rpc` | a node's JSON-RPC endpoint, directly | ✅ | ✅ | ✅ | ✅ |
 | `test` | nothing — an in-process stub | — | — | — | — |
 
-**`regtest` is not supported by any interface.** `network_type = "regtest"` is not an accepted value either, so it fails at startup with `unable to decode network`. There is currently no way to run this service against a local regtest chain; see [issue #44](https://github.com/nchain-innovation/financing-service/issues/44).
+**`rpc` is the only interface that reaches regtest**, because no public explorer serves a private chain. It also works against a node you control on any other network, which removes the dependency on a third-party API being up.
+
+### The `rpc` interface
+
+```toml
+[blockchain_interface]
+interface_type = "rpc"
+network_type = "regtest"
+url = "127.0.0.1:18443"
+rpc_user = "rpcuser"
+rpc_password = "env:FS_RPC_PASSWORD"
+```
+
+* `url` — the node's JSON-RPC host and port. A bare `host:port` is treated as `http://`; give a full URL to use `https`.
+* `rpc_user` / `rpc_password` — the node's RPC credentials, sent as HTTP basic auth on every call. **Point this only at a node you control**, since the credentials go to whatever host is configured.
+
+`rpc_password` supports an `env:VAR_NAME` reference and is overridden by `FS_RPC_PASSWORD`; `rpc_user` behaves the same way with `FS_RPC_USER`. A plaintext `rpc_password` is reported at startup like any other plaintext secret. See [Secrets](#secrets).
+
+**The node must be watching each client's funding address.** Balance and UTXO queries use `listunspent` filtered by address, which only returns outputs for addresses the node's wallet tracks. The service does not import addresses for you — that would mean managing the node's wallet and deciding when to rescan. On a fresh regtest node, import each client's address once:
+
+```
+bitcoin-cli -regtest importaddress "<client funding address>" "" false
+```
+
+Use `GET /client/{client_id}/address` to obtain the address, and `false` to skip the rescan on a chain with no history. Without this, balances read zero and funding is refused with `no_suitable_utxo` even though the node is reachable.
 
 **`test` is a fixture, not a backend.** It is an in-process stub used by the unit tests, with a UTXO set injected directly by the test harness. It has no network of its own, so the `network_type` you set alongside it only affects address encoding. It will start and serve requests as a configured backend, but its UTXO set is empty, so balances read zero and funding is refused — useful for exercising the API surface, not for funding anything.
 

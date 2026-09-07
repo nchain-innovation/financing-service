@@ -1,6 +1,12 @@
 [blockchain_interface]
 interface_type = "woc"
 network_type = "testnet"
+# For a local node (the only way to reach regtest):
+# interface_type = "rpc"
+# network_type = "regtest"
+# url = "127.0.0.1:18443"
+# rpc_user = "rpcuser"
+# rpc_password = "env:FS_RPC_PASSWORD"
 # url = "http://localhost:5010"
 
 [web_interface]

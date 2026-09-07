@@ -11,7 +11,56 @@ use crate::secrets::{resolve_secret, warn_plaintext_secrets};
 pub struct BlockchainInterfaceConfig {
     pub interface_type: String,
     pub network_type: String,
+    /// Endpoint for the interfaces that need one: the UaaS base URL, or the
+    /// node's JSON-RPC host and port for `rpc` (a bare `host:port` is assumed
+    /// to be `http://`).
     pub url: Option<String>,
+    /// JSON-RPC username, for `interface_type = "rpc"`.
+    #[serde(default)]
+    pub rpc_user: Option<String>,
+    /// JSON-RPC password, for `interface_type = "rpc"`. Supports an
+    /// `env:VAR_NAME` reference, and is overridden by `FS_RPC_PASSWORD`.
+    #[serde(default)]
+    pub rpc_password: Option<String>,
+}
+
+impl BlockchainInterfaceConfig {
+    /// Reject a configuration the chosen interface cannot work with, at
+    /// startup rather than on the first request.
+    pub fn validate(&self) -> Result<(), String> {
+        match self.interface_type.as_str() {
+            "uaas" => {
+                if self.url.as_deref().unwrap_or("").is_empty() {
+                    return Err(
+                        "blockchain_interface.url is required for interface_type = \"uaas\""
+                            .to_string(),
+                    );
+                }
+            }
+            "rpc" => {
+                if self.url.as_deref().unwrap_or("").is_empty() {
+                    return Err(
+                        "blockchain_interface.url is required for interface_type = \"rpc\" (the node's JSON-RPC host and port)"
+                            .to_string(),
+                    );
+                }
+                if self.rpc_user.as_deref().unwrap_or("").is_empty() {
+                    return Err(
+                        "blockchain_interface.rpc_user is required for interface_type = \"rpc\""
+                            .to_string(),
+                    );
+                }
+                if self.rpc_password.as_deref().unwrap_or("").is_empty() {
+                    return Err(
+                        "blockchain_interface.rpc_password is required for interface_type = \"rpc\""
+                            .to_string(),
+                    );
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
 }
 
 /// Client Configuration
@@ -192,6 +241,7 @@ impl Config {
             "mainnet" => Ok(Network::BSV_Mainnet),
             "testnet" => Ok(Network::BSV_Testnet),
             "stn" => Ok(Network::BSV_STN),
+            "regtest" => Ok(Network::BSV_Regtest),
             _ => Err("unable to decode network"),
         }
     }
@@ -216,6 +266,24 @@ impl Config {
             }
         } else if let Some(admin_api_key) = self.web_interface.admin_api_key.take() {
             self.web_interface.admin_api_key = Some(resolve_secret(&admin_api_key)?);
+        }
+
+        // The node's RPC credentials are secrets like any other, so they take
+        // the same `env:VAR` references and the same environment override.
+        if let Ok(rpc_user) = env::var("FS_RPC_USER") {
+            if !rpc_user.is_empty() {
+                self.blockchain_interface.rpc_user = Some(rpc_user);
+            }
+        } else if let Some(rpc_user) = self.blockchain_interface.rpc_user.take() {
+            self.blockchain_interface.rpc_user = Some(resolve_secret(&rpc_user)?);
+        }
+
+        if let Ok(rpc_password) = env::var("FS_RPC_PASSWORD") {
+            if !rpc_password.is_empty() {
+                self.blockchain_interface.rpc_password = Some(rpc_password);
+            }
+        } else if let Some(rpc_password) = self.blockchain_interface.rpc_password.take() {
+            self.blockchain_interface.rpc_password = Some(resolve_secret(&rpc_password)?);
         }
 
         if let Some(clients) = self.client.as_mut() {
@@ -289,6 +357,7 @@ pub fn load_config(env_var: &str, filename: &str) -> Result<Config, String> {
     config.web_interface.rate_limit.validate()?;
     config.telemetry.validate()?;
     config.idempotency.validate()?;
+    config.blockchain_interface.validate()?;
     warn_plaintext_secrets(&config);
     config.resolve_secrets()
 }
@@ -501,11 +570,12 @@ filename = "./data/dynamic.toml"
     }
 
     #[test]
-    fn sr_bchn_002_get_network_supports_mainnet_testnet_and_stn() {
+    fn sr_bchn_002_get_network_supports_mainnet_testnet_stn_and_regtest() {
         for (network_type, expected) in [
             ("mainnet", Network::BSV_Mainnet),
             ("testnet", Network::BSV_Testnet),
             ("stn", Network::BSV_STN),
+            ("regtest", Network::BSV_Regtest),
         ] {
             let config = Config {
                 blockchain_interface: BlockchainInterfaceConfig {
@@ -516,6 +586,125 @@ filename = "./data/dynamic.toml"
             };
             assert_eq!(config.get_network().unwrap(), expected);
         }
+    }
+
+    fn rpc_interface_config(
+        url: Option<&str>,
+        user: Option<&str>,
+        password: Option<&str>,
+    ) -> BlockchainInterfaceConfig {
+        BlockchainInterfaceConfig {
+            interface_type: "rpc".to_string(),
+            network_type: "regtest".to_string(),
+            url: url.map(str::to_string),
+            rpc_user: user.map(str::to_string),
+            rpc_password: password.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn sr_bchn_005_rpc_config_requires_address_and_credentials() {
+        assert!(
+            rpc_interface_config(Some("127.0.0.1:18443"), Some("u"), Some("p"))
+                .validate()
+                .is_ok()
+        );
+        for (url, user, password, expected) in [
+            (None, Some("u"), Some("p"), "url"),
+            (Some(""), Some("u"), Some("p"), "url"),
+            (Some("127.0.0.1:18443"), None, Some("p"), "rpc_user"),
+            (Some("127.0.0.1:18443"), Some("u"), None, "rpc_password"),
+        ] {
+            let error = rpc_interface_config(url, user, password)
+                .validate()
+                .expect_err("expected validation to fail");
+            assert!(error.contains(expected), "should name {expected}: {error}");
+        }
+    }
+
+    /// An interface that needs no endpoint must not be made to supply one.
+    #[test]
+    fn woc_and_test_interfaces_need_no_url() {
+        for interface_type in ["woc", "test"] {
+            let config = BlockchainInterfaceConfig {
+                interface_type: interface_type.to_string(),
+                network_type: "testnet".to_string(),
+                ..Default::default()
+            };
+            assert!(config.validate().is_ok());
+        }
+    }
+
+    #[test]
+    fn uaas_interface_requires_a_url() {
+        let config = BlockchainInterfaceConfig {
+            interface_type: "uaas".to_string(),
+            network_type: "testnet".to_string(),
+            ..Default::default()
+        };
+        assert!(config.validate().unwrap_err().contains("url"));
+    }
+
+    /// The node password is a secret, so it takes an `env:` reference like the
+    /// others rather than having to sit in the config file.
+    #[test]
+    fn sr_sec_014_rpc_password_resolves_from_an_env_reference() {
+        let _guard = crate::test_support::env_lock();
+        unsafe { std::env::set_var("FS_TEST_RPC_PASSWORD", "from-env") };
+        unsafe { std::env::remove_var("FS_RPC_PASSWORD") };
+        unsafe { std::env::remove_var("FS_RPC_USER") };
+        let config = Config {
+            blockchain_interface: rpc_interface_config(
+                Some("127.0.0.1:18443"),
+                Some("rpcuser"),
+                Some("env:FS_TEST_RPC_PASSWORD"),
+            ),
+            ..Default::default()
+        };
+        let resolved = config.resolve_secrets().unwrap();
+        assert_eq!(
+            resolved.blockchain_interface.rpc_password.as_deref(),
+            Some("from-env")
+        );
+        unsafe { std::env::remove_var("FS_TEST_RPC_PASSWORD") };
+    }
+
+    /// FS_RPC_PASSWORD overrides the config file, so a deployment can inject
+    /// the credential without editing it.
+    #[test]
+    fn sr_sec_014_fs_rpc_password_env_overrides_the_config() {
+        let _guard = crate::test_support::env_lock();
+        unsafe { std::env::set_var("FS_RPC_PASSWORD", "override") };
+        let config = Config {
+            blockchain_interface: rpc_interface_config(
+                Some("127.0.0.1:18443"),
+                Some("rpcuser"),
+                Some("in-file"),
+            ),
+            ..Default::default()
+        };
+        let resolved = config.resolve_secrets().unwrap();
+        assert_eq!(
+            resolved.blockchain_interface.rpc_password.as_deref(),
+            Some("override")
+        );
+        unsafe { std::env::remove_var("FS_RPC_PASSWORD") };
+    }
+
+    /// A plaintext node password should be reported like any other, so an
+    /// operator is told to move it into the environment.
+    #[test]
+    fn sr_sec_014_plaintext_rpc_password_is_reported() {
+        let config = Config {
+            blockchain_interface: rpc_interface_config(
+                Some("127.0.0.1:18443"),
+                Some("rpcuser"),
+                Some("plaintext-secret"),
+            ),
+            ..Default::default()
+        };
+        assert!(crate::secrets::plaintext_secret_fields(&config)
+            .contains(&"blockchain_interface.rpc_password".to_string()));
     }
 
     #[test]

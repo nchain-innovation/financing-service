@@ -66,10 +66,12 @@ Requirement IDs appear in test function names (for example `sr_fund_008_*`) or a
 
 | ID | Requirement | Priority | Verification |
 |----|-------------|----------|--------------|
-| SR-BCHN-001 | The service SHALL support blockchain backends `woc`, `uaas`, and `test` via configuration. | Must | **AT:** `blockchain_factory::tests::sr_bchn_001_blockchain_factory_supports_woc_test_and_uaas`, `sr_bchn_001_blockchain_factory_rejects_unknown_interface_type` |
-| SR-BCHN-002 | The service SHALL support network types `mainnet`, `testnet`, and `stn`. | Must | **AT:** `config::tests::sr_bchn_002_get_network_supports_mainnet_testnet_and_stn` |
+| SR-BCHN-001 | The service SHALL support blockchain backends `woc`, `uaas`, `rpc`, and `test` via configuration. | Must | **AT:** `blockchain_factory::tests::sr_bchn_001_blockchain_factory_supports_woc_test_uaas_and_rpc`, `sr_bchn_001_blockchain_factory_rejects_unknown_interface_type` |
+| SR-BCHN-002 | The service SHALL support network types `mainnet`, `testnet`, `stn`, and `regtest`. | Must | **AT:** `config::tests::sr_bchn_002_get_network_supports_mainnet_testnet_stn_and_regtest` |
 | SR-BCHN-003 | The service SHALL periodically refresh all client UTXO balances at the interval configured by `service.utxo_refresh_period` (seconds). | Must | **AT:** `config::tests::sr_bchn_003_sample_config_sets_utxo_refresh_period` |
 | SR-BCHN-004 | `/health` SHALL NOT depend on blockchain connectivity (liveness only). | Must | **AT:** `rest_api::tests::test_health` |
+| SR-BCHN-005 | The `rpc` interface SHALL require the node's address, username and password, and SHALL report which is missing at startup. | Must | **AT:** `blockchain_factory::tests::sr_bchn_005_rpc_interface_requires_address_and_credentials`, `config::tests::sr_bchn_005_rpc_config_requires_address_and_credentials` |
+| SR-BCHN-006 | The service SHALL be configurable against a regtest chain via the `rpc` interface. | Must | **AT:** `blockchain_factory::tests::sr_bchn_006_rpc_interface_can_be_built_for_regtest` |
 
 ## Security requirements
 
@@ -88,6 +90,7 @@ Requirement IDs appear in test function names (for example `sr_fund_008_*`) or a
 | SR-SEC-011 | `/`, `/health`, and `/status` SHALL remain unauthenticated regardless of client API key configuration. | Must | **AT:** `rest_api::tests::test_health_unauthenticated_when_api_key_enabled`, `test_status_unauthenticated_when_client_api_key_enabled`, `sr_sec_011_index_unauthenticated_when_client_api_key_enabled` |
 | SR-SEC-012 | When rate limiting is enabled, excess requests from the same IP SHALL receive HTTP 429 with a JSON error body. | Must | **AT:** `rest_api::tests::test_rate_limit_returns_429_when_burst_exceeded` |
 | SR-SEC-013 | `/health` SHALL be exempt from rate limiting when rate limiting is enabled. | Must | **AT:** `rest_api::tests::test_health_is_exempt_from_rate_limit` |
+| SR-SEC-014 | The node RPC password SHALL be resolvable from an `env:VAR` reference, SHALL be overridable by `FS_RPC_PASSWORD`, and SHALL be reported when stored as plaintext. | Must | **AT:** `config::tests::sr_sec_014_rpc_password_resolves_from_an_env_reference`, `sr_sec_014_fs_rpc_password_env_overrides_the_config`, `sr_sec_014_plaintext_rpc_password_is_reported` |
 
 ## Configuration and deployment requirements
 
