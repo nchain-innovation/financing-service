@@ -61,8 +61,8 @@ Admin       ──REST──▶       │                │
 * Balance checks against total wallet balance; funding combines multiple UTXOs when needed; balance endpoint refreshes from chain on each request; `multiple_tx` partial failures return structured successful transaction data; concurrent fund requests for the same client use read-only planning and commit UTXO updates only after broadcast
 * Docker image with `/health` liveness check
 * CI: build, test, `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo audit`
-* Pinned `chain-gang` git dependency and committed `Cargo.lock` for reproducible builds
-* 114 automated tests (unit, integration, REST API, system requirements)
+* `chain-gang` from crates.io at an exact release, with a committed `Cargo.lock`, for reproducible builds
+* 144 automated tests (unit, integration, REST API, system requirements)
 
 ## Known limitations
 
