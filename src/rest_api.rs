@@ -1,3 +1,4 @@
+use actix_web::http::StatusCode;
 use actix_web::{delete, get, post, web, HttpRequest, HttpResponse, Responder};
 use log::debug;
 use serde::Deserialize;
@@ -9,8 +10,9 @@ use crate::{
     config::ClientConfig,
     idempotency::{request_fingerprint, Outcome, RecordKey, Reservation},
     responses::{
-        coded_error_response, error_response, json_ok, partial_funding_error_response,
-        AddressResponse, BalanceResponse, CodedError, ErrorCode, HealthResponse, SuccessResponse,
+        coded_error_response, error_response, error_response_with_status, json_ok,
+        partial_funding_error_response, AddressResponse, BalanceResponse, CodedError, ErrorCode,
+        HealthResponse, SuccessResponse,
     },
     secrets::{secret_reference, validate_env_var_name},
     service::Service,
@@ -171,7 +173,11 @@ pub async fn get_funds(
     };
 
     if !data.service.is_client_id_valid(client_id).await {
-        return error_response(
+        // 400 rather than the code's default 404: the client_id arrives in the
+        // request body, so this is a malformed request, not a missing
+        // resource. A 404 here would read as "/fund does not exist".
+        return error_response_with_status(
+            StatusCode::BAD_REQUEST,
             ErrorCode::UnknownClient,
             format!("Unknown client_id {client_id}"),
         );
@@ -434,7 +440,7 @@ pub async fn add_client(
 
     match data.service.add_client(&client_config).await {
         Ok(()) => json_ok(&SuccessResponse::new()),
-        Err(description) => error_response(ErrorCode::Internal, description),
+        Err(error) => coded_error_response(error),
     }
 }
 
@@ -751,7 +757,7 @@ mod tests {
                 .to_request(),
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         let body: Value = test::read_body_json(resp).await;
         assert_eq!(body["code"], "unknown_client");
         assert!(body["description"]
@@ -800,7 +806,7 @@ mod tests {
                 .to_request(),
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[actix_web::test]
@@ -856,7 +862,7 @@ mod tests {
                 .to_request(),
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
         let body: Value = test::read_body_json(resp).await;
         assert!(body["description"]
             .as_str()
@@ -878,7 +884,7 @@ mod tests {
                 .to_request(),
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body: Value = test::read_body_json(resp).await;
         assert!(body["description"]
             .as_str()
@@ -911,7 +917,7 @@ mod tests {
                 .to_request(),
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[actix_web::test]
@@ -925,7 +931,7 @@ mod tests {
                 .to_request(),
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body: Value = test::read_body_json(resp).await;
         assert!(body["description"]
             .as_str()
@@ -944,7 +950,7 @@ mod tests {
                 .to_request(),
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body: Value = test::read_body_json(resp).await;
         assert_eq!(body["code"], "invalid_request");
         assert!(body["description"]
@@ -964,7 +970,7 @@ mod tests {
                 .to_request(),
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body: Value = test::read_body_json(resp).await;
         assert_eq!(body["code"], "invalid_request");
         assert!(body["description"]
@@ -984,7 +990,7 @@ mod tests {
                 .to_request(),
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body: Value = test::read_body_json(resp).await;
         assert_eq!(body["code"], "invalid_request");
         assert!(body["description"]
@@ -1009,7 +1015,7 @@ mod tests {
                 .to_request(),
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
         let body: Value = test::read_body_json(resp).await;
         assert_eq!(body["code"], "insufficient_balance");
         assert!(body["description"]
@@ -1190,7 +1196,7 @@ mod tests {
             fund_body_with_key(TEST_CLIENT_ID, 456, LOCKING_SCRIPT_HEX, "key-2"),
         )
         .await;
-        assert_eq!(http_status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(http_status, StatusCode::CONFLICT);
         assert_eq!(body["code"], "idempotency_key_reused");
     }
 
@@ -1205,7 +1211,7 @@ mod tests {
             fund_body_with_key(TEST_CLIENT_ID, 100_000_000, LOCKING_SCRIPT_HEX, "key-3"),
         )
         .await;
-        assert_eq!(http_status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(http_status, StatusCode::CONFLICT);
         assert_eq!(body["code"], "insufficient_balance");
 
         // the idempotency_key is free again, so a viable request with it now succeeds
@@ -1313,7 +1319,7 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(http_status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(http_status, StatusCode::BAD_REQUEST);
         assert_eq!(body["code"], "invalid_request");
         assert!(body["description"].as_str().unwrap().contains("not both"));
     }
@@ -1331,7 +1337,7 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(http_status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(http_status, StatusCode::BAD_REQUEST);
         assert_eq!(body["code"], "invalid_request");
     }
 
@@ -1348,7 +1354,7 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(http_status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(http_status, StatusCode::BAD_REQUEST);
         assert_eq!(body["code"], "invalid_request");
     }
 
@@ -1368,7 +1374,7 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(http_status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(http_status, StatusCode::BAD_REQUEST);
         assert_eq!(body["code"], "invalid_request");
         assert!(body["description"]
             .as_str()
@@ -1802,7 +1808,7 @@ mod tests {
                 .to_request(),
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body = String::from_utf8(test::read_body(resp).await.to_vec()).unwrap();
         assert!(!body.contains(secret_wif));
     }
@@ -1833,6 +1839,6 @@ mod tests {
                 .to_request(),
         )
         .await;
-        assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(err.status(), StatusCode::NOT_FOUND);
     }
 }

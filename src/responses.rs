@@ -1,4 +1,4 @@
-use actix_web::{http::header::ContentType, HttpResponse};
+use actix_web::{http::header::ContentType, http::StatusCode, HttpResponse};
 use serde::Serialize;
 
 #[derive(Debug, Serialize, Clone, Copy)]
@@ -50,6 +50,43 @@ pub enum ErrorCode {
     /// This `idempotency_key` was already used with a materially different
     /// request. Use a fresh `idempotency_key`.
     IdempotencyKeyReused,
+}
+
+impl ErrorCode {
+    /// HTTP status this code is reported with.
+    ///
+    /// Splitting the statuses lets a caller classify a failure without
+    /// parsing the body, which matters for anything between the caller and
+    /// this service -- a proxy, a gateway, a retry policy, an alerting rule --
+    /// that sees the status and not the payload. The rule is that `5xx` is
+    /// worth retrying unchanged and `4xx` needs the caller or an operator to
+    /// change something.
+    pub fn status(self) -> StatusCode {
+        match self {
+            // the caller must change the request
+            ErrorCode::InvalidRequest => StatusCode::BAD_REQUEST,
+            // the named client does not exist
+            ErrorCode::UnknownClient => StatusCode::NOT_FOUND,
+            // the request is well formed but conflicts with current state
+            ErrorCode::ClientExists
+            | ErrorCode::InsufficientBalance
+            | ErrorCode::NoSuitableUtxo
+            | ErrorCode::KeyInProgress
+            | ErrorCode::IdempotencyKeyReused => StatusCode::CONFLICT,
+            // upstream node rejected the transaction or was unreachable
+            ErrorCode::BroadcastFailed => StatusCode::BAD_GATEWAY,
+            ErrorCode::ChainUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCode::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::Unauthorized => StatusCode::UNAUTHORIZED,
+            ErrorCode::RateLimited => StatusCode::TOO_MANY_REQUESTS,
+            // Neither a success nor a clean failure: some transactions are on
+            // chain and the caller has to read the body to learn which. Kept
+            // as 422 deliberately -- 207 Multi-Status is the honest code but
+            // is WebDAV and rarely handled, and any plain failure status would
+            // invite a caller to ignore a body it must not ignore.
+            ErrorCode::PartialBroadcast => StatusCode::UNPROCESSABLE_ENTITY,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -181,7 +218,7 @@ pub fn partial_funding_error_response(
     description: impl Into<String>,
     funding: &FundingResponseJson,
 ) -> HttpResponse {
-    HttpResponse::UnprocessableEntity()
+    HttpResponse::build(ErrorCode::PartialBroadcast.status())
         .content_type(ContentType::json())
         .json(PartialFundingErrorResponse {
             code: ErrorCode::PartialBroadcast,
@@ -193,7 +230,19 @@ pub fn partial_funding_error_response(
 }
 
 pub fn error_response(code: ErrorCode, description: impl Into<String>) -> HttpResponse {
-    HttpResponse::UnprocessableEntity()
+    error_response_with_status(code.status(), code, description)
+}
+
+/// Build an error response with a status other than the code's default.
+///
+/// Needed only for `UnknownClient`, which is a missing resource on the
+/// `/client/{client_id}/...` routes but a malformed body on `POST /fund`.
+pub fn error_response_with_status(
+    status: StatusCode,
+    code: ErrorCode,
+    description: impl Into<String>,
+) -> HttpResponse {
+    HttpResponse::build(status)
         .content_type(ContentType::json())
         .json(ErrorResponse {
             code,
@@ -207,7 +256,7 @@ pub fn coded_error_response(error: CodedError) -> HttpResponse {
 }
 
 pub fn unauthorized_response() -> HttpResponse {
-    HttpResponse::Unauthorized()
+    HttpResponse::build(ErrorCode::Unauthorized.status())
         .content_type(ContentType::json())
         .json(ErrorResponse {
             code: ErrorCode::Unauthorized,
@@ -255,10 +304,50 @@ mod tests {
     #[test]
     fn error_response_carries_code_and_description() {
         let response = error_response(ErrorCode::UnknownClient, "Unknown client_id id9");
-        assert_eq!(
-            response.status(),
-            actix_http::StatusCode::UNPROCESSABLE_ENTITY
-        );
+        assert_eq!(response.status(), actix_http::StatusCode::NOT_FOUND);
+    }
+
+    /// The status for each code is part of the API, so pin the whole mapping.
+    /// A caller may branch on the status without reading the body, and a
+    /// change here would break that silently.
+    #[test]
+    fn each_error_code_maps_to_its_documented_status() {
+        use actix_http::StatusCode as S;
+        let cases = [
+            (ErrorCode::InvalidRequest, S::BAD_REQUEST),
+            (ErrorCode::UnknownClient, S::NOT_FOUND),
+            (ErrorCode::ClientExists, S::CONFLICT),
+            (ErrorCode::InsufficientBalance, S::CONFLICT),
+            (ErrorCode::NoSuitableUtxo, S::CONFLICT),
+            (ErrorCode::KeyInProgress, S::CONFLICT),
+            (ErrorCode::IdempotencyKeyReused, S::CONFLICT),
+            (ErrorCode::BroadcastFailed, S::BAD_GATEWAY),
+            (ErrorCode::ChainUnavailable, S::SERVICE_UNAVAILABLE),
+            (ErrorCode::Internal, S::INTERNAL_SERVER_ERROR),
+            (ErrorCode::Unauthorized, S::UNAUTHORIZED),
+            (ErrorCode::RateLimited, S::TOO_MANY_REQUESTS),
+            (ErrorCode::PartialBroadcast, S::UNPROCESSABLE_ENTITY),
+        ];
+        for (code, expected) in cases {
+            assert_eq!(code.status(), expected, "status for {code:?}");
+        }
+    }
+
+    /// Retry semantics fall out of the split: 5xx is worth retrying
+    /// unchanged, 4xx needs the caller or an operator to act.
+    #[test]
+    fn retryable_codes_are_5xx_and_client_errors_are_4xx() {
+        for code in [ErrorCode::BroadcastFailed, ErrorCode::ChainUnavailable] {
+            assert!(code.status().is_server_error(), "{code:?} should be 5xx");
+        }
+        for code in [
+            ErrorCode::InvalidRequest,
+            ErrorCode::UnknownClient,
+            ErrorCode::ClientExists,
+            ErrorCode::IdempotencyKeyReused,
+        ] {
+            assert!(code.status().is_client_error(), "{code:?} should be 4xx");
+        }
     }
 
     #[test]
@@ -267,10 +356,7 @@ mod tests {
         assert_eq!(error.code, ErrorCode::BroadcastFailed);
         assert_eq!(error.to_string(), "node unreachable");
         let response = coded_error_response(error);
-        assert_eq!(
-            response.status(),
-            actix_http::StatusCode::UNPROCESSABLE_ENTITY
-        );
+        assert_eq!(response.status(), actix_http::StatusCode::BAD_GATEWAY);
     }
 
     #[test]

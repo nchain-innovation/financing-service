@@ -25,13 +25,13 @@ When `[web_interface.rate_limit]` is enabled, excess requests from the same IP r
 {"code": "rate_limited", "description": "Rate limit exceeded, retry in 1s"}
 ```
 
-All JSON error responses use HTTP status `422` with this shape:
+All JSON error responses share this shape:
 
 ```json
 {"code": "invalid_request", "description": "Error message"}
 ```
 
-The `code` is a stable, machine-readable classification; see [Error responses](#error-responses) for the full set.
+The `code` is a stable, machine-readable classification, and the HTTP status is derived from it — see [Error responses](#error-responses) for the full mapping.
 
 Successful JSON responses use HTTP status `200`.
 
@@ -209,21 +209,23 @@ Every error response carries a machine-readable `code` alongside the human-reada
 
 **The `code` is the contract; the `description` is prose for humans and may be reworded at any time.** Clients should branch on `code` and log `description`. Treat an unrecognised code the way you would have treated the response before codes existed — the set may grow.
 
-| `code` | Meaning | Caller action |
-|---|---|---|
-| `insufficient_balance` | Total balance cannot cover the request | Top the wallet up; retryable after that |
-| `no_suitable_utxo` | Balance is sufficient but no combination of UTXOs fits | Split the wallet's UTXOs; retryable after that |
-| `unknown_client` | No such `client_id` | Fix configuration; never retryable as-is |
-| `client_exists` | `client_id` is already configured | `POST /client` only |
-| `invalid_request` | The request is malformed | Fix the request; never retryable unchanged |
-| `broadcast_failed` | Transaction built and signed, but the node rejected it or was unreachable | Retry may succeed |
-| `partial_broadcast` | Some of the requested transactions broadcast, some did not | Successful ones are in the response body |
-| `chain_unavailable` | The blockchain interface could not be reached | Retryable |
-| `internal` | Unexpected internal failure | Report it |
-| `unauthorized` | Authentication missing or invalid (HTTP 401) | Fix credentials |
-| `rate_limited` | Request rate exceeded | Retry after the interval in `description` |
-| `key_in_progress` | A request with this `idempotency_key` is still being processed | Retry shortly |
-| `idempotency_key_reused` | This `idempotency_key` was used with a different request | Use a fresh `idempotency_key` |
+The status is derived from the code, so a caller that cannot read the body — a proxy, a gateway, a retry policy, an alerting rule — can still classify the failure: **5xx is worth retrying unchanged, 4xx needs the caller or an operator to change something.** `partial_broadcast` is the sole exception to that reading: it is a 422 precisely because the body must be read.
+
+| `code` | HTTP | Meaning | Caller action |
+|---|---|---|---|
+| `insufficient_balance` | 409 | Total balance cannot cover the request | Top the wallet up; retryable after that |
+| `no_suitable_utxo` | 409 | Balance is sufficient but no combination of UTXOs fits | Split the wallet's UTXOs; retryable after that |
+| `unknown_client` | 404 / 400 | No such `client_id`. 404 where the id is a path segment, 400 where it is a body field | Fix configuration; never retryable as-is |
+| `client_exists` | 409 | `client_id` is already configured | `POST /client` only |
+| `invalid_request` | 400 | The request is malformed | Fix the request; never retryable unchanged |
+| `broadcast_failed` | 502 | Transaction built and signed, but the node rejected it or was unreachable | Retry may succeed |
+| `partial_broadcast` | 422 | Some of the requested transactions broadcast, some did not | **Read the body** — the successful ones are in it |
+| `chain_unavailable` | 503 | The blockchain interface could not be reached | Retryable |
+| `internal` | 500 | Unexpected internal failure | Report it |
+| `unauthorized` | 401 | Authentication missing or invalid | Fix credentials |
+| `rate_limited` | 429 | Request rate exceeded | Retry after the interval in `description` |
+| `key_in_progress` | 409 | A request with this `idempotency_key` is still being processed | Retry shortly |
+| `idempotency_key_reused` | 409 | This `idempotency_key` was used with a different request | Use a fresh `idempotency_key` |
 
 Examples:
 
