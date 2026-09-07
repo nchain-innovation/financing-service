@@ -30,7 +30,33 @@ pub struct FundRequest {
     pub satoshi: u64,
     pub no_of_outpoints: u32,
     pub multiple_tx: bool,
-    pub locking_script: Vec<u8>,
+    /// One locking script per requested outpoint.
+    ///
+    /// The REST layer normalises both request forms into this: a single
+    /// `locking_script` is expanded to `no_of_outpoints` copies, and a
+    /// `locking_scripts` list is used as given. Invariant: the length always
+    /// equals `no_of_outpoints`.
+    pub locking_scripts: Vec<Vec<u8>>,
+}
+
+impl FundRequest {
+    /// Total bytes of all output locking scripts, for fee estimation.
+    fn output_script_bytes(&self) -> u64 {
+        self.locking_scripts
+            .iter()
+            .map(|script| script.len() as u64)
+            .sum()
+    }
+
+    /// Script for the `index`-th outpoint, falling back to the last one if the
+    /// list is somehow short (the invariant should prevent this).
+    fn script_at(&self, index: usize) -> &[u8] {
+        self.locking_scripts
+            .get(index)
+            .or_else(|| self.locking_scripts.last())
+            .map(|script| script.as_slice())
+            .unwrap_or(&[])
+    }
 }
 
 /// Represents a Client of the service
@@ -118,27 +144,34 @@ impl Client {
         self.unspent.iter().map(|utxo| utxo.value).sum()
     }
 
-    fn estimate_fee(locking_script_len: u64, no_of_outpoints: u32, no_of_inputs: u32) -> u64 {
+    /// Estimate the fee for a transaction whose output locking scripts total
+    /// `output_script_bytes`.
+    ///
+    /// Taking a total rather than a length and a count means scripts of
+    /// differing sizes are costed correctly, instead of assuming they are all
+    /// the same size as the first.
+    fn estimate_fee(output_script_bytes: u64, no_of_inputs: u32) -> u64 {
         const INPUT_BYTES: u64 = 148;
         const CHANGE_OUTPUT_BYTES: u64 = 34;
         const TX_OVERHEAD_BYTES: u64 = 10;
-        let output_bytes = locking_script_len * no_of_outpoints as u64 + CHANGE_OUTPUT_BYTES;
+        let output_bytes = output_script_bytes + CHANGE_OUTPUT_BYTES;
         let tx_bytes = TX_OVERHEAD_BYTES + INPUT_BYTES * no_of_inputs.max(1) as u64 + output_bytes;
         ((tx_bytes / 1000) * 500) + 750
     }
 
     fn estimate_total_cost(fund_request: &FundRequest, no_of_inputs: u32) -> u64 {
-        let locking_script_len = fund_request.locking_script.len() as u64;
         if fund_request.no_of_outpoints > 1 && fund_request.multiple_tx {
-            let fee_estimate = Self::estimate_fee(locking_script_len, 1, 1);
-            fund_request.no_of_outpoints as u64 * (fund_request.satoshi + fee_estimate)
+            // One transaction per outpoint, each paying its own script, so
+            // cost each separately rather than multiplying one estimate.
+            (0..fund_request.no_of_outpoints as usize)
+                .map(|index| {
+                    let bytes = fund_request.script_at(index).len() as u64;
+                    fund_request.satoshi + Self::estimate_fee(bytes, 1)
+                })
+                .sum()
         } else {
             fund_request.satoshi * fund_request.no_of_outpoints as u64
-                + Self::estimate_fee(
-                    locking_script_len,
-                    fund_request.no_of_outpoints,
-                    no_of_inputs,
-                )
+                + Self::estimate_fee(fund_request.output_script_bytes(), no_of_inputs)
         }
     }
 
@@ -185,14 +218,15 @@ impl Client {
             lock_script: change_script.clone(),
         }];
 
-        let mut script_pubkey = Script::new();
-        script_pubkey.append_slice(&fund_request.locking_script);
-        let txout = TxOut {
-            satoshis: fund_request.satoshi as i64,
-            lock_script: script_pubkey,
-        };
-        for _ in 0..fund_request.no_of_outpoints {
-            vouts.push(txout.clone());
+        // One output per requested outpoint, each with its own script, so N
+        // outpoints from one request can be independently spendable.
+        for index in 0..fund_request.no_of_outpoints as usize {
+            let mut script_pubkey = Script::new();
+            script_pubkey.append_slice(fund_request.script_at(index));
+            vouts.push(TxOut {
+                satoshis: fund_request.satoshi as i64,
+                lock_script: script_pubkey,
+            });
         }
         vouts
     }
@@ -256,8 +290,16 @@ impl Client {
         }
 
         if fund_request.no_of_outpoints > 1 && fund_request.multiple_tx {
-            let per_tx_cost = fund_request.satoshi
-                + Self::estimate_fee(fund_request.locking_script.len() as u64, 1, 1);
+            // Scripts may differ in size, so require a UTXO large enough for
+            // the most expensive of the transactions rather than assuming all
+            // are the size of the first.
+            let per_tx_cost = (0..fund_request.no_of_outpoints as usize)
+                .map(|index| {
+                    fund_request.satoshi
+                        + Self::estimate_fee(fund_request.script_at(index).len() as u64, 1)
+                })
+                .max()
+                .unwrap_or(fund_request.satoshi);
             let suitable_utxos = self.count_utxos_above(per_tx_cost);
             if suitable_utxos < fund_request.no_of_outpoints as usize {
                 return Some(CodedError::new(
@@ -448,7 +490,7 @@ mod tests {
             satoshi: 123,
             no_of_outpoints: 1,
             multiple_tx: false,
-            locking_script,
+            locking_scripts: vec![locking_script],
         };
         let tx = client.create_funding_tx(&fund_request).unwrap();
 
@@ -481,7 +523,7 @@ mod tests {
             satoshi: 123,
             no_of_outpoints: 1,
             multiple_tx: false,
-            locking_script: hex::decode(LOCKING_SCRIPT_HEX).unwrap(),
+            locking_scripts: vec![hex::decode(LOCKING_SCRIPT_HEX).unwrap()],
         };
 
         let result = client.create_funding_tx(&fund_request);
@@ -518,7 +560,7 @@ mod tests {
             satoshi,
             no_of_outpoints: 1,
             multiple_tx: false,
-            locking_script: hex::decode(LOCKING_SCRIPT_HEX).unwrap(),
+            locking_scripts: vec![hex::decode(LOCKING_SCRIPT_HEX).unwrap()],
         }
     }
 
@@ -567,7 +609,7 @@ mod tests {
             satoshi: 123,
             no_of_outpoints: 3,
             multiple_tx: true,
-            locking_script: hex::decode(LOCKING_SCRIPT_HEX).unwrap(),
+            locking_scripts: vec![hex::decode(LOCKING_SCRIPT_HEX).unwrap()],
         };
         let error = client.funding_balance_error(&fund_request).unwrap();
         assert_eq!(error.code, ErrorCode::NoSuitableUtxo);

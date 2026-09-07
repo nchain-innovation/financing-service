@@ -130,6 +130,34 @@ curl -H "Authorization: Bearer your-client-api-key" \
 `satoshi` and `locking_script` describe the output this outpoint refers to. **They are read from the transaction that was broadcast, not echoed from the request**, so a client can verify what was actually paid rather than assume the request was honoured.
 
 That matters when spending the outpoint: a BSV (BIP-143) signature commits to both the previous output's value and its locking script, so if either differed from what the client assumed, the signature would not verify and the node would reject the spending transaction with a script error that says nothing about the funding value being wrong.
+### Locking scripts per outpoint
+
+`POST /fund` accepts the locking script in either of two forms. Exactly one is required.
+
+**One script for every outpoint** — the original form:
+
+```json
+{"client_id": "client1", "satoshi": 123, "no_of_outpoints": 3,
+ "multiple_tx": false, "locking_script": "76a914...88ac"}
+```
+
+All three outputs pay the same script, so all three outpoints are spendable by the same key. That is only what you want when a single owner takes all of them.
+
+**One script per outpoint** — for independently spendable outputs:
+
+```json
+{"client_id": "client1", "satoshi": 123, "multiple_tx": false,
+ "locking_scripts": ["76a914aa...88ac", "76a914bb...88ac", "76a914cc...88ac"]}
+```
+
+The number of outpoints comes from the list length. `no_of_outpoints` may be omitted; if given it must agree with the length, and a mismatch is rejected rather than one silently winning.
+
+This matters when each funded output is spent by a different transaction. Outputs sharing one key are each spendable by the other's input, so one becomes a double-spend of the other. With `locking_scripts` a single funding transaction can serve N independent spends, instead of needing N separate `POST /fund` calls and N funding transactions on chain.
+
+With `multiple_tx: true` the scripts are paid one per transaction rather than one per output of a single transaction.
+
+Rejected as `invalid_request`: supplying both fields, supplying neither, an empty `locking_scripts` list, and a `no_of_outpoints` that disagrees with the list length.
+
 ### Idempotency
 
 `POST /fund` broadcasts a funding transaction and then returns the outpoint in the response body. If that response is lost — a client timeout, a dropped connection — the transaction is already on chain and the client has no record of the outpoint. A plain retry funds a **second** time, and the first output is stranded: locked to a key the client may no longer be able to name.

@@ -215,9 +215,14 @@ pub fn request_fingerprint(
     satoshi: u64,
     no_of_outpoints: u32,
     multiple_tx: bool,
-    locking_script: &str,
+    locking_scripts: &[String],
 ) -> String {
-    format!("{satoshi}:{no_of_outpoints}:{multiple_tx}:{locking_script}")
+    // Every script is included, so two requests that differ only in which
+    // scripts they pay cannot share a key.
+    format!(
+        "{satoshi}:{no_of_outpoints}:{multiple_tx}:{}",
+        locking_scripts.join(",")
+    )
 }
 
 #[cfg(test)]
@@ -338,11 +343,46 @@ mod tests {
 
     #[test]
     fn fingerprint_distinguishes_materially_different_requests() {
-        let base = request_fingerprint(123, 1, false, "76a914aa88ac");
-        assert_eq!(base, request_fingerprint(123, 1, false, "76a914aa88ac"));
-        assert_ne!(base, request_fingerprint(124, 1, false, "76a914aa88ac"));
-        assert_ne!(base, request_fingerprint(123, 2, false, "76a914aa88ac"));
-        assert_ne!(base, request_fingerprint(123, 1, true, "76a914aa88ac"));
-        assert_ne!(base, request_fingerprint(123, 1, false, "76a914bb88ac"));
+        let one = |s: &str| vec![s.to_string()];
+        let base = request_fingerprint(123, 1, false, &one("76a914aa88ac"));
+        assert_eq!(
+            base,
+            request_fingerprint(123, 1, false, &one("76a914aa88ac"))
+        );
+        assert_ne!(
+            base,
+            request_fingerprint(124, 1, false, &one("76a914aa88ac"))
+        );
+        assert_ne!(
+            base,
+            request_fingerprint(123, 2, false, &one("76a914aa88ac"))
+        );
+        assert_ne!(
+            base,
+            request_fingerprint(123, 1, true, &one("76a914aa88ac"))
+        );
+        assert_ne!(
+            base,
+            request_fingerprint(123, 1, false, &one("76a914bb88ac"))
+        );
+    }
+
+    /// Two requests for the same count but different per-outpoint scripts are
+    /// different requests, so a key used for one must not answer the other.
+    #[test]
+    fn fingerprint_covers_every_script_in_the_list() {
+        let a = request_fingerprint(
+            123,
+            2,
+            false,
+            &["76a914aa88ac".to_string(), "76a914bb88ac".to_string()],
+        );
+        let b = request_fingerprint(
+            123,
+            2,
+            false,
+            &["76a914aa88ac".to_string(), "76a914cc88ac".to_string()],
+        );
+        assert_ne!(a, b);
     }
 }
