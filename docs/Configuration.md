@@ -31,7 +31,7 @@ The interface you choose constrains which networks you can reach, and this is us
 
 **`regtest` is not supported by any interface.** `network_type = "regtest"` is not an accepted value either, so it fails at startup with `unable to decode network`. There is currently no way to run this service against a local regtest chain; see [issue #44](https://github.com/nchain-innovation/financing-service/issues/44).
 
-**`test` is a fixture, not a backend.** It is an in-process stub used by the unit tests, with a UTXO set injected directly by the test harness. It has no network of its own, so the `network_type` you set alongside it only affects address encoding. It is also not runnable as a configured backend today: a default-constructed stub panics on the first balance query (see [chain-gang#139](https://github.com/nchain-innovation/chain-gang/issues/139)).
+**`test` is a fixture, not a backend.** It is an in-process stub used by the unit tests, with a UTXO set injected directly by the test harness. It has no network of its own, so the `network_type` you set alongside it only affects address encoding. It will start and serve requests as a configured backend, but its UTXO set is empty, so balances read zero and funding is refused — useful for exercising the API surface, not for funding anything.
 
 ### A note on the default port
 
