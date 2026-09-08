@@ -92,6 +92,14 @@ pub fn plaintext_secret_fields(config: &crate::config::Config) -> Vec<String> {
     {
         fields.push("web_interface.admin_api_key".to_string());
     }
+    if config
+        .blockchain_interface
+        .rpc_password
+        .as_deref()
+        .is_some_and(|password| !password.is_empty() && !is_secret_reference(password))
+    {
+        fields.push("blockchain_interface.rpc_password".to_string());
+    }
     if let Some(clients) = &config.client {
         for client in clients {
             if !is_secret_reference(&client.wif_key) {

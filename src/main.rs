@@ -4,6 +4,7 @@ use tokio::time;
 use actix_governor::Governor;
 use actix_web::{web, App, HttpServer};
 
+mod address_watcher;
 mod auth;
 mod blockchain_factory;
 mod client;

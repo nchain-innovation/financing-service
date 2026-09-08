@@ -9,7 +9,8 @@ use chrono::Utc;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::{
-    blockchain_factory::blockchain_factory,
+    address_watcher::AddressWatcher,
+    blockchain_factory::{blockchain_factory, Backend},
     client::{Client, FundRequest, FundingSpendPlan},
     config::{ClientConfig, Config},
     dynamic_config::DynamicConfig,
@@ -113,13 +114,16 @@ pub struct Service {
     dynamic_config: Mutex<DynamicConfig>,
     admin_api_key: Option<String>,
     idempotency: Mutex<IdempotencyStore>,
+    /// Set only for backends that must be told which addresses to follow.
+    address_watcher: Option<Arc<dyn AddressWatcher>>,
 }
 
 impl Service {
-    fn build(
-        config: &Config,
-        blockchain_interface: Arc<dyn BlockchainInterface + Send + Sync>,
-    ) -> Result<Service, String> {
+    fn build(config: &Config, backend: Backend) -> Result<Service, String> {
+        let Backend {
+            interface: blockchain_interface,
+            address_watcher,
+        } = backend;
         let mut clients = HashMap::new();
 
         if let Some(clients_config) = &config.client {
@@ -161,6 +165,7 @@ impl Service {
                 config.idempotency.ttl(),
                 config.idempotency.max_entries,
             )),
+            address_watcher,
         })
     }
 
@@ -197,13 +202,16 @@ impl Service {
 
     /// Create a new Service from the provided config
     pub async fn new(config: &Config) -> Result<Service, String> {
-        let blockchain_interface = blockchain_factory(config)?;
+        let backend = blockchain_factory(config)?;
 
-        blockchain_interface.status().await.map_err(|e| {
+        backend.interface.status().await.map_err(|e| {
             format!("Unable to connect to blockchain, ensure that the service is running: {e:?}")
         })?;
 
-        let service = Self::build(config, blockchain_interface)?;
+        let service = Self::build(config, backend)?;
+        // Before the first balance read, so the backend already knows the
+        // addresses it is about to be asked about.
+        service.watch_configured_client_addresses().await;
         service.update_balances().await;
         Ok(service)
     }
@@ -213,15 +221,71 @@ impl Service {
         config: &Config,
         blockchain_interface: Arc<dyn BlockchainInterface + Send + Sync>,
     ) -> Service {
+        Self::new_for_test_with_watcher(config, blockchain_interface, None).await
+    }
+
+    #[cfg(test)]
+    pub async fn new_for_test_with_watcher(
+        config: &Config,
+        blockchain_interface: Arc<dyn BlockchainInterface + Send + Sync>,
+        address_watcher: Option<Arc<dyn AddressWatcher>>,
+    ) -> Service {
         blockchain_interface
             .status()
             .await
             .expect("Unable to connect to test blockchain.");
 
-        let service = Self::build(config, blockchain_interface)
-            .expect("Invalid client configuration in test setup");
+        let service = Self::build(
+            config,
+            Backend {
+                interface: blockchain_interface,
+                address_watcher,
+            },
+        )
+        .expect("Invalid client configuration in test setup");
+        service.watch_configured_client_addresses().await;
         service.update_balances().await;
         service
+    }
+
+    /// Ask the backend to watch every configured client's funding address.
+    ///
+    /// A failure is reported but does not stop startup: the node may refuse
+    /// the import for a reason the operator already knows about, such as a
+    /// descriptor wallet, and refusing to run would be worse than a warning
+    /// they can act on. The warning names the consequence, because the symptom
+    /// -- a zero balance from a reachable node -- does not point at its cause.
+    async fn watch_configured_client_addresses(&self) {
+        let Some(watcher) = self.address_watcher.as_ref() else {
+            return;
+        };
+        for client in self.client_handles().await {
+            let address = client.read().await.get_address();
+            if let Err(error) = watcher.watch_address(&address).await {
+                log::warn!(
+                    "Could not ask the node to watch {address}: {error}. \
+                     Its balance will read zero and funding will be refused until \
+                     the node tracks it."
+                );
+            }
+        }
+    }
+
+    /// As above, for one address, when a client is added at runtime.
+    async fn watch_client_address(&self, client_id: &str) {
+        let Some(watcher) = self.address_watcher.as_ref() else {
+            return;
+        };
+        let Some(client) = self.client_handle(client_id).await else {
+            return;
+        };
+        let address = client.read().await.get_address();
+        if let Err(error) = watcher.watch_address(&address).await {
+            log::warn!(
+                "Could not ask the node to watch {address} for new client {client_id}: {error}. \
+                 Its balance will read zero and funding will be refused until the node tracks it."
+            );
+        }
     }
 
     async fn client_handle(&self, client_id: &str) -> Option<Arc<RwLock<Client>>> {
@@ -264,6 +328,9 @@ impl Service {
             self.clients.write().await.remove(&client_config.client_id);
             return Err(CodedError::internal(error));
         }
+        // A client added at runtime needs watching too, or its balance reads
+        // zero until the next restart.
+        self.watch_client_address(&client_config.client_id).await;
         Ok(())
     }
 
@@ -697,11 +764,71 @@ async fn fetch_chain_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::address_watcher::RecordingWatcher;
     use crate::config::ClientConfig;
     use crate::test_support::{
         test_blockchain_interface, test_config, test_config_with_keys, unique_dynamic_config_path,
-        LOCKING_SCRIPT_HEX, TEST_CLIENT_ID, TEST_WIF,
+        LOCKING_SCRIPT_HEX, TEST_ADDRESS, TEST_CLIENT_ID, TEST_WIF,
     };
+
+    async fn service_with_watcher(config: &Config, watcher: Arc<RecordingWatcher>) -> Arc<Service> {
+        let blockchain = test_blockchain_interface(config).await;
+        Arc::new(Service::new_for_test_with_watcher(config, blockchain, Some(watcher)).await)
+    }
+
+    /// A node reports zero for an address it does not track, so the configured
+    /// clients' addresses must be handed to it before the first balance read.
+    #[tokio::test]
+    async fn sr_bchn_008_configured_client_addresses_are_watched_at_startup() {
+        let config = test_config(&unique_dynamic_config_path());
+        let watcher = Arc::new(RecordingWatcher::new(false));
+        let _service = service_with_watcher(&config, watcher.clone()).await;
+        assert_eq!(watcher.watched(), vec![TEST_ADDRESS.to_string()]);
+    }
+
+    /// A client added through POST /client needs watching too, or its balance
+    /// reads zero until the next restart.
+    #[tokio::test]
+    async fn sr_bchn_008_a_runtime_added_client_address_is_watched() {
+        let config = test_config(&unique_dynamic_config_path());
+        let watcher = Arc::new(RecordingWatcher::new(false));
+        let service = service_with_watcher(&config, watcher.clone()).await;
+
+        service
+            .add_client(&ClientConfig {
+                client_id: "id2".to_string(),
+                wif_key: TEST_WIF.to_string(),
+                api_key: None,
+            })
+            .await
+            .expect("client should be added");
+
+        // the startup import, then the new client's
+        assert_eq!(watcher.watched().len(), 2);
+        assert_eq!(watcher.watched()[1], TEST_ADDRESS);
+    }
+
+    /// An import failure is reported but must not stop the service: the node
+    /// may refuse for a reason the operator already knows about.
+    #[tokio::test]
+    async fn sr_bchn_008_a_failed_import_does_not_prevent_startup() {
+        let config = test_config(&unique_dynamic_config_path());
+        let watcher = Arc::new(RecordingWatcher::new(true));
+        let service = service_with_watcher(&config, watcher.clone()).await;
+        assert_eq!(watcher.watched(), vec![TEST_ADDRESS.to_string()]);
+        // the service is still usable
+        assert!(service.is_client_id_valid(TEST_CLIENT_ID).await);
+    }
+
+    /// Backends that index the chain themselves must not be sent imports.
+    #[tokio::test]
+    async fn sr_bchn_007_no_watcher_means_no_import_attempts() {
+        let config = test_config(&unique_dynamic_config_path());
+        let blockchain = test_blockchain_interface(&config).await;
+        // None, as woc/uaas/test supply
+        let service = Service::new_for_test_with_watcher(&config, blockchain, None).await;
+        assert!(service.is_client_id_valid(TEST_CLIENT_ID).await);
+    }
 
     fn sample_fund_request(client_id: &str) -> FundRequest {
         FundRequest {

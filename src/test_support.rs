@@ -48,7 +48,7 @@ pub fn test_config_with_keys(
         blockchain_interface: BlockchainInterfaceConfig {
             interface_type: "test".to_string(),
             network_type: "testnet".to_string(),
-            url: None,
+            ..Default::default()
         },
         web_interface: crate::config::WebInterfaceConfig {
             address: std::net::Ipv4Addr::LOCALHOST,

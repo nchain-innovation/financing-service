@@ -8,16 +8,19 @@ The file is composed of the following sections:
 
 ## [blockchain_interface]
 
-Configures the blockchain interface. Supported `interface_type` values: `woc`, `uaas`, `test`.
+Configures the blockchain interface. Supported `interface_type` values: `woc`, `uaas`, `rpc`, `test`.
 
 ```toml
 [blockchain_interface]
 interface_type = "woc"
 network_type = "testnet"
-# url = "http://localhost:5010"  # required for uaas
+# url = "http://localhost:5010"  # required for uaas, and for rpc (host:port)
+# rpc_user = "rpcuser"                    # required for rpc
+# rpc_password = "env:FS_RPC_PASSWORD"    # required for rpc
+# rpc_import_addresses = true             # rpc only; default true
 ```
 
-Supported `network_type` values: `mainnet`, `testnet`, `stn`.
+Supported `network_type` values: `mainnet`, `testnet`, `stn`, `regtest`.
 
 ### Which interface reaches which network
 
@@ -27,9 +30,40 @@ The interface you choose constrains which networks you can reach, and this is us
 |---|---|---|---|---|---|
 | `woc` | WhatsOnChain, a public API | ✅ | ✅ | ✅ | ❌ |
 | `uaas` | a UTXO as a Service instance (set `url`) | ✅ | ✅ | ✅ | ❌ |
+| `rpc` | a node's JSON-RPC endpoint, directly | ✅ | ✅ | ✅ | ✅ |
 | `test` | nothing — an in-process stub | — | — | — | — |
 
-**`regtest` is not supported by any interface.** `network_type = "regtest"` is not an accepted value either, so it fails at startup with `unable to decode network`. There is currently no way to run this service against a local regtest chain; see [issue #44](https://github.com/nchain-innovation/financing-service/issues/44).
+**`rpc` is the only interface that reaches regtest**, because no public explorer indexes a private chain. It also works against a node you control on any other network, which removes the dependency on a third-party API being up.
+
+### The `rpc` interface
+
+```toml
+[blockchain_interface]
+interface_type = "rpc"
+network_type = "regtest"
+url = "127.0.0.1:18443"
+rpc_user = "rpcuser"
+rpc_password = "env:FS_RPC_PASSWORD"
+```
+
+* `url` — the node's JSON-RPC host and port. A bare `host:port` is treated as `http://`; give a full URL for `https`.
+* `rpc_user` / `rpc_password` — the node's RPC credentials, sent as HTTP basic auth on every call. **Point this only at a node you control**, since the credentials go to whatever host is configured.
+
+`rpc_password` takes an `env:VAR_NAME` reference and is overridden by `FS_RPC_PASSWORD`; `rpc_user` behaves the same way with `FS_RPC_USER`. A plaintext `rpc_password` is reported at startup like any other plaintext secret.
+
+#### Address imports
+
+A node answers balance and UTXO queries from its own wallet, so an address it does not track reads as **zero, with no error**. The service therefore asks the node to watch each client's funding address — at startup for configured clients, and again whenever one is added through `POST /client`, so a new client works without a restart.
+
+The import uses `importaddress` with the rescan disabled, because a freshly derived client key has no history to find and a rescan blocks the node's RPC connection while it runs.
+
+```toml
+rpc_import_addresses = false   # default: true
+```
+
+Turn it off if you manage the node's wallet yourself, or if it is a **descriptor wallet**, where `importaddress` is refused. With imports off, make sure each client's address is already tracked; `GET /client/{client_id}/address` gives you the address.
+
+An import that fails is logged as a warning and does not stop the service — the node may be refusing for a reason you already know about. The warning names the address and says what follows from it: that balance reads zero and funding is refused until the node tracks the address. Worth watching for on first run, because a reachable node reporting an empty wallet otherwise looks like a bug at the caller.
 
 **`test` is a fixture, not a backend.** It is an in-process stub used by the unit tests, with a UTXO set injected directly by the test harness. It has no network of its own, so the `network_type` you set alongside it only affects address encoding. It will start and serve requests as a configured backend, but its UTXO set is empty, so balances read zero and funding is refused — useful for exercising the API surface, not for funding anything.
 
