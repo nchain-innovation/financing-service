@@ -38,7 +38,7 @@ impl AddressWatcher for RpcInterface {
         // freshly derived client keys with no history to find.
         self.import_address(address, false)
             .await
-            .map_err(|e| format!("{e:?}"))
+            .map_err(|e| e.to_string())
     }
 }
 

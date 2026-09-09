@@ -46,7 +46,7 @@ pub fn blockchain_factory(config: &Config) -> Result<Backend, String> {
                 .as_ref()
                 .ok_or_else(|| "Config blockchain interface url not found.".to_string())?;
             let mut interface = UaaSInterface::new(uaas_url)
-                .map_err(|e| format!("Unable to create UaaS interface: {e:?}"))?;
+                .map_err(|e| format!("Unable to create UaaS interface: {e}"))?;
             interface.set_network(&network);
             Ok(Backend {
                 interface: Arc::new(interface),
