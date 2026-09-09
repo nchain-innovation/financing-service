@@ -205,7 +205,7 @@ impl Service {
         let backend = blockchain_factory(config)?;
 
         backend.interface.status().await.map_err(|e| {
-            format!("Unable to connect to blockchain, ensure that the service is running: {e:?}")
+            format!("Unable to connect to blockchain, ensure that the service is running: {e}")
         })?;
 
         let service = Self::build(config, backend)?;
@@ -753,11 +753,11 @@ async fn fetch_chain_state(
     let balance = blockchain
         .get_balance(address)
         .await
-        .map_err(|e| format!("get_balance failed: {e:?}"))?;
+        .map_err(|e| format!("get_balance failed: {e}"))?;
     let utxo = blockchain
         .get_utxo(address)
         .await
-        .map_err(|e| format!("get_utxo failed: {e:?}"))?;
+        .map_err(|e| format!("get_utxo failed: {e}"))?;
     Ok((balance, utxo))
 }
 
