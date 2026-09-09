@@ -1,6 +1,14 @@
 [blockchain_interface]
 interface_type = "woc"
 network_type = "testnet"
+# For a local node, the only way to reach regtest. The service imports each
+# client's address into the node's wallet so their balances are visible.
+# interface_type = "rpc"
+# network_type = "regtest"
+# url = "127.0.0.1:18443"
+# rpc_user = "rpcuser"
+# rpc_password = "env:FS_RPC_PASSWORD"
+# rpc_import_addresses = true
 # url = "http://localhost:5010"
 
 [web_interface]
