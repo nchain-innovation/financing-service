@@ -20,7 +20,7 @@ For API details see [SupportedEndpoints.md](SupportedEndpoints.md). For configur
 | Multi-tx partial failure structured responses | 2026 |
 | Same-client concurrent funding (plan-then-commit) | 2026 |
 
-The Rust service uses the [`chain-gang`](https://github.com/nchain-innovation/chain-gang) library for blockchain access (WhatsOnChain, UaaS, or test interface) and wallet operations.
+The Rust service uses the [`chain-gang`](https://github.com/nchain-innovation/chain-gang) library for blockchain access (WhatsOnChain, UaaS, a node's JSON-RPC endpoint, or the test interface) and wallet operations.
 
 ## Current architecture
 
