@@ -206,19 +206,21 @@ auth_token = "env:FS_MAPI_LITE_AUTH_TOKEN"
 # timeout_seconds = 30
 # health_timeout_seconds = 2
 # max_retries = 2
+# total_timeout_seconds = 45
 ```
 
-* `base_url` — **required.** Base URL of the mapi-lite server, `http://` or `https://`. A trailing `/` is tolerated.
+* `base_url` — **required.** Base URL of the mapi-lite server, `http://` or `https://`. Surrounding whitespace and a trailing `/` are stripped before the URL is validated or used, so the value that is checked at startup is the one that is requested.
 * `auth_token` — optional. Sent **verbatim** as the `Authorization` header on every request, so include the scheme the server expects, e.g. `"Bearer <secret>"`. Takes an `env:VAR_NAME` reference and is overridden by `FS_MAPI_LITE_AUTH_TOKEN`. A plaintext value is reported at startup like any other plaintext secret. Never logged.
 * `timeout_seconds` — per-request timeout for a transaction submit. Default `30`.
-* `health_timeout_seconds` — timeout for the mapi-lite probe behind `GET /health`. Default `2`; keep it under the Docker health check's three seconds.
+* `health_timeout_seconds` — timeout for the mapi-lite probe behind `GET /health`. Default `2`. Must be **less than 3**, the Docker health check's own `--timeout`, and is rejected at startup otherwise: a slower probe would be killed by `curl` first and mark the container unhealthy on every check even while mapi-lite is fine. The probe's verdict is cached for this long, so `/health` — which is unauthenticated and exempt from rate limiting — cannot be used to flood mapi-lite.
 * `max_retries` — how many times a submit is retried after a transient failure (an HTTP 5xx or a transport error) before `POST /fund` reports `broadcast_failed`. Default `2`. Resubmitting is safe: mapi-lite answers an already-known transaction with success.
+* `total_timeout_seconds` — ceiling on a whole submit: every attempt and every back-off between them. Default `45`; must be at least `timeout_seconds`. `timeout_seconds` alone bounds one attempt, so without this the worst case against a mapi-lite that accepts connections but never answers is `timeout_seconds × (max_retries + 1)` plus back-off — about 93s at the defaults — with the `POST /fund` caller and its worker held for the whole of it. On expiry the caller gets `broadcast_failed`.
 
 When the section is present the service:
 
 * Logs at startup: `mapi-lite integration configured (base_url=...): funding transactions will be broadcast via mapi-lite`. Without the section the line reads `mapi-lite not configured: funding transactions will be broadcast via the 'woc' blockchain interface` (naming whichever `interface_type` is configured).
-* Probes mapi-lite at startup (`GET /mapi/feeQuote`) and refuses to start if it is unreachable, the same way it refuses to start when the blockchain interface is unreachable.
-* Probes mapi-lite on every `GET /health` and returns HTTP 503 when the probe fails. See [Health check](SupportedEndpoints.md#health-check).
+* Probes mapi-lite at startup (`GET /mapi/feeQuote`) and **warns** if it is unreachable, without refusing to start. Funding will fail until mapi-lite is reachable, but the read paths — `/status`, balances, UTXO refreshes — do not depend on it and keep serving, and the service recovers on its own when mapi-lite returns. Refusing to start would instead put the container in a restart loop driven by its own health check, taking the read paths down with it.
+* Probes mapi-lite for `GET /health` and returns HTTP 503 when the probe fails, reusing a verdict for up to `health_timeout_seconds`. See [Health check](SupportedEndpoints.md#health-check).
 * Reports `"broadcaster": "mapi-lite"` in `GET /status`.
 * Submits each funding transaction as a one-element batch to `POST /mapi/txs`, with the merkle proof declined (no callbacks are wanted). A rejection by mapi-lite or the node surfaces to the caller as `broadcast_failed` (HTTP 502), with the reason in the service log.
 

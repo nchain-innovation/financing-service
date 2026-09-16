@@ -69,11 +69,15 @@ When the optional [`[mapi_lite]`](Configuration.md#mapi_lite) section is configu
 |---|---|---|
 | mapi-lite not configured | 200 | `{"status": "ok"}` (unchanged) |
 | mapi-lite configured and reachable | 200 | `{"status": "ok", "mapi_lite": {"ok": true}}` |
-| mapi-lite configured but unreachable | 503 | `{"status": "unhealthy", "mapi_lite": {"ok": false, "detail": "upstream error: http status 503"}}` |
+| mapi-lite configured but unreachable | 503 | `{"status": "unhealthy", "mapi_lite": {"ok": false, "detail": "mapi-lite probe failed"}}` |
 
 The probe is bounded by `mapi_lite.health_timeout_seconds` (default 2s), so it answers inside the Docker health check's timeout.
 
-The Docker image includes a `HEALTHCHECK` that calls this endpoint; `curl -f` fails on the 503, so an unreachable mapi-lite marks the container unhealthy.
+The `detail` is deliberately generic. This endpoint is unauthenticated and exempt from rate limiting, and the underlying transport error names the mapi-lite host and port; the full error is written to the service log instead.
+
+The verdict is **cached for `health_timeout_seconds`**, so repeated calls do not each reach mapi-lite. Without that cache an unauthenticated, unmetered endpoint could be used to flood the broadcast path. The Docker health check runs every 30s, so it always sees a fresh probe.
+
+The Docker image includes a `HEALTHCHECK` that calls this endpoint; `curl -f` fails on the 503, so an unreachable mapi-lite marks the container unhealthy. The service itself keeps running and keeps serving reads (`/status`, balances, UTXOs), which do not depend on mapi-lite, and recovers on its own when mapi-lite returns.
 
 ## Service status
 

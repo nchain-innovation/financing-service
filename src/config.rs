@@ -175,8 +175,10 @@ impl IdempotencyConfig {
 /// funding call may wait on mapi-lite.
 #[derive(Debug, Deserialize, Clone, PartialEq)]
 pub struct MapiLiteConfig {
-    /// Base URL of the mapi-lite server, e.g. `http://127.0.0.1:8080`. A
-    /// trailing `/` is tolerated.
+    /// Base URL of the mapi-lite server, e.g. `http://127.0.0.1:8080`.
+    /// Surrounding whitespace and a trailing `/` are tolerated; read it
+    /// through [`MapiLiteConfig::base_url`] rather than touching the field,
+    /// so what was validated is what gets requested.
     pub base_url: String,
     /// Sent verbatim as the `Authorization` header on every request, so it
     /// must include the scheme: `"Bearer <secret>"`. Takes an `env:VAR_NAME`
@@ -186,8 +188,10 @@ pub struct MapiLiteConfig {
     /// Per-request timeout for transaction submits, in seconds.
     #[serde(default = "default_mapi_lite_timeout_seconds")]
     pub timeout_seconds: u64,
-    /// Timeout for the mapi-lite probe behind `GET /health`, in seconds. Keep
-    /// it under the Docker health check's three seconds.
+    /// Timeout for the mapi-lite probe behind `GET /health`, in seconds. Must
+    /// be under the Docker health check's three seconds, and is rejected at
+    /// startup otherwise: a probe slower than the health check's own timeout
+    /// would mark the container unhealthy even while mapi-lite is fine.
     #[serde(default = "default_mapi_lite_health_timeout_seconds")]
     pub health_timeout_seconds: u64,
     /// How many times a submit is retried after a transient failure (an HTTP
@@ -196,6 +200,13 @@ pub struct MapiLiteConfig {
     /// success.
     #[serde(default = "default_mapi_lite_max_retries")]
     pub max_retries: u32,
+    /// Upper bound on a whole submit -- every attempt and every back-off
+    /// between them -- in seconds. Without it the worst case is
+    /// `timeout_seconds * (max_retries + 1)` plus back-off, which against a
+    /// wedged mapi-lite holds a `/fund` request, and the worker serving it,
+    /// open for minutes. Must be at least `timeout_seconds`.
+    #[serde(default = "default_mapi_lite_total_timeout_seconds")]
+    pub total_timeout_seconds: u64,
 }
 
 fn default_mapi_lite_timeout_seconds() -> u64 {
@@ -210,6 +221,15 @@ fn default_mapi_lite_max_retries() -> u32 {
     2
 }
 
+fn default_mapi_lite_total_timeout_seconds() -> u64 {
+    45
+}
+
+/// `health_timeout_seconds` has to leave the Docker health check
+/// (`--timeout=3s`) room to receive the answer, so it is rejected at or above
+/// that bound rather than only documented.
+const MAPI_LITE_HEALTH_TIMEOUT_LIMIT_SECONDS: u64 = 3;
+
 impl MapiLiteConfig {
     /// A section naming only `base_url`, with every other field at its default.
     #[cfg(test)]
@@ -220,7 +240,17 @@ impl MapiLiteConfig {
             timeout_seconds: default_mapi_lite_timeout_seconds(),
             health_timeout_seconds: default_mapi_lite_health_timeout_seconds(),
             max_retries: default_mapi_lite_max_retries(),
+            total_timeout_seconds: default_mapi_lite_total_timeout_seconds(),
         }
+    }
+
+    /// The configured base URL, normalised: surrounding whitespace removed and
+    /// any trailing `/` stripped, so `uls-client` always joins its paths onto
+    /// a bare origin. Validation, the HTTP clients and the log lines all read
+    /// the URL through here, so a padded or slash-terminated value in the TOML
+    /// cannot validate as one thing and be requested as another.
+    pub fn base_url(&self) -> &str {
+        self.base_url.trim().trim_end_matches('/')
     }
 
     pub fn timeout(&self) -> std::time::Duration {
@@ -231,10 +261,14 @@ impl MapiLiteConfig {
         std::time::Duration::from_secs(self.health_timeout_seconds)
     }
 
+    pub fn total_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.total_timeout_seconds)
+    }
+
     /// Reject a section the broadcaster cannot work with, at startup rather
     /// than on the first funding request.
     pub fn validate(&self) -> Result<(), String> {
-        let base_url = self.base_url.trim();
+        let base_url = self.base_url();
         if base_url.is_empty() {
             return Err("mapi_lite.base_url is required when [mapi_lite] is present".to_string());
         }
@@ -248,6 +282,24 @@ impl MapiLiteConfig {
         }
         if self.health_timeout_seconds == 0 {
             return Err("mapi_lite.health_timeout_seconds must be greater than zero".to_string());
+        }
+        if self.health_timeout_seconds >= MAPI_LITE_HEALTH_TIMEOUT_LIMIT_SECONDS {
+            return Err(format!(
+                "mapi_lite.health_timeout_seconds must be less than \
+                 {MAPI_LITE_HEALTH_TIMEOUT_LIMIT_SECONDS}, so GET /health answers inside the \
+                 Docker health check's own timeout, got {}",
+                self.health_timeout_seconds
+            ));
+        }
+        if self.total_timeout_seconds == 0 {
+            return Err("mapi_lite.total_timeout_seconds must be greater than zero".to_string());
+        }
+        if self.total_timeout_seconds < self.timeout_seconds {
+            return Err(format!(
+                "mapi_lite.total_timeout_seconds ({}) must be at least timeout_seconds ({}), \
+                 otherwise not even the first attempt can finish",
+                self.total_timeout_seconds, self.timeout_seconds
+            ));
         }
         Ok(())
     }
@@ -987,7 +1039,32 @@ filename = "./data/dynamic.toml"
         assert_eq!(mapi_lite.timeout_seconds, 30);
         assert_eq!(mapi_lite.health_timeout_seconds, 2);
         assert_eq!(mapi_lite.max_retries, 2);
+        assert_eq!(mapi_lite.total_timeout_seconds, 45);
         assert!(mapi_lite.validate().is_ok());
+    }
+
+    /// Whatever `validate` checked has to be what the client requests, so the
+    /// normalised URL -- not the raw field -- is what both of them read.
+    #[test]
+    fn sr_cfg_008_mapi_lite_base_url_is_normalised_before_use() {
+        for raw in [
+            "http://mapi:8080",
+            "http://mapi:8080/",
+            "http://mapi:8080///",
+            "  http://mapi:8080  ",
+            "\thttp://mapi:8080/\n",
+        ] {
+            let config = MapiLiteConfig::for_base_url(raw);
+            assert_eq!(config.base_url(), "http://mapi:8080", "for {raw:?}");
+            assert!(config.validate().is_ok(), "for {raw:?}");
+        }
+
+        // A padded value that is not a URL is still rejected: validation reads
+        // the same normalised string the client would be built from.
+        let error = MapiLiteConfig::for_base_url(" ftp://mapi ")
+            .validate()
+            .expect_err("not an http URL");
+        assert!(error.contains("must start with http:// or https://"), "{error}");
     }
 
     #[test]
@@ -1029,6 +1106,42 @@ filename = "./data/dynamic.toml"
         let mut config = MapiLiteConfig::for_base_url("http://127.0.0.1:8080");
         config.health_timeout_seconds = 0;
         assert!(config.validate().unwrap_err().contains("mapi_lite.health_timeout_seconds"));
+
+        let mut config = MapiLiteConfig::for_base_url("http://127.0.0.1:8080");
+        config.total_timeout_seconds = 0;
+        assert!(config.validate().unwrap_err().contains("mapi_lite.total_timeout_seconds"));
+    }
+
+    /// A probe slower than the Docker health check's own `--timeout=3s` would
+    /// mark the container unhealthy on every check even while mapi-lite is
+    /// fine, so the documented ceiling is enforced rather than just written
+    /// down.
+    #[test]
+    fn sr_cfg_008_mapi_lite_validate_rejects_a_health_timeout_the_health_check_cannot_wait_for() {
+        for seconds in [3, 4, 10] {
+            let mut config = MapiLiteConfig::for_base_url("http://127.0.0.1:8080");
+            config.health_timeout_seconds = seconds;
+            let error = config.validate().expect_err("a health timeout at or above 3s is rejected");
+            assert!(error.contains("must be less than 3"), "for {seconds}s: {error}");
+        }
+
+        let mut config = MapiLiteConfig::for_base_url("http://127.0.0.1:8080");
+        config.health_timeout_seconds = 2;
+        assert!(config.validate().is_ok());
+    }
+
+    /// The retry budget multiplies `timeout_seconds`, so the total deadline
+    /// has to leave room for at least one attempt.
+    #[test]
+    fn sr_cfg_008_mapi_lite_validate_rejects_a_total_timeout_below_one_attempt() {
+        let mut config = MapiLiteConfig::for_base_url("http://127.0.0.1:8080");
+        config.timeout_seconds = 30;
+        config.total_timeout_seconds = 10;
+        let error = config.validate().expect_err("no attempt can finish");
+        assert!(error.contains("must be at least timeout_seconds"), "{error}");
+
+        config.total_timeout_seconds = 30;
+        assert!(config.validate().is_ok());
     }
 
     #[test]

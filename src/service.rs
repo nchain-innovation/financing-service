@@ -1,4 +1,8 @@
-use std::{collections::HashMap, sync::Arc, time::SystemTime};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant, SystemTime},
+};
 
 use chain_gang::{
     interface::{Balance, BlockchainInterface, Utxo},
@@ -11,7 +15,7 @@ use tokio::sync::{Mutex, RwLock};
 use crate::{
     address_watcher::AddressWatcher,
     blockchain_factory::{blockchain_factory, Backend},
-    broadcaster::{factory::broadcaster_factory, BroadcastError, TxBroadcaster, MAPI_LITE},
+    broadcaster::{factory::broadcaster_factory, TxBroadcaster, MAPI_LITE},
     client::{Client, FundRequest, FundingSpendPlan},
     config::{ClientConfig, Config},
     dynamic_config::DynamicConfig,
@@ -120,6 +124,20 @@ pub struct Service {
     idempotency: Mutex<IdempotencyStore>,
     /// Set only for backends that must be told which addresses to follow.
     address_watcher: Option<Arc<dyn AddressWatcher>>,
+    /// The last mapi-lite probe verdict, reused by `GET /health` until it
+    /// goes stale. See [`Service::mapi_lite_health`].
+    mapi_health: Mutex<Option<CachedHealth>>,
+    /// How long a probe verdict is reused for. Zero without `[mapi_lite]`,
+    /// where nothing is ever probed.
+    mapi_health_ttl: Duration,
+}
+
+/// A mapi-lite probe verdict and the moment it was taken.
+struct CachedHealth {
+    taken_at: Instant,
+    /// The probe's own error text, kept for the log line rather than for the
+    /// `/health` body, which stays generic.
+    verdict: Result<(), String>,
 }
 
 impl Service {
@@ -175,6 +193,12 @@ impl Service {
                 config.idempotency.max_entries,
             )),
             address_watcher,
+            mapi_health: Mutex::new(None),
+            mapi_health_ttl: config
+                .mapi_lite
+                .as_ref()
+                .map(|mapi_lite| mapi_lite.health_timeout())
+                .unwrap_or_default(),
         })
     }
 
@@ -219,17 +243,27 @@ impl Service {
 
         // The write path. Without [mapi_lite] it wraps the interface probed
         // just above, so only mapi-lite needs a probe of its own -- and gets
-        // one, for the same reason the interface does: a funding service that
-        // cannot broadcast is better refused at startup than discovered on
-        // the first /fund.
+        // one, to tell the operator at startup rather than on the first /fund.
+        //
+        // A failed probe is reported but does not stop startup, the way a
+        // refused address import does not (see
+        // watch_configured_client_addresses). Refusing to start ties this
+        // service's lifecycle to mapi-lite's: the container health check would
+        // restart the process, the probe would fail again, and the service
+        // would sit in a restart loop -- taking /status, balances and every
+        // other read path, none of which need mapi-lite, down with it, and
+        // unable to recover on its own. Serving degraded and saying so through
+        // GET /health leaves the operator a service that heals when mapi-lite
+        // comes back.
         let broadcaster = broadcaster_factory(config, Arc::clone(&backend.interface))?;
         if let Some(mapi_lite) = &config.mapi_lite {
-            broadcaster.health_check().await.map_err(|e| {
-                format!(
-                    "Unable to reach mapi-lite at {}, ensure that it is running: {e}",
-                    mapi_lite.base_url
-                )
-            })?;
+            if let Err(e) = broadcaster.health_check().await {
+                log::warn!(
+                    "Unable to reach mapi-lite at {} at startup: {e}. Funding will fail until it \
+                     is reachable; GET /health reports the service unhealthy meanwhile.",
+                    mapi_lite.base_url()
+                );
+            }
         }
 
         let service = Self::build(config, backend, broadcaster)?;
@@ -548,15 +582,43 @@ impl Service {
         self.broadcaster.name() == MAPI_LITE
     }
 
-    /// Probe mapi-lite for `GET /health`.
+    /// Probe mapi-lite for `GET /health`, reusing a recent verdict.
     ///
     /// `None` when mapi-lite is not configured: there is then nothing to
     /// probe, and `/health` stays the pure liveness check it always was.
-    pub async fn mapi_lite_health(&self) -> Option<Result<(), BroadcastError>> {
+    ///
+    /// The verdict is cached for `mapi_lite.health_timeout_seconds`, because
+    /// `/health` is unauthenticated *and* exempt from the rate limiter
+    /// (SR-SEC-013), so without a cache anyone who can reach the port can turn
+    /// health traffic into an unbounded stream of requests to mapi-lite and
+    /// starve the funding path from an endpoint that costs them nothing. One
+    /// probe per TTL bounds that, and still answers the Docker health check
+    /// (every 30s) with a fresh result each time.
+    pub async fn mapi_lite_health(&self) -> Option<Result<(), String>> {
         if !self.mapi_lite_configured() {
             return None;
         }
-        Some(self.broadcaster.health_check().await)
+
+        // Held across the probe on purpose: concurrent callers wait for the
+        // one in flight rather than each starting their own, which is the
+        // point of the cache. The probe is bounded by health_timeout.
+        let mut cached = self.mapi_health.lock().await;
+        if let Some(entry) = cached.as_ref() {
+            if entry.taken_at.elapsed() < self.mapi_health_ttl {
+                return Some(entry.verdict.clone());
+            }
+        }
+
+        let verdict = self
+            .broadcaster
+            .health_check()
+            .await
+            .map_err(|e| e.to_string());
+        *cached = Some(CachedHealth {
+            taken_at: Instant::now(),
+            verdict: verdict.clone(),
+        });
+        Some(verdict)
     }
 
     pub fn admin_auth_required(&self) -> bool {
@@ -1194,6 +1256,32 @@ mod tests {
         let blockchain = test_blockchain_interface(&config).await;
         let unhealthy = service_with(&config, blockchain, StubMapiBroadcaster::new(false)).await;
         let probe = unhealthy.mapi_lite_health().await;
-        assert!(matches!(probe, Some(Err(BroadcastError::Upstream(_)))), "{probe:?}");
+        assert!(matches!(probe, Some(Err(ref detail)) if detail.contains("503")), "{probe:?}");
+    }
+
+    /// `/health` is unauthenticated and rate-limit exempt, so its probe must
+    /// not reach mapi-lite once per request. Within the TTL the verdict is
+    /// reused; past it a fresh probe is taken.
+    #[tokio::test]
+    async fn sr_bchn_011_mapi_lite_health_is_cached_for_the_health_timeout() {
+        use crate::test_support::StubMapiBroadcaster;
+
+        let mut config = test_config(&unique_dynamic_config_path());
+        let mut mapi_lite = crate::config::MapiLiteConfig::for_base_url("http://127.0.0.1:8080");
+        mapi_lite.health_timeout_seconds = 1;
+        config.mapi_lite = Some(mapi_lite);
+
+        let blockchain = test_blockchain_interface(&config).await;
+        let broadcaster = StubMapiBroadcaster::new(true);
+        let service = service_with(&config, blockchain, broadcaster.clone()).await;
+
+        for _ in 0..5 {
+            assert_eq!(service.mapi_lite_health().await, Some(Ok(())));
+        }
+        assert_eq!(broadcaster.probe_count(), 1, "the verdict should be reused");
+
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(service.mapi_lite_health().await, Some(Ok(())));
+        assert_eq!(broadcaster.probe_count(), 2, "a stale verdict should be refreshed");
     }
 }

@@ -112,7 +112,13 @@ pub async fn index(_data: web::Data<AppState>) -> String {
 /// With mapi-lite configured it also probes mapi-lite, because a funding
 /// service whose only broadcast path is down is not healthy; the probe is
 /// bounded by `mapi_lite.health_timeout_seconds` so the Docker health check
-/// still gets its answer in time.
+/// still gets its answer in time, and its verdict is cached for that long so
+/// this unauthenticated, rate-limit-exempt endpoint cannot be used to flood
+/// mapi-lite (see [`Service::mapi_lite_health`]).
+///
+/// The failure detail is logged, not returned: this endpoint answers anyone
+/// who can reach the port, and an upstream transport error carries the
+/// mapi-lite URL that a public 503 body has no business disclosing.
 #[get("/health")]
 pub async fn health(data: web::Data<AppState>) -> impl Responder {
     match data.service.mapi_lite_health().await {
@@ -121,7 +127,7 @@ pub async fn health(data: web::Data<AppState>) -> impl Responder {
         Some(Err(error)) => {
             log::warn!("mapi-lite health probe failed: {error}");
             HttpResponse::ServiceUnavailable()
-                .json(HealthResponse::mapi_lite_unhealthy(error.to_string()))
+                .json(HealthResponse::mapi_lite_unhealthy("mapi-lite probe failed"))
         }
     }
 }
@@ -806,7 +812,10 @@ mod tests {
         let body: Value = test::read_body_json(resp).await;
         assert_eq!(body["status"], "unhealthy");
         assert_eq!(body["mapi_lite"]["ok"], false);
-        assert!(body["mapi_lite"]["detail"].is_string());
+        // The detail is generic. /health answers unauthenticated callers, and
+        // the upstream error it replaces carries the mapi-lite URL.
+        let detail = body["mapi_lite"]["detail"].as_str().expect("a detail string");
+        assert_eq!(detail, "mapi-lite probe failed");
     }
 
     #[actix_web::test]

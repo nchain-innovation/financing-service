@@ -12,6 +12,11 @@
 //! configured request timeout and retry budget, the probe client a short
 //! timeout and no retries, because `GET /health` has to answer inside the
 //! Docker health check's three seconds however slow mapi-lite is being.
+//!
+//! A per-request timeout bounds one attempt but not the retry sequence, so a
+//! submit also carries a total deadline (`mapi_lite.total_timeout_seconds`).
+//! A funding call is interactive: a wedged mapi-lite must not hold the caller,
+//! and the actix worker serving it, for `timeout * (max_retries + 1)`.
 
 use std::time::Duration;
 
@@ -33,6 +38,10 @@ const RETRY_BACKOFF_CAP: Duration = Duration::from_secs(5);
 pub struct MapiBroadcaster {
     submit: MapiClient,
     probe: MapiClient,
+    /// Ceiling on a whole submit, retries and back-off included. The
+    /// per-request timeout bounds one attempt; this bounds the sequence, so a
+    /// `/fund` caller cannot be held for `timeout * (max_retries + 1)`.
+    submit_deadline: Duration,
 }
 
 impl MapiBroadcaster {
@@ -42,7 +51,11 @@ impl MapiBroadcaster {
             .retry(config.max_retries, RETRY_BACKOFF_BASE, RETRY_BACKOFF_CAP);
         // fee_quote does not retry, so the probe needs no retry settings.
         let probe = Self::client(config, config.health_timeout())?;
-        Ok(Self { submit, probe })
+        Ok(Self {
+            submit,
+            probe,
+            submit_deadline: config.total_timeout(),
+        })
     }
 
     /// A `MapiClient` for `config` whose every request times out after
@@ -53,7 +66,7 @@ impl MapiBroadcaster {
             .timeout(timeout)
             .build()
             .map_err(|e| format!("Unable to build the mapi-lite HTTP client: {e}"))?;
-        let mut client = MapiClient::new(config.base_url.clone()).with_http(http);
+        let mut client = MapiClient::new(config.base_url().to_string()).with_http(http);
         if let Some(token) = &config.auth_token {
             // Sent verbatim as the Authorization header; the scheme is the
             // operator's to include (see MapiLiteConfig::auth_token).
@@ -87,7 +100,24 @@ impl TxBroadcaster for MapiBroadcaster {
             merkle_format: None,
         };
 
-        let payload = self.submit.submit_transactions(&[request]).await?;
+        // The retry budget multiplies the per-request timeout, so the whole
+        // sequence gets a ceiling of its own: against a mapi-lite that accepts
+        // connections and never answers, the caller and the worker serving it
+        // are freed at the deadline rather than at attempts * timeout.
+        let payload = match tokio::time::timeout(
+            self.submit_deadline,
+            self.submit.submit_transactions(&[request]),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(BroadcastError::Upstream(format!(
+                    "mapi-lite did not answer within {}s (mapi_lite.total_timeout_seconds)",
+                    self.submit_deadline.as_secs()
+                )))
+            }
+        };
 
         // One in, one out. Anything else means the server and this client
         // disagree about the batch contract, and guessing which result is
@@ -122,12 +152,19 @@ impl TxBroadcaster for MapiBroadcaster {
 
         // "Already known" also comes back as success: a resubmitted funding
         // transaction is the same transaction, so that is the right answer.
+        //
+        // The txid must be the one we hashed. A different one means what
+        // reached the network is not the transaction this service built, and
+        // the caller would otherwise be handed outpoints -- derived from the
+        // local hash -- for a transaction that will never confirm, with its
+        // UTXOs already marked spent. Refused for the same reason the batch
+        // length is: a disagreement here is not ours to guess through.
         let expected = tx.hash().encode();
         if result.txid != expected {
-            log::warn!(
+            return Err(BroadcastError::Upstream(format!(
                 "mapi-lite reported txid {} for a funding transaction hashing to {expected}",
                 result.txid
-            );
+            )));
         }
         Ok(result.txid.clone())
     }
@@ -339,6 +376,75 @@ mod tests {
             .await
             .expect_err("no result for our transaction");
         assert!(upstream_detail(error).contains("returned 0 results"));
+    }
+
+    /// A txid that is not the one we hashed means the transaction on the
+    /// network is not the one this service built, so the caller must not be
+    /// handed outpoints derived from the local hash.
+    #[tokio::test]
+    async fn mapi_broadcaster_refuses_a_txid_that_is_not_the_transactions_own() {
+        let server = MockServer::start().await;
+        let tx = sample_tx();
+        Mock::given(method("POST"))
+            .and(path("/mapi/txs"))
+            .respond_with(ok(txs_payload(success("deadbeef", ""))))
+            .mount(&server)
+            .await;
+
+        let error = broadcaster(&server)
+            .broadcast_tx(&tx)
+            .await
+            .expect_err("a foreign txid is not our transaction");
+        let detail = upstream_detail(error);
+        assert!(detail.contains("deadbeef"), "{detail}");
+        assert!(detail.contains(&tx.hash().encode()), "{detail}");
+    }
+
+    /// The configured URL is normalised before the client is built, so a
+    /// trailing `/` -- which the configuration documents as tolerated -- does
+    /// not become a doubled separator in the request path.
+    #[tokio::test]
+    async fn mapi_broadcaster_tolerates_a_trailing_slash_on_the_base_url() {
+        let server = MockServer::start().await;
+        let tx = sample_tx();
+        Mock::given(method("POST"))
+            .and(path("/mapi/txs"))
+            .respond_with(ok(txs_payload(success(&tx.hash().encode(), ""))))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let config = MapiLiteConfig::for_base_url(format!("{}/", server.uri()));
+        let broadcaster = MapiBroadcaster::new(&config).expect("broadcaster builds");
+
+        broadcaster.broadcast_tx(&tx).await.expect("accepted");
+    }
+
+    /// The retry budget multiplies the per-request timeout, so the whole
+    /// submit carries a deadline of its own and a wedged mapi-lite cannot hold
+    /// a `/fund` caller for attempts * timeout.
+    #[tokio::test]
+    async fn mapi_broadcaster_submit_is_bounded_by_the_total_deadline() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/mapi/txs"))
+            .respond_with(ResponseTemplate::new(500).set_delay(Duration::from_secs(30)))
+            .mount(&server)
+            .await;
+
+        // Six attempts of up to 2s each, plus back-off, is fifteen seconds and
+        // more; the deadline ends it at three.
+        let mut config = config(&server);
+        config.timeout_seconds = 2;
+        config.max_retries = 5;
+        config.total_timeout_seconds = 3;
+        assert!(config.validate().is_ok(), "the test config is a legal one");
+        let broadcaster = MapiBroadcaster::new(&config).expect("broadcaster builds");
+
+        let started = std::time::Instant::now();
+        let error = broadcaster.broadcast_tx(&sample_tx()).await.expect_err("deadline");
+        assert!(started.elapsed() < Duration::from_secs(10), "the deadline did not fire");
+        assert!(upstream_detail(error).contains("total_timeout_seconds"));
     }
 
     #[tokio::test]

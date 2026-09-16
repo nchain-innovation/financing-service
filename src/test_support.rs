@@ -390,6 +390,7 @@ impl TxBroadcaster for FailingBroadcaster {
 pub struct StubMapiBroadcaster {
     healthy: bool,
     broadcasts: AtomicU32,
+    probes: AtomicU32,
 }
 
 impl StubMapiBroadcaster {
@@ -397,11 +398,18 @@ impl StubMapiBroadcaster {
         Arc::new(Self {
             healthy,
             broadcasts: AtomicU32::new(0),
+            probes: AtomicU32::new(0),
         })
     }
 
     pub fn broadcast_count(&self) -> u32 {
         self.broadcasts.load(Ordering::SeqCst)
+    }
+
+    /// How many health probes actually reached the broadcaster, so a test can
+    /// tell a cached verdict from a fresh one.
+    pub fn probe_count(&self) -> u32 {
+        self.probes.load(Ordering::SeqCst)
     }
 }
 
@@ -417,6 +425,7 @@ impl TxBroadcaster for StubMapiBroadcaster {
     }
 
     async fn health_check(&self) -> Result<(), BroadcastError> {
+        self.probes.fetch_add(1, Ordering::SeqCst);
         if self.healthy {
             Ok(())
         } else {

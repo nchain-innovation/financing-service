@@ -37,7 +37,7 @@ pub fn describe_broadcaster(config: &Config) -> String {
     match &config.mapi_lite {
         Some(mapi_lite) => format!(
             "mapi-lite integration configured (base_url={}): funding transactions will be broadcast via mapi-lite",
-            mapi_lite.base_url
+            mapi_lite.base_url()
         ),
         None => format!(
             "mapi-lite not configured: funding transactions will be broadcast via the '{}' blockchain interface",
