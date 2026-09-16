@@ -165,6 +165,94 @@ impl IdempotencyConfig {
     }
 }
 
+/// Optional mapi-lite integration.
+///
+/// When this section is present, funding transactions are broadcast through
+/// the named mapi-lite server instead of through the `[blockchain_interface]`;
+/// chain reads (balances, UTXOs) are unaffected. The two settings that select
+/// and authenticate the server mirror the ones teranode-event-rs uses for the
+/// same integration (`mapi_base_url`, `auth_token`); the rest bound how long a
+/// funding call may wait on mapi-lite.
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+pub struct MapiLiteConfig {
+    /// Base URL of the mapi-lite server, e.g. `http://127.0.0.1:8080`. A
+    /// trailing `/` is tolerated.
+    pub base_url: String,
+    /// Sent verbatim as the `Authorization` header on every request, so it
+    /// must include the scheme: `"Bearer <secret>"`. Takes an `env:VAR_NAME`
+    /// reference, and is overridden by `FS_MAPI_LITE_AUTH_TOKEN`.
+    #[serde(default)]
+    pub auth_token: Option<String>,
+    /// Per-request timeout for transaction submits, in seconds.
+    #[serde(default = "default_mapi_lite_timeout_seconds")]
+    pub timeout_seconds: u64,
+    /// Timeout for the mapi-lite probe behind `GET /health`, in seconds. Keep
+    /// it under the Docker health check's three seconds.
+    #[serde(default = "default_mapi_lite_health_timeout_seconds")]
+    pub health_timeout_seconds: u64,
+    /// How many times a submit is retried after a transient failure (an HTTP
+    /// 5xx or a transport error) before `/fund` reports `broadcast_failed`.
+    /// Resubmitting is safe: mapi-lite answers a known transaction with
+    /// success.
+    #[serde(default = "default_mapi_lite_max_retries")]
+    pub max_retries: u32,
+}
+
+fn default_mapi_lite_timeout_seconds() -> u64 {
+    30
+}
+
+fn default_mapi_lite_health_timeout_seconds() -> u64 {
+    2
+}
+
+fn default_mapi_lite_max_retries() -> u32 {
+    2
+}
+
+impl MapiLiteConfig {
+    /// A section naming only `base_url`, with every other field at its default.
+    #[cfg(test)]
+    pub fn for_base_url(base_url: impl Into<String>) -> Self {
+        MapiLiteConfig {
+            base_url: base_url.into(),
+            auth_token: None,
+            timeout_seconds: default_mapi_lite_timeout_seconds(),
+            health_timeout_seconds: default_mapi_lite_health_timeout_seconds(),
+            max_retries: default_mapi_lite_max_retries(),
+        }
+    }
+
+    pub fn timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.timeout_seconds)
+    }
+
+    pub fn health_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.health_timeout_seconds)
+    }
+
+    /// Reject a section the broadcaster cannot work with, at startup rather
+    /// than on the first funding request.
+    pub fn validate(&self) -> Result<(), String> {
+        let base_url = self.base_url.trim();
+        if base_url.is_empty() {
+            return Err("mapi_lite.base_url is required when [mapi_lite] is present".to_string());
+        }
+        if !(base_url.starts_with("http://") || base_url.starts_with("https://")) {
+            return Err(format!(
+                "mapi_lite.base_url must start with http:// or https://, got '{base_url}'"
+            ));
+        }
+        if self.timeout_seconds == 0 {
+            return Err("mapi_lite.timeout_seconds must be greater than zero".to_string());
+        }
+        if self.health_timeout_seconds == 0 {
+            return Err("mapi_lite.health_timeout_seconds must be greater than zero".to_string());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Default, Deserialize, Clone)]
 pub struct DynamicConfigConfig {
     pub filename: String,
@@ -248,6 +336,9 @@ pub struct Config {
     pub dynamic_config: DynamicConfigConfig,
     #[serde(default)]
     pub idempotency: IdempotencyConfig,
+    /// Present => funding transactions are broadcast via mapi-lite.
+    #[serde(default)]
+    pub mapi_lite: Option<MapiLiteConfig>,
 }
 
 impl ClientConfig {
@@ -306,6 +397,23 @@ impl Config {
             }
         } else if let Some(rpc_password) = self.blockchain_interface.rpc_password.take() {
             self.blockchain_interface.rpc_password = Some(resolve_secret(&rpc_password)?);
+        }
+
+        // The mapi-lite token is a bearer credential like the API keys.
+        if let Some(mapi_lite) = self.mapi_lite.as_mut() {
+            if let Ok(auth_token) = env::var("FS_MAPI_LITE_AUTH_TOKEN") {
+                if !auth_token.is_empty() {
+                    mapi_lite.auth_token = Some(auth_token);
+                } else if let Some(auth_token) = mapi_lite.auth_token.take() {
+                    mapi_lite.auth_token = Some(resolve_secret(&auth_token)?);
+                }
+            } else if let Some(auth_token) = mapi_lite.auth_token.take() {
+                mapi_lite.auth_token = Some(resolve_secret(&auth_token)?);
+            }
+            // An empty token and no token mean the same thing: send none.
+            if mapi_lite.auth_token.as_deref() == Some("") {
+                mapi_lite.auth_token = None;
+            }
         }
 
         if let Some(clients) = self.client.as_mut() {
@@ -380,6 +488,9 @@ pub fn load_config(env_var: &str, filename: &str) -> Result<Config, String> {
     config.telemetry.validate()?;
     config.idempotency.validate()?;
     config.blockchain_interface.validate()?;
+    if let Some(mapi_lite) = &config.mapi_lite {
+        mapi_lite.validate()?;
+    }
     warn_plaintext_secrets(&config);
     config.resolve_secrets()
 }
@@ -802,5 +913,206 @@ filename = "./data/dynamic.toml"
         unsafe { env::remove_var("FS_CONFIG") };
         let err = load_config("FS_CONFIG", path.to_str().unwrap()).unwrap_err();
         assert!(err.contains("telemetry.otlp_endpoint"));
+    }
+
+    /// The smallest config the service accepts, for the [mapi_lite] tests to
+    /// build on.
+    const MINIMAL_TOML: &str = r#"
+[blockchain_interface]
+interface_type = "test"
+network_type = "testnet"
+
+[web_interface]
+address = "127.0.0.1"
+port = 8080
+
+[logging]
+level = "info"
+
+[service]
+utxo_refresh_period = 60
+
+[dynamic_config]
+filename = "./data/dynamic.toml"
+"#;
+
+    fn write_temp_config(label: &str, content: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "financing-service-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    /// The minimal config plus a `[mapi_lite]` section holding `fields`.
+    fn with_mapi_lite_section(fields: &str) -> String {
+        format!("{MINIMAL_TOML}\n[mapi_lite]\n{fields}")
+    }
+
+    fn config_with_mapi_lite(auth_token: Option<&str>) -> Config {
+        let mut mapi_lite = MapiLiteConfig::for_base_url("http://127.0.0.1:8080");
+        mapi_lite.auth_token = auth_token.map(str::to_string);
+        Config {
+            mapi_lite: Some(mapi_lite),
+            ..Default::default()
+        }
+    }
+
+    fn plaintext_fields(auth_token: Option<&str>) -> Vec<String> {
+        crate::secrets::plaintext_secret_fields(&config_with_mapi_lite(auth_token))
+    }
+
+    /// Leaving the section out is the WoC deployment, and must keep working
+    /// with no change to existing config files.
+    #[test]
+    fn sr_cfg_008_config_without_a_mapi_lite_section_has_none() {
+        let config: Config = toml::from_str(MINIMAL_TOML).unwrap();
+        assert!(config.mapi_lite.is_none());
+    }
+
+    #[test]
+    fn sr_cfg_008_mapi_lite_section_parses_with_defaults() {
+        let content = with_mapi_lite_section("base_url = \"http://127.0.0.1:8080\"\n");
+        let config: Config = toml::from_str(&content).unwrap();
+        let mapi_lite = config.mapi_lite.expect("section present");
+        assert_eq!(mapi_lite.base_url, "http://127.0.0.1:8080");
+        assert_eq!(mapi_lite.auth_token, None);
+        assert_eq!(mapi_lite.timeout_seconds, 30);
+        assert_eq!(mapi_lite.health_timeout_seconds, 2);
+        assert_eq!(mapi_lite.max_retries, 2);
+        assert!(mapi_lite.validate().is_ok());
+    }
+
+    #[test]
+    fn sr_cfg_008_mapi_lite_section_accepts_every_field() {
+        let content = with_mapi_lite_section(
+            "base_url = \"https://mapi.example:8443/\"\nauth_token = \"Bearer secret\"\ntimeout_seconds = 5\nhealth_timeout_seconds = 1\nmax_retries = 0\n",
+        );
+        let config: Config = toml::from_str(&content).unwrap();
+        let mapi_lite = config.mapi_lite.expect("section present");
+        assert_eq!(mapi_lite.base_url, "https://mapi.example:8443/");
+        assert_eq!(mapi_lite.auth_token.as_deref(), Some("Bearer secret"));
+        assert_eq!(mapi_lite.timeout(), std::time::Duration::from_secs(5));
+        assert_eq!(mapi_lite.health_timeout(), std::time::Duration::from_secs(1));
+        assert_eq!(mapi_lite.max_retries, 0);
+        assert!(mapi_lite.validate().is_ok());
+    }
+
+    #[test]
+    fn sr_cfg_008_mapi_lite_validate_rejects_a_missing_or_non_http_base_url() {
+        for (base_url, expected) in [
+            ("", "mapi_lite.base_url is required"),
+            ("   ", "mapi_lite.base_url is required"),
+            ("127.0.0.1:8080", "must start with http:// or https://"),
+            ("ftp://mapi", "must start with http:// or https://"),
+        ] {
+            let error = MapiLiteConfig::for_base_url(base_url)
+                .validate()
+                .expect_err("expected validation to fail");
+            assert!(error.contains(expected), "for '{base_url}': {error}");
+        }
+    }
+
+    #[test]
+    fn sr_cfg_008_mapi_lite_validate_rejects_zero_timeouts() {
+        let mut config = MapiLiteConfig::for_base_url("http://127.0.0.1:8080");
+        config.timeout_seconds = 0;
+        assert!(config.validate().unwrap_err().contains("mapi_lite.timeout_seconds"));
+
+        let mut config = MapiLiteConfig::for_base_url("http://127.0.0.1:8080");
+        config.health_timeout_seconds = 0;
+        assert!(config.validate().unwrap_err().contains("mapi_lite.health_timeout_seconds"));
+    }
+
+    #[test]
+    fn sr_cfg_008_load_config_validates_the_mapi_lite_section() {
+        let _env = env_lock();
+        let path = write_temp_config("mapi-lite", &with_mapi_lite_section("base_url = \"\"\n"));
+        unsafe { env::remove_var("FS_CONFIG") };
+        let err = load_config("FS_CONFIG", path.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("mapi_lite.base_url"), "{err}");
+    }
+
+    #[test]
+    fn sr_cfg_008_load_config_reads_a_valid_mapi_lite_section() {
+        let _env = env_lock();
+        let path = write_temp_config(
+            "mapi-lite-ok",
+            &with_mapi_lite_section("base_url = \"http://127.0.0.1:8080\"\n"),
+        );
+        unsafe { env::remove_var("FS_CONFIG") };
+        unsafe { env::remove_var("FS_MAPI_LITE_AUTH_TOKEN") };
+        let config = load_config("FS_CONFIG", path.to_str().unwrap()).unwrap();
+        assert_eq!(config.mapi_lite.unwrap().base_url, "http://127.0.0.1:8080");
+    }
+
+    #[test]
+    fn sr_cfg_008_fs_config_json_accepts_a_mapi_lite_object() {
+        let _env = env_lock();
+        unsafe {
+            env::set_var(
+                "FS_CONFIG",
+                r#"{"blockchain_interface":{"interface_type":"test","network_type":"testnet"},"web_interface":{"address":"127.0.0.1","port":9092},"logging":{"level":"info"},"service":{"utxo_refresh_period":30},"dynamic_config":{"filename":"./data/dynamic.toml"},"mapi_lite":{"base_url":"http://mapi:8080","max_retries":1}}"#,
+            );
+        }
+        let config = get_config("FS_CONFIG", "missing-file.toml").unwrap();
+        unsafe { env::remove_var("FS_CONFIG") };
+        let mapi_lite = config.mapi_lite.expect("object present");
+        assert_eq!(mapi_lite.base_url, "http://mapi:8080");
+        assert_eq!(mapi_lite.max_retries, 1);
+    }
+
+    #[test]
+    fn sr_sec_015_mapi_lite_auth_token_resolves_from_an_env_reference() {
+        let _env = env_lock();
+        unsafe { env::set_var("FS_TEST_MAPI_TOKEN", "Bearer from-env") };
+        unsafe { env::remove_var("FS_MAPI_LITE_AUTH_TOKEN") };
+        let config = config_with_mapi_lite(Some("env:FS_TEST_MAPI_TOKEN"));
+        let resolved = config.resolve_secrets().unwrap();
+        assert_eq!(resolved.mapi_lite.unwrap().auth_token.as_deref(), Some("Bearer from-env"));
+        unsafe { env::remove_var("FS_TEST_MAPI_TOKEN") };
+    }
+
+    #[test]
+    fn sr_sec_015_fs_mapi_lite_auth_token_env_overrides_the_config() {
+        let _env = env_lock();
+        unsafe { env::set_var("FS_MAPI_LITE_AUTH_TOKEN", "Bearer override") };
+        let config = config_with_mapi_lite(Some("env:SHOULD_NOT_BE_USED"));
+        let resolved = config.resolve_secrets().unwrap();
+        assert_eq!(resolved.mapi_lite.unwrap().auth_token.as_deref(), Some("Bearer override"));
+        unsafe { env::remove_var("FS_MAPI_LITE_AUTH_TOKEN") };
+    }
+
+    #[test]
+    fn sr_sec_015_missing_mapi_lite_auth_token_env_reference_fails_resolution() {
+        let _env = env_lock();
+        unsafe { env::remove_var("FS_MAPI_LITE_AUTH_TOKEN") };
+        unsafe { env::remove_var("FS_DEFINITELY_MISSING_MAPI_TOKEN") };
+        let config = config_with_mapi_lite(Some("env:FS_DEFINITELY_MISSING_MAPI_TOKEN"));
+        let err = config.resolve_secrets().unwrap_err();
+        assert!(err.contains("FS_DEFINITELY_MISSING_MAPI_TOKEN"), "{err}");
+    }
+
+    #[test]
+    fn mapi_lite_auth_token_absent_stays_absent_after_resolution() {
+        let _env = env_lock();
+        unsafe { env::remove_var("FS_MAPI_LITE_AUTH_TOKEN") };
+        let resolved = config_with_mapi_lite(None).resolve_secrets().unwrap();
+        assert_eq!(resolved.mapi_lite.unwrap().auth_token, None);
+    }
+
+    #[test]
+    fn sr_sec_015_plaintext_mapi_lite_auth_token_is_reported() {
+        let field = "mapi_lite.auth_token".to_string();
+        assert!(plaintext_fields(Some("Bearer literal")).contains(&field));
+        assert!(!plaintext_fields(Some("env:FS_MAPI_LITE_AUTH_TOKEN")).contains(&field));
+        assert!(!plaintext_fields(None).contains(&field));
     }
 }

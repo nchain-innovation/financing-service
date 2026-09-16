@@ -5,6 +5,7 @@ interface FS_API
 package "Financing Service" {
     FS_API - [FinancingService] : provides
     [Chain-Gang\n(BSV library)]
+    [uls-client\n(mapi-lite client)]
     file "configuration\n(financing-service.toml)" as fs_toml
 
     [FinancingService] ..> fs_toml : read at startup
@@ -13,19 +14,29 @@ package "Financing Service" {
 cloud "Blockchain" {
 }
 
-[FinancingService] ..> [Chain-Gang\n(BSV library)] : uses
+[FinancingService] ..> [Chain-Gang\n(BSV library)] : chain reads\n(and broadcast by default)
+
+[FinancingService] ..> [uls-client\n(mapi-lite client)] : broadcast\n<<optional: [mapi_lite]>>
 
 [Chain-Gang\n(BSV library)] ..> [WhatsOnChain] : WoC interface\n(interface_type = woc)
 
 [Chain-Gang\n(BSV library)] ..> [UTXO as a Service\n(UaaS)] : UaaS interface\n(interface_type = uaas)\n<<optional>>
 
+[Chain-Gang\n(BSV library)] ..> [Bitcoin node\n(JSON-RPC)] : RPC interface\n(interface_type = rpc)\n<<optional>>
+
+[uls-client\n(mapi-lite client)] ..> [mapi-lite] : POST /mapi/txs\nGET /mapi/feeQuote (health)
+
 [WhatsOnChain] ..> Blockchain
 [UTXO as a Service\n(UaaS)] ..> Blockchain
+[Bitcoin node\n(JSON-RPC)] ..> Blockchain
+[mapi-lite] ..> Blockchain
 
 note bottom of fs_toml
   One blockchain interface is selected at startup via
-  [blockchain_interface].interface_type (woc, uaas, or test).
-  UaaS requires a configured service URL.
+  [blockchain_interface].interface_type (woc, uaas, rpc or test)
+  and serves chain reads. Funding transactions are broadcast
+  through it too, unless a [mapi_lite] section is present, in
+  which case they go to mapi-lite and GET /health probes it.
 end note
 
 @enduml

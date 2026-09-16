@@ -52,6 +52,10 @@ pub fn warn_plaintext_secrets(config: &crate::config::Config) {
             log::warn!(
                 "web_interface.admin_api_key is stored as plaintext in config; use env:VAR_NAME or FS_ADMIN_API_KEY instead"
             );
+        } else if field == "mapi_lite.auth_token" {
+            log::warn!(
+                "mapi_lite.auth_token is stored as plaintext in config; use env:VAR_NAME or FS_MAPI_LITE_AUTH_TOKEN instead"
+            );
         } else if let Some(client_id) = field.strip_prefix("client.").and_then(|rest| {
             rest.strip_suffix(".wif_key")
                 .or_else(|| rest.strip_suffix(".api_key"))
@@ -99,6 +103,14 @@ pub fn plaintext_secret_fields(config: &crate::config::Config) -> Vec<String> {
         .is_some_and(|password| !password.is_empty() && !is_secret_reference(password))
     {
         fields.push("blockchain_interface.rpc_password".to_string());
+    }
+    if config
+        .mapi_lite
+        .as_ref()
+        .and_then(|mapi_lite| mapi_lite.auth_token.as_deref())
+        .is_some_and(|token| !token.is_empty() && !is_secret_reference(token))
+    {
+        fields.push("mapi_lite.auth_token".to_string());
     }
     if let Some(clients) = &config.client {
         for client in clients {

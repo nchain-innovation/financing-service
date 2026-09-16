@@ -105,10 +105,25 @@ pub async fn index(_data: web::Data<AppState>) -> String {
     "Financing Service REST API".to_string()
 }
 
-/// Health check endpoint for container orchestration
+/// Health check endpoint for container orchestration.
+///
+/// Without `[mapi_lite]` configured this is pure liveness: `{"status":"ok"}`
+/// whenever the process serves, independent of any blockchain connectivity.
+/// With mapi-lite configured it also probes mapi-lite, because a funding
+/// service whose only broadcast path is down is not healthy; the probe is
+/// bounded by `mapi_lite.health_timeout_seconds` so the Docker health check
+/// still gets its answer in time.
 #[get("/health")]
-pub async fn health() -> impl Responder {
-    json_ok(&HealthResponse::ok())
+pub async fn health(data: web::Data<AppState>) -> impl Responder {
+    match data.service.mapi_lite_health().await {
+        None => json_ok(&HealthResponse::ok()),
+        Some(Ok(())) => json_ok(&HealthResponse::mapi_lite_ok()),
+        Some(Err(error)) => {
+            log::warn!("mapi-lite health probe failed: {error}");
+            HttpResponse::ServiceUnavailable()
+                .json(HealthResponse::mapi_lite_unhealthy(error.to_string()))
+        }
+    }
 }
 
 /// Get Service Status endpoint
@@ -558,8 +573,8 @@ mod tests {
         service::Service,
         test_support::{
             test_blockchain_interface, test_config, test_config_with_keys,
-            unique_dynamic_config_path, CountingBlockchain, LOCKING_SCRIPT_HEX, TEST_ADDRESS,
-            TEST_CLIENT_ID, TEST_WIF,
+            unique_dynamic_config_path, CountingBlockchain, StubMapiBroadcaster,
+            LOCKING_SCRIPT_HEX, TEST_ADDRESS, TEST_CLIENT_ID, TEST_WIF,
         },
     };
 
@@ -659,6 +674,39 @@ mod tests {
         (app, blockchain)
     }
 
+    /// Build an app that broadcasts through a stand-in for mapi-lite, so the
+    /// health and status endpoints can be exercised in both of its states.
+    async fn build_app_with_mapi_lite(
+        healthy: bool,
+    ) -> (
+        impl ActixService<Request, Response = ServiceResponse, Error = Error>,
+        Arc<StubMapiBroadcaster>,
+    ) {
+        let config = test_config(&unique_dynamic_config_path());
+        let blockchain = test_blockchain_interface(&config).await;
+        let stub = StubMapiBroadcaster::new(healthy);
+        let service =
+            Service::new_for_test_with_broadcaster(&config, blockchain, stub.clone()).await;
+        let app_state = web::Data::new(AppState {
+            service: Arc::new(service),
+        });
+
+        let app = test::init_service(
+            App::new()
+                .app_data(app_state)
+                .service(index)
+                .service(health)
+                .service(status)
+                .service(balance)
+                .service(get_funds)
+                .service(add_client)
+                .service(delete_client)
+                .service(get_address),
+        )
+        .await;
+        (app, stub)
+    }
+
     async fn build_app_with_api_key(
         api_key: Option<&str>,
     ) -> impl ActixService<Request, Response = ServiceResponse, Error = Error> {
@@ -734,6 +782,31 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body: Value = test::read_body_json(resp).await;
         assert_eq!(body["status"], "ok");
+        // Without mapi-lite the body is exactly what it always was.
+        assert_eq!(body, json!({ "status": "ok" }));
+    }
+
+    #[actix_web::test]
+    async fn sr_bchn_011_health_reports_mapi_lite_ok_when_it_is_reachable() {
+        let (app, _broadcaster) = build_app_with_mapi_lite(true).await;
+        let resp =
+            test::call_service(&app, test::TestRequest::get().uri("/health").to_request()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["mapi_lite"]["ok"], true);
+    }
+
+    #[actix_web::test]
+    async fn sr_bchn_011_health_returns_503_when_mapi_lite_is_unreachable() {
+        let (app, _broadcaster) = build_app_with_mapi_lite(false).await;
+        let resp =
+            test::call_service(&app, test::TestRequest::get().uri("/health").to_request()).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["status"], "unhealthy");
+        assert_eq!(body["mapi_lite"]["ok"], false);
+        assert!(body["mapi_lite"]["detail"].is_string());
     }
 
     #[actix_web::test]
@@ -745,6 +818,30 @@ mod tests {
         let body: Value = test::read_body_json(resp).await;
         assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
         assert!(body["blockchain_status"].is_string());
+        // The test config's interface_type, which is what broadcasts go
+        // through when mapi-lite is not configured.
+        assert_eq!(body["broadcaster"], "test");
+    }
+
+    #[actix_web::test]
+    async fn sr_bchn_009_status_names_mapi_lite_and_fund_broadcasts_through_it() {
+        let (app, broadcaster) = build_app_with_mapi_lite(true).await;
+        let resp =
+            test::call_service(&app, test::TestRequest::get().uri("/status").to_request()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["broadcaster"], "mapi-lite");
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/fund")
+                .set_json(fund_body(TEST_CLIENT_ID, 123, 1, LOCKING_SCRIPT_HEX))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(broadcaster.broadcast_count(), 1);
     }
 
     #[actix_web::test]

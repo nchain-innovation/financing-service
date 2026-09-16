@@ -33,6 +33,22 @@ cargo build
 cargo test
 ```
 
+### SSH access to mapi-lite
+
+The optional mapi-lite broadcaster depends on the `uls-client` and `uls-core` crates, which live in the **private** `nchain-innovation/mapi-lite` repository and are pinned in `Cargo.toml` as `git+ssh` dependencies. Building therefore needs an SSH key with read access to that repository loaded in your agent:
+
+```bash
+eval "$(ssh-agent)" && ssh-add ~/.ssh/<your-key>
+ssh -T git@github.com     # should greet you by name
+cargo build
+```
+
+`.cargo/config.toml` sets `net.git-fetch-with-cli = true`, so cargo hands the fetch to your `git`, which uses the agent and `~/.ssh/config` as usual. Nothing else in the dependency tree needs credentials. Details, including how to repin and the single-`chain-gang` rule, are in [Dependencies.md](Dependencies.md).
+
+### Docker
+
+`./build.sh` runs `docker build` with BuildKit and `--ssh default`, which lends your ssh-agent socket to the one build step that fetches dependencies; the key never enters the image. Have an agent running with the key loaded before building. `multi-build.sh` passes the same flag to `docker buildx build`.
+
 ## Formatting and linting
 
 Check formatting:
@@ -65,6 +81,8 @@ These checks run automatically in GitHub Actions (`.github/workflows/rust.yml`) 
 ## Dependencies
 
 `Cargo.lock` is committed for reproducible builds. Run `cargo update` only when intentionally upgrading dependencies, then re-run tests and commit the updated lockfile.
+
+`chain-gang` must resolve to exactly one package in the lockfile — it is referenced both directly and through `uls-client` — and `dependency_graph::tests` fails the build if it does not. See [Dependencies.md](Dependencies.md) for why, and for the order to bump things in.
 
 ## Source code documentation
 

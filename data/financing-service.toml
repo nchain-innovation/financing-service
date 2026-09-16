@@ -42,3 +42,14 @@ filename = "./data/dynamic.toml"
 # [idempotency]
 # ttl_seconds = 600
 # max_entries = 10000
+
+# Optional. When present, funding transactions are broadcast through mapi-lite
+# instead of the [blockchain_interface] above; chain reads (balances, UTXOs)
+# still use [blockchain_interface]. GET /health then probes mapi-lite too.
+# Only base_url is required; the rest are the defaults.
+# [mapi_lite]
+# base_url = "http://127.0.0.1:8080"
+# auth_token = "env:FS_MAPI_LITE_AUTH_TOKEN"   # sent verbatim: include the scheme, e.g. "Bearer <secret>"
+# timeout_seconds = 30
+# health_timeout_seconds = 2
+# max_retries = 2

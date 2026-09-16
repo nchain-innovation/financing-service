@@ -19,18 +19,22 @@ For API details see [SupportedEndpoints.md](SupportedEndpoints.md). For configur
 | Live balance refresh and pre-fund UTXO resync | 2026 |
 | Multi-tx partial failure structured responses | 2026 |
 | Same-client concurrent funding (plan-then-commit) | 2026 |
+| Optional mapi-lite transaction broadcaster | September 2026 |
 
-The Rust service uses the [`chain-gang`](https://github.com/nchain-innovation/chain-gang) library for blockchain access (WhatsOnChain, UaaS, a node's JSON-RPC endpoint, or the test interface) and wallet operations.
+The Rust service uses the [`chain-gang`](https://github.com/nchain-innovation/chain-gang) library for blockchain access (WhatsOnChain, UaaS, a node's JSON-RPC endpoint, or the test interface) and wallet operations. Optionally it broadcasts through [mapi-lite](https://github.com/nchain-innovation/mapi-lite) via that project's `uls-client` crate.
 
 ## Current architecture
 
 ```
-Client App  ──REST──▶  Actix Web API  ──▶  Service  ──▶  BlockchainInterface
+Client App  ──REST──▶  Actix Web API  ──▶  Service  ──reads───▶  BlockchainInterface (woc/uaas/rpc/test)
 Admin       ──REST──▶       │                │
+                            │                ├──writes──▶  TxBroadcaster
+                            │                │              ├── WocBroadcaster  (wraps the BlockchainInterface; default)
+                            │                │              └── MapiBroadcaster (uls-client ──▶ mapi-lite; when [mapi_lite] is set)
                             │                ├── Per-client wallets (Arc<RwLock<Client>>)
                             │                └── dynamic.toml (runtime clients)
                             ├── rate_limit (per-IP, /health exempt)
-                            └── /health (liveness, no auth)
+                            └── /health (liveness, no auth; probes mapi-lite when configured)
 ```
 
 | Module | Role |
@@ -43,7 +47,12 @@ Admin       ──REST──▶       │                │
 | `secrets.rs` | `env:VAR` resolution and plaintext warnings |
 | `responses.rs` | Typed JSON request/response DTOs |
 | `config.rs` | TOML and environment config loading |
-| `blockchain_factory.rs` | Pluggable blockchain backends |
+| `blockchain_factory.rs` | Pluggable blockchain backends (chain reads, and broadcast by default) |
+| `broadcaster/mod.rs` | `TxBroadcaster` seam for sending funding transactions |
+| `broadcaster/woc.rs` | Broadcast through the configured `BlockchainInterface` (WoC in production) |
+| `broadcaster/mapi.rs` | Broadcast through mapi-lite with `uls-client`; fee-quote health probe |
+| `broadcaster/factory.rs` | Select the broadcaster from `[mapi_lite]`; the startup log line |
+| `address_watcher.rs` | Tell a node-backed interface which addresses to track |
 | `dynamic_config.rs` | Persist runtime-added clients |
 | `rate_limit.rs` | Per-IP HTTP rate limiting middleware |
 | `telemetry.rs` | Tracing subscriber and OpenTelemetry OTLP export |
@@ -59,6 +68,7 @@ Admin       ──REST──▶       │                │
 * Optional OpenTelemetry trace export via OTLP (configurable, disabled by default)
 * Configurable per-IP HTTP rate limiting with `/health` exempt
 * Balance checks against total wallet balance; funding combines multiple UTXOs when needed; balance endpoint refreshes from chain on each request; `multiple_tx` partial failures return structured successful transaction data; concurrent fund requests for the same client use read-only planning and commit UTXO updates only after broadcast
+* Optional mapi-lite transaction broadcaster (`[mapi_lite]`): broadcasts go to mapi-lite, reads stay on the blockchain interface, `/health` probes mapi-lite and returns 503 when it is down, `/status` names the broadcaster, startup logs the selection
 * Docker image with `/health` liveness check
 * CI: build, test, `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo audit`
 * `chain-gang` from crates.io at an exact release, with a committed `Cargo.lock`, for reproducible builds
@@ -81,5 +91,7 @@ None at present.
 * [Configuration.md](Configuration.md) — service and client configuration
 * [LockingScripts.md](LockingScripts.md) — generating locking scripts for `/fund`
 * [Development.md](Development.md) — build, test, and CI
+* [Dependencies.md](Dependencies.md) — the private `uls-client` dependency and the single-`chain-gang` invariant
+* [MapiLiteBroadcaster.md](MapiLiteBroadcaster.md) — design record for the mapi-lite broadcaster
 * [SystemRequirements.md](SystemRequirements.md) — system requirements and verification methods
 * [README.md](../README.md) — overview and getting started

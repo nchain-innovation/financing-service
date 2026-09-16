@@ -21,6 +21,7 @@ The FS is designed to be as simple as possible, in that light it:
 * FS does not access the client's key, instead the client provides the locking script (script_pubkey).
 
 * FS accesses the blockchain through WhatsOnChain, UTXO as a Service (UaaS), or a node's JSON-RPC endpoint. The first two reach mainnet, testnet and STN; the `rpc` interface additionally reaches regtest, and works against any node you control. See [which interface reaches which network](docs/Configuration.md#which-interface-reaches-which-network).
+* FS can optionally broadcast funding transactions through [mapi-lite](https://github.com/nchain-innovation/mapi-lite) instead of the blockchain interface. Configure a `[mapi_lite]` section and transactions go to mapi-lite while chain reads stay where they were; leave it out and nothing changes. When configured, mapi-lite is part of `GET /health`. See [Configuration](docs/Configuration.md#mapi_lite). Building with this integration needs SSH access to the private mapi-lite repository — see [Dependencies](docs/Dependencies.md).
 * FS maintains an in-memory UTXO cache per client, refreshed periodically from the blockchain and before funding and balance requests. Clients added at runtime are persisted to a dynamic config file.
 * FS is configurable; it reads its configuration on startup.
 
@@ -49,7 +50,7 @@ The Financing Service Client use cases are:
 
 The Financing Service Admin use cases are:
 * `Get Status` - the FS will return the current status of the component.
-* `Health Check` - the FS exposes a liveness endpoint for container deployments.
+* `Health Check` - the FS exposes a liveness endpoint for container deployments (which also reports mapi-lite reachability when mapi-lite is configured).
 * `Add Client` - Dynamically add the client while the service is running.
 * `Delete Client` - Dynamically delete the client while the service is running.
 * `Top-up Balance` - The Admin will provide a funding transaction to increase the satoshi that the FS can use for funding. This is done outside the Financing Service.

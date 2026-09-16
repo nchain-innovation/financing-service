@@ -1,0 +1,10 @@
+# Delegate git fetching to the system `git` executable instead of Cargo's
+# built-in library. This crate depends on the PRIVATE mapi-lite repo (for the
+# uls-client and uls-core crates) over SSH (ssh://git@github.com/...), so
+# letting `git` handle the fetch means it uses your SSH agent/key and
+# ~/.ssh/config exactly as a normal `git` command would. chain-gang, by
+# contrast, comes from crates.io and needs no credentials.
+#
+# Ref: https://doc.rust-lang.org/cargo/reference/config.html#netgit-fetch-with-cli
+[net]
+git-fetch-with-cli = true

@@ -35,6 +35,8 @@ The interface you choose constrains which networks you can reach, and this is us
 
 **`rpc` is the only interface that reaches regtest**, because no public explorer indexes a private chain. It also works against a node you control on any other network, which removes the dependency on a third-party API being up.
 
+The interface serves both chain *reads* (balances, UTXOs) and, by default, the *broadcast* of funding transactions. The broadcast alone can be moved to a mapi-lite server with the optional [`[mapi_lite]`](#mapi_lite) section; reads stay here.
+
 ### The `rpc` interface
 
 ```toml
@@ -193,6 +195,37 @@ max_entries = 10000
 
 Records are held **in memory only** and are lost when the service restarts, so a retry that spans a restart can still produce a second funding transaction.
 
+## [mapi_lite]
+
+Optional. When this section is present, funding transactions are **broadcast through a [mapi-lite](https://github.com/nchain-innovation/mapi-lite) server** instead of through the `[blockchain_interface]`. Chain reads — balances and UTXO refreshes — are unaffected and keep using `[blockchain_interface]`. Leave the section out and the service behaves exactly as before: transactions are broadcast via WhatsOnChain (or whichever interface is configured).
+
+```toml
+[mapi_lite]
+base_url = "http://127.0.0.1:8080"
+auth_token = "env:FS_MAPI_LITE_AUTH_TOKEN"
+# timeout_seconds = 30
+# health_timeout_seconds = 2
+# max_retries = 2
+```
+
+* `base_url` — **required.** Base URL of the mapi-lite server, `http://` or `https://`. A trailing `/` is tolerated.
+* `auth_token` — optional. Sent **verbatim** as the `Authorization` header on every request, so include the scheme the server expects, e.g. `"Bearer <secret>"`. Takes an `env:VAR_NAME` reference and is overridden by `FS_MAPI_LITE_AUTH_TOKEN`. A plaintext value is reported at startup like any other plaintext secret. Never logged.
+* `timeout_seconds` — per-request timeout for a transaction submit. Default `30`.
+* `health_timeout_seconds` — timeout for the mapi-lite probe behind `GET /health`. Default `2`; keep it under the Docker health check's three seconds.
+* `max_retries` — how many times a submit is retried after a transient failure (an HTTP 5xx or a transport error) before `POST /fund` reports `broadcast_failed`. Default `2`. Resubmitting is safe: mapi-lite answers an already-known transaction with success.
+
+When the section is present the service:
+
+* Logs at startup: `mapi-lite integration configured (base_url=...): funding transactions will be broadcast via mapi-lite`. Without the section the line reads `mapi-lite not configured: funding transactions will be broadcast via the 'woc' blockchain interface` (naming whichever `interface_type` is configured).
+* Probes mapi-lite at startup (`GET /mapi/feeQuote`) and refuses to start if it is unreachable, the same way it refuses to start when the blockchain interface is unreachable.
+* Probes mapi-lite on every `GET /health` and returns HTTP 503 when the probe fails. See [Health check](SupportedEndpoints.md#health-check).
+* Reports `"broadcaster": "mapi-lite"` in `GET /status`.
+* Submits each funding transaction as a one-element batch to `POST /mapi/txs`, with the merkle proof declined (no callbacks are wanted). A rejection by mapi-lite or the node surfaces to the caller as `broadcast_failed` (HTTP 502), with the reason in the service log.
+
+The mapi-lite server must be pointed at the same network as `network_type`, since the funding transactions are signed for that network. Because mapi-lite talks to a node directly, this is also a way to broadcast on regtest while still reading chain state through another interface.
+
+Building the service with this integration requires read access to the private `mapi-lite` repository — see [Dependencies.md](Dependencies.md).
+
 ## [dynamic_config]
 
 Path to the file used to persist clients added at runtime via `POST /client`. Dynamically added clients may include an `api_key` field in the same format as static `[[client]]` entries.
@@ -248,11 +281,13 @@ These variables take precedence over config file values:
 | `FS_ADMIN_API_KEY` | `web_interface.admin_api_key` |
 | `FS_CLIENT_{CLIENT_ID}_WIF` | `wif_key` for that client (`CLIENT_ID` is uppercased; non-alphanumeric characters become `_`) |
 | `FS_CLIENT_{CLIENT_ID}_API_KEY` | `api_key` for that client |
+| `FS_RPC_USER` / `FS_RPC_PASSWORD` | `blockchain_interface.rpc_user` / `rpc_password` |
+| `FS_MAPI_LITE_AUTH_TOKEN` | `mapi_lite.auth_token` (include the scheme, e.g. `Bearer <secret>`) |
 
 Example: for `client_id = "id1"`, set `FS_CLIENT_ID1_WIF`.
 
 ### Plaintext warnings
 
-When WIF keys, client `api_key`, or `admin_api_key` are stored as literal values in config files, the service logs a warning at startup. Literal values still work for local development.
+When WIF keys, client `api_key`, `admin_api_key`, `rpc_password`, or `mapi_lite.auth_token` are stored as literal values in config files, the service logs a warning at startup. Literal values still work for local development.
 
 Dynamic clients added via `POST /client` can use `wif_env` and `api_key_env` instead of `wif` and `api_key`; the service stores `env:VAR` references in the dynamic config file rather than the secret values.
