@@ -15,7 +15,11 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v4
+    # v7 runs on Node 24. v4 ran on Node 20, which GitHub deprecated on its
+    # runners; the warning it emitted named no step, so: this was the one.
+    # taiki-e/install-action below is a composite (shell) action and has no
+    # Node runtime to deprecate.
+    - uses: actions/checkout@v7
     - name: Check formatting
       run: cargo fmt --all -- --check
     - name: Clippy
