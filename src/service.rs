@@ -864,10 +864,15 @@ impl Service {
             tx_as_hexstr(&tx).map_err(CodedError::internal)?
         );
         // The client sees a fixed message whatever the upstream said; the
-        // detail goes to the log, where an operator can act on it. The code
-        // does carry one distinction, because the caller's next move depends
-        // on it: a broadcast that failed spent nothing, a broadcast whose
-        // outcome is unknown may have spent everything.
+        // detail, including the upstream's own reason and its view of whether
+        // a resubmission could work, goes to the log through `BroadcastError`'s
+        // Display.
+        //
+        // The code carries the distinctions the caller's next move depends on,
+        // and the three are genuinely different moves: a broadcast that failed
+        // spent nothing and may work on retry; one that was refused outright
+        // spent nothing and will never work on retry; one whose outcome is
+        // unknown may have spent everything.
         broadcaster.broadcast_tx(&tx).await.map_err(|e| {
             log::warn!(
                 "Failed to broadcast funding transaction via {}: {e}",
@@ -880,6 +885,17 @@ impl Service {
                      the network. Do not retry with a new idempotency_key, which would risk \
                      funding twice.",
                 ),
+                // The upstream looked at this transaction and will not take
+                // it however many times it is offered.
+                BroadcastError::Rejected {
+                    retryable: false, ..
+                } => CodedError::new(
+                    ErrorCode::BroadcastRejected,
+                    "The upstream refused the funding transaction and will not accept it on \
+                     retry. See the service log for its reason.",
+                ),
+                // Unreachable, or refused in a way the upstream itself called
+                // worth retrying. Either way nothing was spent.
                 _ => CodedError::new(
                     ErrorCode::BroadcastFailed,
                     "Failed to broadcast funding transaction.",

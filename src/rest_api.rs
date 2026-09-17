@@ -428,12 +428,18 @@ fn replay(outcome: Outcome) -> HttpResponse {
 ///
 /// This is deliberately conservative. `insufficient_balance` and
 /// `no_suitable_utxo` are decided before a transaction is built, so releasing
-/// is safe. Every other failure is ambiguous from here -- a broadcast may have
-/// reached the node before the connection dropped, and a commit failure means
-/// the transaction is definitely on chain -- so the reservation is left to
-/// expire rather than risk funding twice. The cost is that the same
-/// `idempotency_key` cannot be retried until the TTL elapses; the alternative
-/// risks the duplicate this whole mechanism exists to prevent.
+/// is safe. `broadcast_rejected` is safe for a different reason: the upstream
+/// answered and refused the transaction, which is as definite as "nothing was
+/// spent" gets -- and since that rejection will not change on a resubmission,
+/// holding the key would only stop the client using it for the corrected
+/// request.
+///
+/// Everything else is left to expire. `broadcast_failed` covers an unreachable
+/// upstream as well as a retryable refusal; `broadcast_outcome_unknown` is
+/// unknown by definition; and a commit failure means the transaction is
+/// definitely on chain. The cost is that the same `idempotency_key` cannot be
+/// retried until the TTL elapses; the alternative risks the duplicate this
+/// whole mechanism exists to prevent.
 async fn release_if_nothing_was_spent(
     service: &Arc<Service>,
     record: &Option<(RecordKey, String)>,
@@ -441,7 +447,7 @@ async fn release_if_nothing_was_spent(
 ) {
     let certainly_pre_broadcast = matches!(
         code,
-        ErrorCode::InsufficientBalance | ErrorCode::NoSuitableUtxo
+        ErrorCode::InsufficientBalance | ErrorCode::NoSuitableUtxo | ErrorCode::BroadcastRejected
     );
     if certainly_pre_broadcast {
         if let Some((key, _)) = record {
@@ -788,9 +794,29 @@ mod tests {
         impl ActixService<Request, Response = ServiceResponse, Error = Error>,
         Arc<Service>,
     ) {
+        build_app_broadcasting_through(crate::test_support::UncertainBroadcaster::new()).await
+    }
+
+    /// An app whose upstream refuses every transaction, saying whether a
+    /// resubmission could succeed.
+    async fn build_app_with_rejecting_broadcaster(
+        retryable: bool,
+    ) -> (
+        impl ActixService<Request, Response = ServiceResponse, Error = Error>,
+        Arc<Service>,
+    ) {
+        build_app_broadcasting_through(crate::test_support::RejectingBroadcaster::new(retryable))
+            .await
+    }
+
+    async fn build_app_broadcasting_through(
+        broadcaster: Arc<dyn crate::broadcaster::TxBroadcaster>,
+    ) -> (
+        impl ActixService<Request, Response = ServiceResponse, Error = Error>,
+        Arc<Service>,
+    ) {
         let config = test_config(&unique_dynamic_config_path());
         let blockchain = test_blockchain_interface(&config).await;
-        let broadcaster = crate::test_support::UncertainBroadcaster::new();
         let service = Arc::new(
             Service::new_for_test_with_broadcaster(&config, blockchain, broadcaster).await,
         );
@@ -2122,5 +2148,106 @@ mod tests {
         assert_eq!(retry.status(), StatusCode::CONFLICT);
         let retry_body: Value = test::read_body_json(retry).await;
         assert_eq!(retry_body["code"], "key_in_progress");
+    }
+
+    // ---- Definitive rejection gets its own code (issue #69) ----
+
+    /// A transaction the upstream will never accept must not be reported with
+    /// a code documented as "retry may succeed". The caller is told to stop,
+    /// and the status says so too: 409, not 502, because nothing upstream
+    /// failed -- the state the transaction was built against has to change.
+    #[actix_web::test]
+    async fn sr_fund_014_a_permanent_rejection_is_not_reported_as_retryable() {
+        let (app, _service) = build_app_with_rejecting_broadcaster(false).await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/fund")
+                .set_json(fund_body(TEST_CLIENT_ID, 123, 1, LOCKING_SCRIPT_HEX))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["code"], "broadcast_rejected");
+        let description = body["description"].as_str().expect("a description");
+        assert!(
+            description.contains("will not accept it on retry"),
+            "{description}"
+        );
+    }
+
+    /// The other half of the upstream's answer. When it says a resubmission
+    /// could work, the existing code and its documented advice are right, and
+    /// the caller should get them unchanged.
+    #[actix_web::test]
+    async fn sr_fund_014_a_retryable_rejection_stays_broadcast_failed() {
+        let (app, _service) = build_app_with_rejecting_broadcaster(true).await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/fund")
+                .set_json(fund_body(TEST_CLIENT_ID, 123, 1, LOCKING_SCRIPT_HEX))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["code"], "broadcast_failed");
+    }
+
+    /// A refusal is the upstream having looked at the transaction and said no,
+    /// so nothing was spent and the `idempotency_key` is free again. Holding
+    /// it would only stop the client using it for the corrected request.
+    #[actix_web::test]
+    async fn sr_fund_014_a_permanent_rejection_releases_the_idempotency_key() {
+        let (app, _service) = build_app_with_rejecting_broadcaster(false).await;
+        let mut body = fund_body(TEST_CLIENT_ID, 123, 1, LOCKING_SCRIPT_HEX);
+        body["idempotency_key"] = json!("rejected-1");
+
+        for _ in 0..2 {
+            let resp = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri("/fund")
+                    .set_json(body.clone())
+                    .to_request(),
+            )
+            .await;
+            // the same answer both times: released, so never key_in_progress
+            assert_eq!(resp.status(), StatusCode::CONFLICT);
+            let json: Value = test::read_body_json(resp).await;
+            assert_eq!(json["code"], "broadcast_rejected");
+        }
+    }
+
+    /// The reservation is not released for an outcome that might have spent
+    /// something -- the distinction this code exists to draw.
+    #[actix_web::test]
+    async fn sr_fund_014_an_unknown_outcome_still_holds_the_idempotency_key() {
+        let (app, _service) = build_app_with_uncertain_broadcaster().await;
+        let mut body = fund_body(TEST_CLIENT_ID, 123, 1, LOCKING_SCRIPT_HEX);
+        body["idempotency_key"] = json!("unknown-1");
+
+        let first = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/fund")
+                .set_json(body.clone())
+                .to_request(),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::GATEWAY_TIMEOUT);
+
+        let retry = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/fund")
+                .set_json(body)
+                .to_request(),
+        )
+        .await;
+        let json: Value = test::read_body_json(retry).await;
+        assert_eq!(json["code"], "key_in_progress");
     }
 }
