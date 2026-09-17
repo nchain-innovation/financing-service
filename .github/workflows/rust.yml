@@ -1,10 +1,22 @@
 name: Rust
 
+# Every push, on every branch, plus every pull request whatever it targets.
+#
+# The branch filters used to be `main` on both, which meant a stacked pull
+# request -- one based on another review branch rather than on main -- was
+# never built at all. Work could sit for days with no check against it and
+# nothing saying so.
 on:
   push:
-    branches: [ "main" ]
   pull_request:
-    branches: [ "main" ]
+
+# A branch only needs its newest commit built. Superseded runs are cancelled,
+# except on main, where every commit keeps its own result: a cancelled run
+# reports as cancelled rather than green, and main's history should not have
+# holes in it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   CARGO_TERM_COLOR: always
