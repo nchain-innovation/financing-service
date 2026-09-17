@@ -209,8 +209,16 @@ pub struct MapiLiteConfig {
     pub total_timeout_seconds: u64,
 }
 
+/// One attempt's ceiling.
+///
+/// Chosen with `max_retries` and `total_timeout_seconds` so all three attempts
+/// actually fit: 3 x 13s of attempts plus 3s of back-off is 42s, inside the
+/// 45s deadline. It was 30s, which made the deadline cut the sequence off
+/// after one attempt and part of a second, so the stated retry count was not
+/// what ran. The worst case a `/fund` caller waits is unchanged at 45s; what
+/// changed is that the retries inside it are real.
 fn default_mapi_lite_timeout_seconds() -> u64 {
-    30
+    13
 }
 
 fn default_mapi_lite_health_timeout_seconds() -> u64 {
@@ -224,6 +232,11 @@ fn default_mapi_lite_max_retries() -> u32 {
 fn default_mapi_lite_total_timeout_seconds() -> u64 {
     45
 }
+
+/// Back-off between submit attempts, mirrored from `broadcaster::mapi` so the
+/// budget arithmetic below describes what the broadcaster actually does.
+const RETRY_BACKOFF_BASE_SECONDS: u64 = 1;
+const RETRY_BACKOFF_CAP_SECONDS: u64 = 5;
 
 /// `/ready` answers orchestrator readiness probes, which allow a probe a few
 /// seconds at most (Docker's health check defaults to `--timeout=3s`). A
@@ -265,6 +278,54 @@ impl MapiLiteConfig {
 
     pub fn total_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.total_timeout_seconds)
+    }
+
+    /// How many submit attempts can actually start before the deadline cuts
+    /// the sequence off.
+    ///
+    /// The three fields interact and nothing makes that obvious: an operator
+    /// who raises `max_retries` for resilience may get no extra attempts at
+    /// all. This walks the sequence the broadcaster runs -- attempt, back-off,
+    /// attempt -- against `total_timeout_seconds` and reports what will
+    /// really happen, assuming the worst case where every attempt runs to its
+    /// full timeout.
+    pub fn attempts_within_deadline(&self) -> u32 {
+        let mut elapsed = 0u64;
+        let mut started = 0u32;
+        for attempt in 1..=(self.max_retries + 1) {
+            if elapsed >= self.total_timeout_seconds {
+                break;
+            }
+            started = attempt;
+            elapsed += self
+                .timeout_seconds
+                .min(self.total_timeout_seconds - elapsed);
+            let backoff =
+                (RETRY_BACKOFF_BASE_SECONDS * attempt as u64).min(RETRY_BACKOFF_CAP_SECONDS);
+            elapsed += backoff;
+        }
+        started
+    }
+
+    /// A warning for a section whose retry budget cannot fit its deadline, or
+    /// `None` when the three fields agree.
+    ///
+    /// Warn rather than reject: the combination still works, it just does
+    /// fewer attempts than it says, and refusing to start would break
+    /// deployments that have been running on it.
+    pub fn retry_budget_warning(&self) -> Option<String> {
+        let configured = self.max_retries + 1;
+        let actual = self.attempts_within_deadline();
+        if actual >= configured {
+            return None;
+        }
+        Some(format!(
+            "mapi_lite: max_retries = {} asks for {configured} submit attempts, but only {actual} \
+             can start within total_timeout_seconds = {}s at timeout_seconds = {}s (plus \
+             back-off). Raise total_timeout_seconds or lower timeout_seconds/max_retries so the \
+             three agree.",
+            self.max_retries, self.total_timeout_seconds, self.timeout_seconds
+        ))
     }
 
     /// Reject a section the broadcaster cannot work with, at startup rather
@@ -1038,11 +1099,59 @@ filename = "./data/dynamic.toml"
         let mapi_lite = config.mapi_lite.expect("section present");
         assert_eq!(mapi_lite.base_url, "http://127.0.0.1:8080");
         assert_eq!(mapi_lite.auth_token, None);
-        assert_eq!(mapi_lite.timeout_seconds, 30);
+        assert_eq!(mapi_lite.timeout_seconds, 13);
         assert_eq!(mapi_lite.health_timeout_seconds, 2);
         assert_eq!(mapi_lite.max_retries, 2);
         assert_eq!(mapi_lite.total_timeout_seconds, 45);
         assert!(mapi_lite.validate().is_ok());
+    }
+
+    /// The defaults have to be a set that can all happen at once, or
+    /// `max_retries` is describing attempts that never run.
+    #[test]
+    fn sr_cfg_009_the_default_retry_budget_fits_the_default_deadline() {
+        let config = MapiLiteConfig::for_base_url("http://127.0.0.1:8080");
+        assert_eq!(
+            config.attempts_within_deadline(),
+            config.max_retries + 1,
+            "all {} attempts should fit in {}s",
+            config.max_retries + 1,
+            config.total_timeout_seconds
+        );
+        assert_eq!(config.retry_budget_warning(), None);
+    }
+
+    /// The combination the issue describes: three attempts asked for, one and
+    /// a bit delivered. It is legal, so it still starts -- but it says so.
+    #[test]
+    fn sr_cfg_009_a_budget_that_cannot_fit_is_warned_about() {
+        let mut config = MapiLiteConfig::for_base_url("http://127.0.0.1:8080");
+        config.timeout_seconds = 30;
+        config.max_retries = 2;
+        config.total_timeout_seconds = 45;
+
+        assert_eq!(config.attempts_within_deadline(), 2);
+        let warning = config
+            .retry_budget_warning()
+            .expect("an unfittable budget is warned about");
+        assert!(warning.contains("3 submit attempts"), "{warning}");
+        assert!(warning.contains("only 2"), "{warning}");
+        // still a legal section: warn, do not refuse to start
+        assert!(config.validate().is_ok());
+    }
+
+    /// Raising `max_retries` alone is the trap the issue names: without more
+    /// deadline it buys nothing, and the operator is told so.
+    #[test]
+    fn sr_cfg_009_raising_max_retries_alone_is_warned_about() {
+        let mut config = MapiLiteConfig::for_base_url("http://127.0.0.1:8080");
+        config.max_retries = 10;
+        let attempts = config.attempts_within_deadline();
+        assert!(
+            attempts < 11,
+            "11 attempts cannot fit 45s at 13s each, got {attempts}"
+        );
+        assert!(config.retry_budget_warning().is_some());
     }
 
     /// Whatever `validate` checked has to be what the client requests, so the

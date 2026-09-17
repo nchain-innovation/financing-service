@@ -51,6 +51,6 @@ filename = "./data/dynamic.toml"
 # [mapi_lite]
 # base_url = "http://127.0.0.1:8080"
 # auth_token = "env:FS_MAPI_LITE_AUTH_TOKEN"   # sent verbatim: include the scheme, e.g. "Bearer <secret>"
-# timeout_seconds = 30
+# timeout_seconds = 13
 # health_timeout_seconds = 2
 # max_retries = 2

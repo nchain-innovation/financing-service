@@ -8,17 +8,27 @@
 //! token and the response-verification path both work, which is exactly what
 //! a submit needs.
 //!
-//! Two clients share one base URL and token: the submit client carries the
-//! configured request timeout and retry budget, the probe client a short
-//! timeout and no retries, because `GET /ready` has to answer inside a
-//! readiness probe's few seconds however slow mapi-lite is being.
+//! Two clients share one base URL and token: the submit client and the probe
+//! client, the latter with a short timeout and no retries, because `GET
+//! /ready` has to answer inside a readiness probe's few seconds however slow
+//! mapi-lite is being.
 //!
-//! A per-request timeout bounds one attempt but not the retry sequence, so a
-//! submit also carries a total deadline (`mapi_lite.total_timeout_seconds`).
-//! A funding call is interactive: a wedged mapi-lite must not hold the caller,
-//! and the actix worker serving it, for `timeout * (max_retries + 1)`.
+//! **Retries are this module's, not uls-client's.** uls-client will retry a
+//! submit for us, but it reports the whole sequence as one `RetriesExhausted`
+//! whose cause is a string, and a refused connection and an expired timeout
+//! render identically there. The service needs that distinction: a refused
+//! connection delivered nothing, while an attempt cancelled in flight may
+//! have delivered everything, and only the second calls for the funding
+//! inputs to be reserved (see `BroadcastError::Indeterminate` and
+//! `Client::commit_uncertain_funding_spend`). Running the loop here keeps
+//! every attempt's outcome structural.
+//!
+//! Each attempt is bounded by `mapi_lite.timeout_seconds` and the whole
+//! sequence by `mapi_lite.total_timeout_seconds`. A funding call is
+//! interactive: a wedged mapi-lite must not hold the caller, and the actix
+//! worker serving it, for `timeout * (max_retries + 1)`.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use chain_gang::messages::Tx;
@@ -36,19 +46,36 @@ const RETRY_BACKOFF_CAP: Duration = Duration::from_secs(5);
 
 /// Hands transactions to a mapi-lite server.
 pub struct MapiBroadcaster {
+    /// Built with uls-client's own retries left off: the loop in
+    /// [`MapiBroadcaster::broadcast_tx`] owns them.
     submit: MapiClient,
     probe: MapiClient,
-    /// Ceiling on a whole submit, retries and back-off included. The
-    /// per-request timeout bounds one attempt; this bounds the sequence, so a
-    /// `/fund` caller cannot be held for `timeout * (max_retries + 1)`.
+    /// Ceiling on one attempt.
+    attempt_timeout: Duration,
+    /// Attempts after the first.
+    max_retries: u32,
+    /// Ceiling on a whole submit, retries and back-off included, so a `/fund`
+    /// caller cannot be held for `timeout * (max_retries + 1)`.
     submit_deadline: Duration,
 }
 
 impl MapiBroadcaster {
     /// Build a broadcaster for the server named by `config`.
     pub fn new(config: &MapiLiteConfig) -> Result<Self, String> {
-        let submit = Self::client(config, config.timeout())?.retry(
-            config.max_retries,
+        if let Some(warning) = config.retry_budget_warning() {
+            log::warn!("{warning}");
+        }
+        // uls-client retries five times by default with a 60s back-off cap,
+        // so the retries have to be turned *off* explicitly -- left alone they
+        // would nest inside every attempt this module makes and blow through
+        // both bounds. Zero means one HTTP request per call, which is what the
+        // loop below is counting.
+        //
+        // The reqwest timeout is only a backstop against a connection the
+        // per-attempt bound somehow outlives; that bound is never larger than
+        // the deadline, so it always fires first.
+        let submit = Self::client(config, config.total_timeout() + Duration::from_secs(5))?.retry(
+            0,
             RETRY_BACKOFF_BASE,
             RETRY_BACKOFF_CAP,
         );
@@ -57,8 +84,120 @@ impl MapiBroadcaster {
         Ok(Self {
             submit,
             probe,
+            attempt_timeout: config.timeout(),
+            max_retries: config.max_retries,
             submit_deadline: config.total_timeout(),
         })
+    }
+
+    /// Wait before attempt `attempt + 1`, matching uls-client's linear
+    /// back-off so moving the loop here does not change the pacing.
+    fn backoff(attempt: u32) -> Duration {
+        RETRY_BACKOFF_BASE
+            .saturating_mul(attempt)
+            .min(RETRY_BACKOFF_CAP)
+    }
+
+    /// Turn a submit response into a txid or an error.
+    ///
+    /// Everything here is the server's answer about our transaction, so none
+    /// of it is retried: it is settled, however unwelcome.
+    fn read_result(
+        payload: uls_client::TxsPayload,
+        expected: &str,
+    ) -> Result<String, BroadcastError> {
+        // One in, one out. Anything else means the server and this client
+        // disagree about the batch contract, and guessing which result is ours
+        // would be worse than refusing.
+        let [result] = payload.txs.as_slice() else {
+            // The server answered, so it took the transaction, but the answer
+            // is not one this client can read. What it did with the
+            // transaction is therefore unknown rather than known to have
+            // failed.
+            return Err(BroadcastError::Indeterminate(format!(
+                "submitted 1 transaction but mapi-lite returned {} results",
+                payload.txs.len()
+            )));
+        };
+
+        if result.return_result != RESULT_SUCCESS {
+            let conflicts: Vec<&str> = result
+                .conflicted_with
+                .iter()
+                .map(|conflict| conflict.txid.as_str())
+                .collect();
+            let description = if conflicts.is_empty() {
+                result.result_description.clone()
+            } else {
+                format!(
+                    "{} (conflicted with {})",
+                    result.result_description,
+                    conflicts.join(", ")
+                )
+            };
+            return Err(BroadcastError::Rejected {
+                description,
+                retryable: result.failure_retryable,
+            });
+        }
+
+        // "Already known" also comes back as success: a resubmitted funding
+        // transaction is the same transaction, so that is the right answer --
+        // and it is how a retry after an unknown outcome resolves into a
+        // known one.
+        //
+        // The txid must be the one we hashed. A different one means what
+        // reached the network is not the transaction this service built, and
+        // the caller would otherwise be handed outpoints -- derived from the
+        // local hash -- for a transaction that will never confirm, with its
+        // UTXOs already marked spent. Refused for the same reason the batch
+        // length is: a disagreement here is not ours to guess through.
+        //
+        // Unknown rather than failed, though: the server reported success, so
+        // something was accepted, and this service cannot tell whether the
+        // transaction it built was part of it.
+        if result.txid != expected {
+            return Err(BroadcastError::Indeterminate(format!(
+                "mapi-lite reported txid {} for a funding transaction hashing to {expected}",
+                result.txid
+            )));
+        }
+        Ok(result.txid.clone())
+    }
+
+    /// The error for a submit that ran out of deadline between attempts.
+    ///
+    /// Whether that is a failure or an unknown outcome turns on what the
+    /// attempts did, not on the clock: a mapi-lite that refuses connections
+    /// burns the deadline in back-off alone and delivered nothing, while one
+    /// that goes quiet burns it inside a request that may have been received.
+    fn out_of_time(&self, attempts: u32, may_have_landed: bool) -> BroadcastError {
+        let detail = format!(
+            "mapi-lite did not answer within {}s (mapi_lite.total_timeout_seconds) over {attempts} \
+             attempt(s)",
+            self.submit_deadline.as_secs()
+        );
+        if may_have_landed {
+            BroadcastError::Indeterminate(detail)
+        } else {
+            BroadcastError::Upstream(detail)
+        }
+    }
+
+    /// The error a finished submit reports, given what its attempts might have
+    /// delivered.
+    ///
+    /// A plain upstream failure on the last attempt does not make the call a
+    /// plain failure: if an earlier attempt was cancelled in flight, the
+    /// transaction may be on the network and the inputs must still be
+    /// reserved.
+    fn settle(&self, last: BroadcastError, may_have_landed: bool) -> BroadcastError {
+        match last {
+            BroadcastError::Upstream(detail) if may_have_landed => BroadcastError::Indeterminate(
+                format!("{detail}; an earlier attempt may have been delivered"),
+            ),
+            other => other,
+        }
     }
 
     /// A `MapiClient` for `config` whose every request times out after
@@ -135,107 +274,69 @@ impl TxBroadcaster for MapiBroadcaster {
             merkle_proof: Some(false),
             merkle_format: None,
         };
-
-        // The retry budget multiplies the per-request timeout, so the whole
-        // sequence gets a ceiling of its own: against a mapi-lite that accepts
-        // connections and never answers, the caller and the worker serving it
-        // are freed at the deadline rather than at attempts * timeout.
-        //
-        // The deadline also does the classifying, because uls-client renders
-        // the last attempt's cause to a string and a refused connection and an
-        // expired timeout render identically (see `From<ClientError>`). What
-        // separates them is how long they take:
-        //
-        // * a mapi-lite that accepts the request and goes quiet spends
-        //   `timeout_seconds` per attempt, so the deadline fires while a
-        //   request is in flight -- correctly unknown;
-        // * a mapi-lite that is down refuses connections in milliseconds, so
-        //   only the back-off between attempts takes any time and the budget
-        //   exhausts first -- correctly a plain failure.
-        //
-        // That holds while `timeout_seconds * (max_retries + 1)` exceeds
-        // `total_timeout_seconds` and the back-off total does not. At the
-        // defaults both hold comfortably: 3 x 30s of attempts against a 45s
-        // deadline, and 3s of back-off inside it. Squeeze the deadline down
-        // towards the back-off and a down mapi-lite starts being reported as
-        // an unknown outcome, reserving inputs nothing ever spent.
-        let payload = match tokio::time::timeout(
-            self.submit_deadline,
-            self.submit.submit_transactions(&[request]),
-        )
-        .await
-        {
-            Ok(result) => result?,
-            Err(_) => {
-                // Cancelling the request says nothing about what the server
-                // did with it: a mapi-lite that is slow rather than broken may
-                // have relayed the transaction already and be about to answer.
-                // So this is an unknown outcome, not a failure, and the
-                // service treats the inputs as spent (see
-                // `Service::execute_funding`).
-                return Err(BroadcastError::Indeterminate(format!(
-                    "mapi-lite did not answer within {}s (mapi_lite.total_timeout_seconds)",
-                    self.submit_deadline.as_secs()
-                )));
-            }
-        };
-
-        // One in, one out. Anything else means the server and this client
-        // disagree about the batch contract, and guessing which result is
-        // ours would be worse than refusing.
-        let [result] = payload.txs.as_slice() else {
-            // The server answered, so it took the transaction, but the answer
-            // is not one this client can read. What it did with the
-            // transaction is therefore unknown rather than known to have
-            // failed.
-            return Err(BroadcastError::Indeterminate(format!(
-                "submitted 1 transaction but mapi-lite returned {} results",
-                payload.txs.len()
-            )));
-        };
-
-        if result.return_result != RESULT_SUCCESS {
-            let conflicts: Vec<&str> = result
-                .conflicted_with
-                .iter()
-                .map(|conflict| conflict.txid.as_str())
-                .collect();
-            let description = if conflicts.is_empty() {
-                result.result_description.clone()
-            } else {
-                format!(
-                    "{} (conflicted with {})",
-                    result.result_description,
-                    conflicts.join(", ")
-                )
-            };
-            return Err(BroadcastError::Rejected {
-                description,
-                retryable: result.failure_retryable,
-            });
-        }
-
-        // "Already known" also comes back as success: a resubmitted funding
-        // transaction is the same transaction, so that is the right answer.
-        //
-        // The txid must be the one we hashed. A different one means what
-        // reached the network is not the transaction this service built, and
-        // the caller would otherwise be handed outpoints -- derived from the
-        // local hash -- for a transaction that will never confirm, with its
-        // UTXOs already marked spent. Refused for the same reason the batch
-        // length is: a disagreement here is not ours to guess through.
-        //
-        // Unknown rather than failed, though: the server reported success, so
-        // something was accepted, and this service cannot tell whether the
-        // transaction it built was part of it.
         let expected = tx.hash().encode();
-        if result.txid != expected {
-            return Err(BroadcastError::Indeterminate(format!(
-                "mapi-lite reported txid {} for a funding transaction hashing to {expected}",
-                result.txid
-            )));
+
+        let started = Instant::now();
+        let mut attempt: u32 = 0;
+        // Set the moment an attempt might have reached the server: a request
+        // cancelled in flight, or an answer this client could not read. It is
+        // never cleared, because a later refused connection cannot un-deliver
+        // an earlier request. Only a definite answer about the transaction --
+        // accepted, or rejected -- settles it.
+        let mut may_have_landed = false;
+
+        loop {
+            attempt += 1;
+            let remaining = self.submit_deadline.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Err(self.out_of_time(attempt - 1, may_have_landed));
+            }
+            // Whichever runs out first. An attempt is never allowed to outlive
+            // the deadline it sits inside.
+            let bound = self.attempt_timeout.min(remaining);
+
+            let error = match tokio::time::timeout(
+                bound,
+                self.submit
+                    .submit_transactions(std::slice::from_ref(&request)),
+            )
+            .await
+            {
+                Ok(Ok(payload)) => return Self::read_result(payload, &expected),
+                Ok(Err(client_error)) => BroadcastError::from(client_error),
+                Err(_) => {
+                    // Cancelling the request says nothing about what the
+                    // server did with it: a mapi-lite that is slow rather than
+                    // broken may have relayed the transaction already and be
+                    // about to answer.
+                    BroadcastError::Indeterminate(format!(
+                        "mapi-lite did not answer attempt {attempt} within {}s \
+                         (mapi_lite.timeout_seconds)",
+                        bound.as_secs()
+                    ))
+                }
+            };
+
+            if matches!(error, BroadcastError::Indeterminate(_)) {
+                may_have_landed = true;
+            }
+
+            if attempt > self.max_retries {
+                return Err(self.settle(error, may_have_landed));
+            }
+
+            // Retrying is safe, and after an unknown outcome it is actively
+            // useful: mapi-lite answers a transaction it already holds with
+            // success, so a retry can turn "we do not know" into "it is on the
+            // network" -- which is the difference between reserving the
+            // client's inputs and committing them.
+            let backoff = Self::backoff(attempt);
+            let remaining = self.submit_deadline.saturating_sub(started.elapsed());
+            if backoff >= remaining {
+                return Err(self.out_of_time(attempt, may_have_landed));
+            }
+            tokio::time::sleep(backoff).await;
         }
-        Ok(result.txid.clone())
     }
 
     async fn health_check(&self) -> Result<(), BroadcastError> {
@@ -678,5 +779,171 @@ mod tests {
     async fn mapi_broadcaster_is_named_mapi_lite() {
         let server = MockServer::start().await;
         assert_eq!(broadcaster(&server).name(), MAPI_LITE);
+    }
+
+    // ---- The retry budget actually running (issue #68) ----
+
+    /// `max_retries` has to mean attempts that happen. Before this, the total
+    /// deadline cut the default sequence off after one attempt and part of a
+    /// second, so the number in the config was not the number that ran.
+    ///
+    /// wiremock verifies the expectation on drop, so the count is the test.
+    #[tokio::test]
+    async fn sr_fund_013_every_configured_attempt_is_actually_made() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/mapi/txs"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(3) // one attempt plus max_retries = 2
+            .mount(&server)
+            .await;
+
+        let config = config(&server);
+        assert_eq!(config.max_retries, 2, "the default this test is about");
+        assert_eq!(
+            config.attempts_within_deadline(),
+            3,
+            "the defaults must allow all three"
+        );
+
+        let broadcaster = MapiBroadcaster::new(&config).expect("broadcaster builds");
+        broadcaster
+            .broadcast_tx(&sample_tx())
+            .await
+            .expect_err("every attempt is a 500");
+    }
+
+    /// The deadline is still the backstop. With attempts that cannot fit, the
+    /// sequence stops at the deadline rather than running to the budget.
+    #[tokio::test]
+    async fn sr_fund_013_the_deadline_still_cuts_a_budget_that_cannot_fit() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/mapi/txs"))
+            .respond_with(ResponseTemplate::new(500).set_delay(Duration::from_secs(30)))
+            .mount(&server)
+            .await;
+
+        let mut config = config(&server);
+        config.timeout_seconds = 2;
+        config.max_retries = 10;
+        config.total_timeout_seconds = 3;
+        let broadcaster = MapiBroadcaster::new(&config).expect("broadcaster builds");
+
+        let started = std::time::Instant::now();
+        let error = broadcaster
+            .broadcast_tx(&sample_tx())
+            .await
+            .expect_err("the deadline fires");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "eleven 2s attempts ran instead of stopping at the 3s deadline"
+        );
+        assert!(indeterminate_detail(error).contains("total_timeout_seconds"));
+    }
+
+    /// A retry after a timeout is how an unknown outcome becomes a known one:
+    /// mapi-lite answers a transaction it already holds with success, so the
+    /// second attempt settles what the first left open. Without the retry the
+    /// caller would be told the outcome is unknown and the client's inputs
+    /// would be reserved for nothing.
+    #[tokio::test]
+    async fn sr_fund_013_a_retry_resolves_an_attempt_that_timed_out() {
+        let server = MockServer::start().await;
+        let tx = sample_tx();
+        // first attempt: accepted but far too slow to answer
+        Mock::given(method("POST"))
+            .and(path("/mapi/txs"))
+            .respond_with(
+                ok(txs_payload(success(&tx.hash().encode(), "")))
+                    .set_delay(Duration::from_secs(30)),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        // second attempt: "already known", which mapi-lite reports as success
+        Mock::given(method("POST"))
+            .and(path("/mapi/txs"))
+            .respond_with(ok(txs_payload(success(
+                &tx.hash().encode(),
+                "Transaction already known",
+            ))))
+            .mount(&server)
+            .await;
+
+        let mut config = config(&server);
+        config.timeout_seconds = 1;
+        config.max_retries = 2;
+        config.total_timeout_seconds = 10;
+        let broadcaster = MapiBroadcaster::new(&config).expect("broadcaster builds");
+
+        let txid = broadcaster
+            .broadcast_tx(&tx)
+            .await
+            .expect("the retry settles it");
+        assert_eq!(txid, tx.hash().encode());
+    }
+
+    /// Once an attempt may have been delivered, a later transport failure
+    /// cannot take that back. The call has to stay an unknown outcome, or the
+    /// service would leave inputs spendable that may already be spent.
+    #[tokio::test]
+    async fn sr_fund_013_a_timeout_then_a_failure_is_still_an_unknown_outcome() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/mapi/txs"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(30)))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        // Everything after the first attempt is an undecodable answer, which
+        // on its own would be one thing; what matters is that the first
+        // attempt already put the transaction in doubt.
+        Mock::given(method("POST"))
+            .and(path("/mapi/txs"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let mut config = config(&server);
+        config.timeout_seconds = 1;
+        config.max_retries = 1;
+        config.total_timeout_seconds = 5;
+        let broadcaster = MapiBroadcaster::new(&config).expect("broadcaster builds");
+
+        let error = broadcaster
+            .broadcast_tx(&sample_tx())
+            .await
+            .expect_err("nothing succeeded");
+        let detail = indeterminate_detail(error);
+        assert!(
+            detail.contains("earlier attempt may have been delivered"),
+            "{detail}"
+        );
+    }
+
+    /// The counter-case, and the one that caught me out while fixing #66: a
+    /// mapi-lite that refuses connections fails fast, so the deadline can be
+    /// consumed by back-off alone. That is still a plain failure -- nothing
+    /// was ever delivered -- and reporting it as unknown would reserve inputs
+    /// that were never spent.
+    #[tokio::test]
+    async fn sr_fund_013_backoff_exhausting_the_deadline_is_a_failure_not_unknown() {
+        // Nothing is listening, so every attempt is refused immediately and
+        // only the back-off takes any time.
+        let mut config = MapiLiteConfig::for_base_url("http://127.0.0.1:1");
+        config.timeout_seconds = 5;
+        config.max_retries = 5;
+        config.total_timeout_seconds = 5;
+        let broadcaster = MapiBroadcaster::new(&config).expect("broadcaster builds");
+
+        let error = broadcaster
+            .broadcast_tx(&sample_tx())
+            .await
+            .expect_err("nothing is listening");
+        assert!(
+            matches!(error, BroadcastError::Upstream(_)),
+            "a refused connection delivered nothing, got {error:?}"
+        );
     }
 }
