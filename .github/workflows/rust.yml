@@ -48,7 +48,9 @@ jobs:
     # as a developer's git does. The action also writes github.com into
     # known_hosts. chain-gang needs none of this: it comes from crates.io.
     - name: Load the mapi-lite deploy key into ssh-agent
-      uses: webfactory/ssh-agent@v0.9.0
+      # v0.10.0 is the release that moved to Node 24; v0.9.x ran on Node 20,
+      # which GitHub is deprecating on its runners.
+      uses: webfactory/ssh-agent@v0.10.0
       with:
         ssh-private-key: ${{ secrets.MAPI_LITE_DEPLOY_KEY }}
     - name: Check formatting
