@@ -36,7 +36,7 @@ note bottom of fs_toml
   [blockchain_interface].interface_type (woc, uaas, rpc or test)
   and serves chain reads. Funding transactions are broadcast
   through it too, unless a [mapi_lite] section is present, in
-  which case they go to mapi-lite and GET /health probes it.
+  which case they go to mapi-lite and GET /ready probes it.
 end note
 
 @enduml

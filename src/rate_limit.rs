@@ -16,8 +16,10 @@ use actix_web::{
 use crate::config::RateLimitConfig;
 use crate::responses::{ErrorCode, ErrorResponse};
 
-const HEALTH_PATH: &str = "/health";
-const HEALTH_WHITELIST_KEY: &str = "__health__";
+/// Probe endpoints, exempt from rate limiting so an orchestrator polling them
+/// on a short interval is never throttled out of its own health signal.
+const PROBE_PATHS: [&str; 2] = ["/health", "/ready"];
+const PROBE_WHITELIST_KEY: &str = "__probe__";
 
 #[derive(Clone, Default)]
 pub(crate) struct FinancingServiceKeyExtractor;
@@ -27,14 +29,14 @@ impl KeyExtractor for FinancingServiceKeyExtractor {
     type KeyExtractionError = SimpleKeyExtractionError<&'static str>;
 
     fn extract(&self, req: &ServiceRequest) -> Result<Self::Key, Self::KeyExtractionError> {
-        if req.path() == HEALTH_PATH {
-            return Ok(HEALTH_WHITELIST_KEY.to_string());
+        if PROBE_PATHS.contains(&req.path()) {
+            return Ok(PROBE_WHITELIST_KEY.to_string());
         }
         PeerIpKeyExtractor.extract(req).map(|ip| ip.to_string())
     }
 
     fn whitelisted_keys(&self) -> Vec<Self::Key> {
-        vec![HEALTH_WHITELIST_KEY.to_string()]
+        vec![PROBE_WHITELIST_KEY.to_string()]
     }
 
     fn exceed_rate_limit_response(

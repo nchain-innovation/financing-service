@@ -105,27 +105,47 @@ pub async fn index(_data: web::Data<AppState>) -> String {
     "Financing Service REST API".to_string()
 }
 
-/// Health check endpoint for container orchestration.
+/// Liveness: is this process up and serving?
 ///
-/// Without `[mapi_lite]` configured this is pure liveness: `{"status":"ok"}`
-/// whenever the process serves, independent of any blockchain connectivity.
-/// With mapi-lite configured it also probes mapi-lite, because a funding
-/// service whose only broadcast path is down is not healthy; the probe is
-/// bounded by `mapi_lite.health_timeout_seconds` so the Docker health check
-/// still gets its answer in time, and its verdict is cached for that long so
-/// this unauthenticated, rate-limit-exempt endpoint cannot be used to flood
-/// mapi-lite (see [`Service::mapi_lite_health`]).
+/// Always `{"status":"ok"}` whenever the process answers, independent of the
+/// blockchain interface and of mapi-lite. That is deliberate, and it is what
+/// makes this endpoint safe to wire to a liveness probe or the Docker
+/// HEALTHCHECK: restarting the process cannot fix an upstream that is down,
+/// and a restart loop would take `/status`, balances and addresses -- none of
+/// which need mapi-lite -- down with it.
+///
+/// For "should traffic be sent here", use [`ready`].
+#[get("/health")]
+pub async fn health() -> impl Responder {
+    json_ok(&HealthResponse::ok())
+}
+
+/// Readiness: can this service do its job right now?
+///
+/// Without `[mapi_lite]` this matches `/health` -- there is no upstream whose
+/// absence would stop funding. With mapi-lite configured it probes mapi-lite
+/// and answers HTTP 503 when the probe fails, because a funding service whose
+/// only broadcast path is unreachable should be taken out of rotation rather
+/// than handed requests it will refuse.
+///
+/// Point a readiness probe here and a liveness probe at [`health`]. Sending
+/// both at this endpoint reintroduces exactly the restart loop the split
+/// exists to avoid.
+///
+/// The probe is bounded by `mapi_lite.health_timeout_seconds` and its verdict
+/// cached for that long, so this unauthenticated, rate-limit-exempt endpoint
+/// cannot be used to flood mapi-lite (see [`Service::mapi_lite_health`]).
 ///
 /// The failure detail is logged, not returned: this endpoint answers anyone
 /// who can reach the port, and an upstream transport error carries the
 /// mapi-lite URL that a public 503 body has no business disclosing.
-#[get("/health")]
-pub async fn health(data: web::Data<AppState>) -> impl Responder {
+#[get("/ready")]
+pub async fn ready(data: web::Data<AppState>) -> impl Responder {
     match data.service.mapi_lite_health().await {
         None => json_ok(&HealthResponse::ok()),
         Some(Ok(())) => json_ok(&HealthResponse::mapi_lite_ok()),
         Some(Err(error)) => {
-            log::warn!("mapi-lite health probe failed: {error}");
+            log::warn!("mapi-lite readiness probe failed: {error}");
             HttpResponse::ServiceUnavailable().json(HealthResponse::mapi_lite_unhealthy(
                 "mapi-lite probe failed",
             ))
@@ -574,8 +594,8 @@ mod tests {
         config::{ClientConfig, Config, RateLimitConfig},
         rate_limit,
         rest_api::{
-            add_client, balance, delete_client, get_address, get_funds, health, index, status,
-            AppState,
+            add_client, balance, delete_client, get_address, get_funds, health, index, ready,
+            status, AppState,
         },
         service::Service,
         test_support::{
@@ -611,6 +631,7 @@ mod tests {
                 .app_data(app_state)
                 .service(index)
                 .service(health)
+                .service(ready)
                 .service(status)
                 .service(balance)
                 .service(get_funds)
@@ -642,6 +663,7 @@ mod tests {
                 .app_data(app_state)
                 .service(index)
                 .service(health)
+                .service(ready)
                 .service(status)
                 .service(balance)
                 .service(get_funds)
@@ -670,6 +692,7 @@ mod tests {
                 .app_data(app_state)
                 .service(index)
                 .service(health)
+                .service(ready)
                 .service(status)
                 .service(balance)
                 .service(get_funds)
@@ -703,6 +726,7 @@ mod tests {
                 .app_data(app_state)
                 .service(index)
                 .service(health)
+                .service(ready)
                 .service(status)
                 .service(balance)
                 .service(get_funds)
@@ -746,6 +770,7 @@ mod tests {
                 .app_data(app_state)
                 .service(index)
                 .service(health)
+                .service(ready)
                 .service(status)
                 .service(balance)
                 .service(get_funds)
@@ -794,10 +819,10 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn sr_bchn_011_health_reports_mapi_lite_ok_when_it_is_reachable() {
+    async fn sr_bchn_011_ready_reports_mapi_lite_ok_when_it_is_reachable() {
         let (app, _broadcaster) = build_app_with_mapi_lite(true).await;
         let resp =
-            test::call_service(&app, test::TestRequest::get().uri("/health").to_request()).await;
+            test::call_service(&app, test::TestRequest::get().uri("/ready").to_request()).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body: Value = test::read_body_json(resp).await;
         assert_eq!(body["status"], "ok");
@@ -805,20 +830,49 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn sr_bchn_011_health_returns_503_when_mapi_lite_is_unreachable() {
+    async fn sr_bchn_011_ready_returns_503_when_mapi_lite_is_unreachable() {
         let (app, _broadcaster) = build_app_with_mapi_lite(false).await;
         let resp =
-            test::call_service(&app, test::TestRequest::get().uri("/health").to_request()).await;
+            test::call_service(&app, test::TestRequest::get().uri("/ready").to_request()).await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body: Value = test::read_body_json(resp).await;
         assert_eq!(body["status"], "unhealthy");
         assert_eq!(body["mapi_lite"]["ok"], false);
-        // The detail is generic. /health answers unauthenticated callers, and
+        // The detail is generic. /ready answers unauthenticated callers, and
         // the upstream error it replaces carries the mapi-lite URL.
         let detail = body["mapi_lite"]["detail"]
             .as_str()
             .expect("a detail string");
         assert_eq!(detail, "mapi-lite probe failed");
+    }
+
+    /// The property this split exists to protect. A liveness probe that fails
+    /// while mapi-lite is down gets the process killed and restarted, which
+    /// cannot fix a broken upstream and costs the service its in-memory state.
+    /// So /health must answer 200 even when the very same configuration makes
+    /// /ready answer 503.
+    #[actix_web::test]
+    async fn sr_bchn_012_health_stays_up_when_mapi_lite_is_unreachable() {
+        let (app, _broadcaster) = build_app_with_mapi_lite(false).await;
+        let resp =
+            test::call_service(&app, test::TestRequest::get().uri("/health").to_request()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = test::read_body_json(resp).await;
+        // Liveness says nothing about upstreams, so the body carries no
+        // mapi_lite field at all -- only that this process is running.
+        assert_eq!(body, json!({ "status": "ok" }));
+    }
+
+    /// Without `[mapi_lite]` there is no upstream to probe, so readiness is
+    /// the same answer as liveness rather than a different shape.
+    #[actix_web::test]
+    async fn sr_bchn_012_ready_matches_health_without_mapi_lite() {
+        let app = build_app().await;
+        let resp =
+            test::call_service(&app, test::TestRequest::get().uri("/ready").to_request()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body, json!({ "status": "ok" }));
     }
 
     #[actix_web::test]
@@ -1590,6 +1644,15 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    /// Probes are answered by orchestrators, which carry no API key.
+    #[actix_web::test]
+    async fn test_ready_unauthenticated_when_api_key_enabled() {
+        let app = build_app_with_api_key(Some(TEST_API_KEY)).await;
+        let resp =
+            test::call_service(&app, test::TestRequest::get().uri("/ready").to_request()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
     #[actix_web::test]
     async fn test_fund_requires_api_key_when_enabled() {
         let app = build_app_with_api_key(Some(TEST_API_KEY)).await;
@@ -1750,6 +1813,25 @@ mod tests {
                 &app,
                 test::TestRequest::get()
                     .uri("/health")
+                    .peer_addr(peer_addr())
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+    }
+
+    /// A readiness probe runs on a fixed interval from every orchestrator
+    /// replica, so rate limiting it would report the service unready for
+    /// reasons that have nothing to do with the service.
+    #[actix_web::test]
+    async fn test_ready_is_exempt_from_rate_limit() {
+        let app = build_app_with_rate_limit(1).await;
+        for _ in 0..5 {
+            let resp = test::call_service(
+                &app,
+                test::TestRequest::get()
+                    .uri("/ready")
                     .peer_addr(peer_addr())
                     .to_request(),
             )

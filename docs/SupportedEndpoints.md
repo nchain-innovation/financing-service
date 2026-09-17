@@ -9,7 +9,7 @@ When a client has an `api_key` configured, that client's endpoints require authe
 
 The key must match the `client_id` being accessed. Using another client's key returns `401`.
 
-This applies to `POST /fund`, `GET /client/{client_id}/balance`, `GET /client/{client_id}/address`, and `DELETE /client/{client_id}` when that client has an `api_key`. `/`, `/health`, and `/status` remain unauthenticated.
+This applies to `POST /fund`, `GET /client/{client_id}/balance`, `GET /client/{client_id}/address`, and `DELETE /client/{client_id}` when that client has an `api_key`. `/`, `/health`, `/ready`, and `/status` remain unauthenticated.
 
 `POST /client` requires `web_interface.admin_api_key` when configured. Send the admin key via `Authorization: Bearer <admin_api_key>` or `X-API-Key: <admin_api_key>`. The request body may include an optional `api_key` field that is stored for the new client. See [Configuration](Configuration.md).
 
@@ -53,7 +53,7 @@ Financing Service REST API
 
 `GET /health`
 
-Liveness probe for Docker and orchestrators. Does not check blockchain (read) connectivity.
+Liveness: is this process running? It checks nothing else — not the blockchain (read) interface, not mapi-lite — and answers 200 whenever the service is up.
 
 ```bash
 curl http://127.0.0.1:8080/health
@@ -63,21 +63,35 @@ curl http://127.0.0.1:8080/health
 {"status": "ok"}
 ```
 
-When the optional [`[mapi_lite]`](Configuration.md#mapi_lite) section is configured, the endpoint also probes mapi-lite — the service's only broadcast path in that mode — and reports the result:
+Point Docker's `HEALTHCHECK` and a Kubernetes `livenessProbe` here. Both can restart the container, and a restart cannot fix an upstream that is down — it would only take `/status`, balances and addresses, none of which need an upstream, down with it.
+
+## Readiness check
+
+`GET /ready`
+
+Readiness: should traffic be sent here right now? Use this for a Kubernetes `readinessProbe` or a load balancer's health check, which remove an instance from rotation rather than restarting it.
+
+```bash
+curl http://127.0.0.1:8080/ready
+```
+
+Without [`[mapi_lite]`](Configuration.md#mapi_lite) there is no upstream whose absence would stop funding, so the answer matches `/health`. With it configured, `/ready` probes mapi-lite — the service's only broadcast path in that mode — and reports the result:
 
 | Situation | HTTP | Body |
 |---|---|---|
-| mapi-lite not configured | 200 | `{"status": "ok"}` (unchanged) |
+| mapi-lite not configured | 200 | `{"status": "ok"}` |
 | mapi-lite configured and reachable | 200 | `{"status": "ok", "mapi_lite": {"ok": true}}` |
 | mapi-lite configured but unreachable | 503 | `{"status": "unhealthy", "mapi_lite": {"ok": false, "detail": "mapi-lite probe failed"}}` |
 
-The probe is bounded by `mapi_lite.health_timeout_seconds` (default 2s), so it answers inside the Docker health check's timeout.
+`/health` is unaffected by that 503 and stays 200, which is the point of the split. Sending a liveness probe to `/ready` puts the restart loop back.
+
+The probe is bounded by `mapi_lite.health_timeout_seconds` (default 2s), which must stay under the few seconds a readiness probe allows before it gives up.
 
 The `detail` is deliberately generic. This endpoint is unauthenticated and exempt from rate limiting, and the underlying transport error names the mapi-lite host and port; the full error is written to the service log instead.
 
-The verdict is **cached for `health_timeout_seconds`**, so repeated calls do not each reach mapi-lite. Without that cache an unauthenticated, unmetered endpoint could be used to flood the broadcast path. The Docker health check runs every 30s, so it always sees a fresh probe.
+The verdict is **cached for `health_timeout_seconds`**, so repeated calls do not each reach mapi-lite. Without that cache an unauthenticated, unmetered endpoint could be used to flood the broadcast path. A readiness probe on a 5s interval therefore reaches mapi-lite at most every 2s.
 
-The Docker image includes a `HEALTHCHECK` that calls this endpoint; `curl -f` fails on the 503, so an unreachable mapi-lite marks the container unhealthy. The service itself keeps running and keeps serving reads (`/status`, balances, UTXOs), which do not depend on mapi-lite, and recovers on its own when mapi-lite returns.
+Through a 503 here the service keeps running and keeps serving reads (`/status`, balances, UTXOs), which do not depend on mapi-lite, and returns to ready on its own when mapi-lite comes back.
 
 ## Service status
 

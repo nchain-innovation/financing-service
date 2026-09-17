@@ -10,8 +10,8 @@
 //!
 //! Two clients share one base URL and token: the submit client carries the
 //! configured request timeout and retry budget, the probe client a short
-//! timeout and no retries, because `GET /health` has to answer inside the
-//! Docker health check's three seconds however slow mapi-lite is being.
+//! timeout and no retries, because `GET /ready` has to answer inside a
+//! readiness probe's few seconds however slow mapi-lite is being.
 //!
 //! A per-request timeout bounds one attempt but not the retry sequence, so a
 //! submit also carries a total deadline (`mapi_lite.total_timeout_seconds`).

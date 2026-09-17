@@ -124,7 +124,7 @@ pub struct Service {
     idempotency: Mutex<IdempotencyStore>,
     /// Set only for backends that must be told which addresses to follow.
     address_watcher: Option<Arc<dyn AddressWatcher>>,
-    /// The last mapi-lite probe verdict, reused by `GET /health` until it
+    /// The last mapi-lite probe verdict, reused by `GET /ready` until it
     /// goes stale. See [`Service::mapi_lite_health`].
     mapi_health: Mutex<Option<CachedHealth>>,
     /// How long a probe verdict is reused for. Zero without `[mapi_lite]`,
@@ -253,14 +253,14 @@ impl Service {
         // would sit in a restart loop -- taking /status, balances and every
         // other read path, none of which need mapi-lite, down with it, and
         // unable to recover on its own. Serving degraded and saying so through
-        // GET /health leaves the operator a service that heals when mapi-lite
+        // GET /ready leaves the operator a service that heals when mapi-lite
         // comes back.
         let broadcaster = broadcaster_factory(config, Arc::clone(&backend.interface))?;
         if let Some(mapi_lite) = &config.mapi_lite {
             if let Err(e) = broadcaster.health_check().await {
                 log::warn!(
                     "Unable to reach mapi-lite at {} at startup: {e}. Funding will fail until it \
-                     is reachable; GET /health reports the service unhealthy meanwhile.",
+                     is reachable; GET /ready reports the service unready meanwhile.",
                     mapi_lite.base_url()
                 );
             }
@@ -582,7 +582,7 @@ impl Service {
         self.broadcaster.name() == MAPI_LITE
     }
 
-    /// Probe mapi-lite for `GET /health`, reusing a recent verdict.
+    /// Probe mapi-lite for `GET /ready`, reusing a recent verdict.
     ///
     /// `None` when mapi-lite is not configured: there is then nothing to
     /// probe, and `/health` stays the pure liveness check it always was.

@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use chain_gang::messages::Tx;
 
 /// [`TxBroadcaster::name`] of the mapi-lite implementation. The service uses
-/// it to decide whether `GET /health` has an upstream to probe.
+/// it to decide whether `GET /ready` has an upstream to probe.
 pub const MAPI_LITE: &str = "mapi-lite";
 
 /// Why a broadcast did not succeed.
@@ -72,7 +72,7 @@ pub trait TxBroadcaster: Send + Sync {
     /// reported it, which for a well-behaved upstream equals `tx.hash()`.
     async fn broadcast_tx(&self, tx: &Tx) -> Result<String, BroadcastError>;
 
-    /// Reachability probe, used at startup and by `GET /health`. Should be
+    /// Reachability probe, used at startup and by `GET /ready`. Should be
     /// cheap and bounded in time: the Docker health check allows three
     /// seconds in total.
     async fn health_check(&self) -> Result<(), BroadcastError>;

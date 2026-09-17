@@ -133,12 +133,12 @@ pub struct CheckResult {
     pub detail: Option<String>,
 }
 
-/// Body of `GET /health`.
+/// Body of `GET /health` and `GET /ready`.
 ///
-/// Without mapi-lite configured this is `{"status":"ok"}`, unchanged from
-/// before the integration existed. With mapi-lite configured the probe's
-/// verdict is added under `mapi_lite`, and `status` becomes `"unhealthy"`
-/// (with HTTP 503) when the probe fails.
+/// `/health` is liveness and always answers `{"status":"ok"}`. `/ready`
+/// answers the same when mapi-lite is not configured; with mapi-lite the
+/// probe's verdict is added under `mapi_lite`, and `status` becomes
+/// `"unhealthy"` (with HTTP 503) when the probe fails.
 #[derive(Serialize)]
 pub struct HealthResponse {
     pub status: &'static str,
