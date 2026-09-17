@@ -203,7 +203,7 @@ Optional. When this section is present, funding transactions are **broadcast thr
 [mapi_lite]
 base_url = "http://127.0.0.1:8080"
 auth_token = "env:FS_MAPI_LITE_AUTH_TOKEN"
-# timeout_seconds = 30
+# timeout_seconds = 13
 # health_timeout_seconds = 2
 # max_retries = 2
 # total_timeout_seconds = 45
@@ -211,12 +211,16 @@ auth_token = "env:FS_MAPI_LITE_AUTH_TOKEN"
 
 * `base_url` — **required.** Base URL of the mapi-lite server, `http://` or `https://`. Surrounding whitespace and a trailing `/` are stripped before the URL is validated or used, so the value that is checked at startup is the one that is requested.
 * `auth_token` — optional. Sent **verbatim** as the `Authorization` header on every request, so include the scheme the server expects, e.g. `"Bearer <secret>"`. Takes an `env:VAR_NAME` reference and is overridden by `FS_MAPI_LITE_AUTH_TOKEN`. A plaintext value is reported at startup like any other plaintext secret. Never logged.
-* `timeout_seconds` — per-request timeout for a transaction submit. Default `30`.
+* `timeout_seconds` — ceiling on **one** submit attempt. Default `13`. Chosen so the whole retry budget fits the deadline: 3 attempts × 13s plus 3s of back-off is 42s, inside `total_timeout_seconds` of 45. It was 30s, which meant the deadline cut the sequence off after one attempt and part of a second, so `max_retries` described attempts that never ran.
 * `health_timeout_seconds` — timeout for the mapi-lite probe behind `GET /ready`. Default `2`. Must be **less than 3**, and is rejected at startup otherwise: readiness probes allow a few seconds at most (Docker's health check defaults to `--timeout=3s`), and a slower probe would be killed by the caller before it answered, marking the instance unready on every check even while mapi-lite is fine. The probe's verdict is cached for this long, so `/ready` — which is unauthenticated and exempt from rate limiting — cannot be used to flood mapi-lite.
-* `max_retries` — how many times a submit is retried after a transient failure (an HTTP 5xx or a transport error) before `POST /fund` reports `broadcast_failed`. Default `2`. Resubmitting is safe: mapi-lite answers an already-known transaction with success.
-* `total_timeout_seconds` — ceiling on a whole submit: every attempt and every back-off between them. Default `45`; must be at least `timeout_seconds`. `timeout_seconds` alone bounds one attempt, so without this the worst case against a mapi-lite that accepts connections but never answers is `timeout_seconds × (max_retries + 1)` plus back-off — about 93s at the defaults — with the `POST /fund` caller and its worker held for the whole of it. On expiry the caller gets `broadcast_outcome_unknown` (HTTP 504), not `broadcast_failed`: cancelling a request in flight says nothing about what the server did with it, so the transaction may be on the network. The service reserves that transaction's inputs in response — see [When the outcome is unknown](SupportedEndpoints.md#when-the-outcome-is-unknown).
+* `max_retries` — how many times a submit is retried after a transient failure (an HTTP 5xx, a transport error, or an attempt that ran out of `timeout_seconds`). Default `2`, so three attempts, with linear back-off of 1s then 2s (capped at 5s). Resubmitting is safe: mapi-lite answers an already-known transaction with success — which is also how a retry can *settle* an attempt that timed out, turning `broadcast_outcome_unknown` back into a plain success.
 
-  This deadline is what separates a mapi-lite that is *slow* from one that is *down*. A slow one spends `timeout_seconds` on each attempt, so the deadline fires mid-request and the outcome is correctly unknown; a down one refuses connections in milliseconds, so only the retry back-off (1s, then 2s, capped at 5s) takes any time and the budget exhausts well inside the deadline, reported correctly as `broadcast_failed`. Keep `total_timeout_seconds` comfortably above the back-off total and below `timeout_seconds × (max_retries + 1)`, as the defaults do. Squeeze it towards the back-off and an unreachable mapi-lite starts being reported as an unknown outcome, reserving inputs that were never spent.
+  Raising this only buys attempts that fit inside `total_timeout_seconds`. If they do not, the service logs a warning at startup naming how many will actually start, and carries on — the combination is legal, it just does less than it asks for.
+* `total_timeout_seconds` — ceiling on a whole submit: every attempt and every back-off between them. Default `45`; must be at least `timeout_seconds`. This is the worst case a `POST /fund` caller — and the actix worker serving it — can be held by an unresponsive mapi-lite, so it is the number to set first and then fit the other two inside.
+
+  On expiry the caller gets `broadcast_outcome_unknown` (HTTP 504) if an attempt was still in flight, because cancelling a request says nothing about what the server did with it and the transaction may be on the network; the service reserves that transaction's inputs in response — see [When the outcome is unknown](SupportedEndpoints.md#when-the-outcome-is-unknown). If instead the deadline was consumed by back-off between attempts that were all refused outright, nothing was ever delivered and the caller gets `broadcast_failed` (HTTP 502) with no reservation.
+
+**The three interact.** The worst case is `timeout_seconds × (max_retries + 1)` plus back-off, and `total_timeout_seconds` cuts it off there. Set the deadline to the longest a `/fund` call may take, then choose the other two to fit inside it; the startup warning tells you when they do not.
 
 When the section is present the service:
 
