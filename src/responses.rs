@@ -28,10 +28,18 @@ pub enum ErrorCode {
     ClientExists,
     /// The request itself is malformed. Never retryable unchanged.
     InvalidRequest,
-    /// The funding transaction was built and signed but the node rejected it
-    /// or was unreachable. Nothing was spent, so the client's own retry may
-    /// succeed.
+    /// The funding transaction was built and signed but the upstream could
+    /// not be reached, or refused it in a way it said was worth retrying.
+    /// Nothing was spent, so the client's own retry may succeed.
     BroadcastFailed,
+    /// The upstream answered and refused the funding transaction, and said a
+    /// resubmission would not change that -- a conflicting spend, say.
+    ///
+    /// Separate from [`ErrorCode::BroadcastFailed`] because the advice is the
+    /// opposite: retrying this transaction can never work. Something has to
+    /// change first, usually the wallet's UTXO set, and usually by an
+    /// operator. The upstream's own reason is in the service log.
+    BroadcastRejected,
     /// The funding transaction was handed to the broadcaster and its fate is
     /// unknown -- the submit deadline expired, or the answer could not be
     /// read. It may be on the network.
@@ -79,10 +87,14 @@ impl ErrorCode {
             ErrorCode::InvalidRequest => StatusCode::BAD_REQUEST,
             // the named client does not exist
             ErrorCode::UnknownClient => StatusCode::NOT_FOUND,
-            // the request is well formed but conflicts with current state
+            // the request is well formed but conflicts with current state.
+            // A definitive rejection belongs here rather than with the 5xx
+            // upstream failures: the service and the upstream both did their
+            // job, and what has to change is the state they were working on.
             ErrorCode::ClientExists
             | ErrorCode::InsufficientBalance
             | ErrorCode::NoSuitableUtxo
+            | ErrorCode::BroadcastRejected
             | ErrorCode::KeyInProgress
             | ErrorCode::IdempotencyKeyReused => StatusCode::CONFLICT,
             // upstream node rejected the transaction or was unreachable, so

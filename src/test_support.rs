@@ -383,6 +383,39 @@ impl TxBroadcaster for FailingBroadcaster {
     }
 }
 
+/// Broadcaster whose upstream refuses every transaction.
+///
+/// `retryable` is the upstream's own view of whether resubmitting could
+/// succeed -- mapi-lite's `failureRetryable` -- and is the whole point of the
+/// double: the two answers call for opposite advice to the caller.
+pub struct RejectingBroadcaster {
+    retryable: bool,
+}
+
+impl RejectingBroadcaster {
+    pub fn new(retryable: bool) -> Arc<Self> {
+        Arc::new(Self { retryable })
+    }
+}
+
+#[async_trait]
+impl TxBroadcaster for RejectingBroadcaster {
+    fn name(&self) -> &str {
+        "rejecting"
+    }
+
+    async fn broadcast_tx(&self, _tx: &Tx) -> Result<String, BroadcastError> {
+        Err(BroadcastError::Rejected {
+            description: "txn-mempool-conflict".to_string(),
+            retryable: self.retryable,
+        })
+    }
+
+    async fn health_check(&self) -> Result<(), BroadcastError> {
+        Ok(())
+    }
+}
+
 /// Broadcaster that reports an unknown outcome, as a mapi-lite whose submit
 /// deadline expires does.
 ///

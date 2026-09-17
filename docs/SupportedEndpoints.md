@@ -249,7 +249,8 @@ The status is derived from the code, so a caller that cannot read the body — a
 | `unknown_client` | 404 / 400 | No such `client_id`. 404 where the id is a path segment, 400 where it is a body field | Fix configuration; never retryable as-is |
 | `client_exists` | 409 | `client_id` is already configured | `POST /client` only |
 | `invalid_request` | 400 | The request is malformed | Fix the request; never retryable unchanged |
-| `broadcast_failed` | 502 | Transaction built and signed, but the node rejected it or never took it | Nothing was spent; retry may succeed |
+| `broadcast_failed` | 502 | The upstream could not be reached, or refused the transaction in a way it said was worth retrying | Nothing was spent; retry may succeed |
+| `broadcast_rejected` | 409 | The upstream looked at the transaction and refused it, and said a resubmission would not change that | Nothing was spent, and **retrying will not help** — see below |
 | `broadcast_outcome_unknown` | 504 | The transaction was handed over and its fate is unknown — it may be on the network | **Do not retry with a new `idempotency_key`**; see below |
 | `partial_broadcast` | 422 | Some of the requested transactions broadcast, some did not | **Read the body** — the successful ones are in it |
 | `chain_unavailable` | 503 | The blockchain interface could not be reached | Retryable |
@@ -258,6 +259,16 @@ The status is derived from the code, so a caller that cannot read the body — a
 | `rate_limited` | 429 | Request rate exceeded | Retry after the interval in `description` |
 | `key_in_progress` | 409 | A request with this `idempotency_key` is still being processed | Retry shortly |
 | `idempotency_key_reused` | 409 | This `idempotency_key` was used with a different request | Use a fresh `idempotency_key` |
+
+### When the transaction is refused
+
+`broadcast_rejected` means the upstream answered, looked at the funding transaction, and will not take it however many times it is offered — `failureRetryable: false` in mapi-lite's terms. The commonest cause is a conflicting spend: another transaction already spends an input this one uses.
+
+Nothing was spent, so the `idempotency_key` is released and can be used again for the corrected request. But the same transaction will never be accepted, so something has to change first — usually the wallet's UTXO set, usually by an operator. The upstream's own reason, and its `retryable` verdict, are in the service log; they are not in the response, which carries a fixed description like every other error here.
+
+This is 409 rather than 502 because nothing upstream failed. The service built a transaction, the upstream read it and said no, and what needs to change is the state they were both working on — the same shape as `insufficient_balance` and `no_suitable_utxo`.
+
+A refusal the upstream *does* think is worth retrying stays `broadcast_failed`, with its documented "retry may succeed" advice intact.
 
 ### When the outcome is unknown
 

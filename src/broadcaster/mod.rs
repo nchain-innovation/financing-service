@@ -95,6 +95,10 @@ pub trait TxBroadcaster: Send + Sync {
 mod tests {
     use super::*;
 
+    /// The response body carries a fixed description, so this Display is the
+    /// only place an operator learns *why* the upstream refused a transaction
+    /// and whether it thought a retry could help. `Service` logs the error
+    /// through it on every broadcast failure.
     #[test]
     fn broadcast_error_display_names_the_kind_of_failure() {
         let rejected = BroadcastError::Rejected {
@@ -105,7 +109,17 @@ mod tests {
             rejected.to_string(),
             "rejected: txn-mempool-conflict (retryable: false)"
         );
+        let retryable = BroadcastError::Rejected {
+            description: "mempool full".to_string(),
+            retryable: true,
+        };
+        assert_eq!(
+            retryable.to_string(),
+            "rejected: mempool full (retryable: true)"
+        );
         let upstream = BroadcastError::Upstream("http status 503".to_string());
         assert_eq!(upstream.to_string(), "upstream error: http status 503");
+        let unknown = BroadcastError::Indeterminate("no answer in 45s".to_string());
+        assert_eq!(unknown.to_string(), "outcome unknown: no answer in 45s");
     }
 }
