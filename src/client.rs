@@ -15,13 +15,51 @@ use chain_gang::{
     wallet::{create_sighash, Wallet},
 };
 
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
 use crate::config::ClientConfig;
 use crate::responses::{CodedError, ErrorCode};
+
+/// How long an outpoint stays reserved after a funding transaction whose
+/// outcome is unknown.
+///
+/// The reservation exists to stop the next funding request spending an input
+/// that may already be spent on chain, and it has to outlive the gap between a
+/// transaction reaching the network and the read interface admitting it --
+/// mempool visibility, not confirmation, so seconds to a minute in practice.
+/// Ten minutes is far longer than that, and the cost of overshooting is only
+/// that funds sit idle: if the transaction never landed, the reservation
+/// expires and the outpoint comes back on the next refresh. The cost of
+/// undershooting is a conflicting transaction, so the bound leans long.
+const UNCERTAIN_SPEND_RESERVATION: Duration = Duration::from_secs(600);
+
+/// An outpoint, as the chain names it.
+type OutPointKey = (String, u32);
+
+fn outpoint_key(entry: &UtxoEntry) -> OutPointKey {
+    (entry.tx_hash.clone(), entry.tx_pos)
+}
+
+/// An input handed to the network in a transaction whose fate is unknown.
+///
+/// The entry is kept whole rather than just its key so the withheld value can
+/// be taken off the reported balance too, leaving the balance and the UTXO set
+/// telling the same story.
+#[derive(Clone, Debug)]
+struct ReservedOutpoint {
+    entry: UtxoEntry,
+    since: Instant,
+}
 
 #[derive(Clone, Debug)]
 pub struct FundingSpendPlan {
     spent_indices: Vec<usize>,
     change_entry: UtxoEntry,
+    /// The inputs this plan spends, by outpoint, so they can be reserved when
+    /// the broadcast outcome is unknown. Indices address the UTXO list this
+    /// plan was built against and do not survive a refresh; outpoints do.
+    spent_outpoints: Vec<UtxoEntry>,
 }
 
 #[derive(Clone)]
@@ -70,6 +108,12 @@ pub struct Client {
     balance: Balance,
     /// Current funding UTXO
     unspent: Utxo,
+    /// Outpoints spent by a funding transaction whose outcome is unknown.
+    ///
+    /// Held out of `unspent` -- and out of every refresh that would otherwise
+    /// resurrect them -- until the chain agrees they are spent or the
+    /// reservation expires. See [`UNCERTAIN_SPEND_RESERVATION`].
+    reserved: HashMap<OutPointKey, ReservedOutpoint>,
 }
 
 impl Client {
@@ -92,6 +136,7 @@ impl Client {
             address,
             balance: Balance::default(),
             unspent: Vec::new(),
+            reserved: HashMap::new(),
         })
     }
 
@@ -115,10 +160,73 @@ impl Client {
         Ok(())
     }
 
+    /// Replace the cached balance and UTXO set with what the chain reports,
+    /// less anything still reserved by an uncertain funding transaction.
+    ///
+    /// Without that subtraction a refresh would undo a reservation as fast as
+    /// it was made: a transaction that has reached the network but is not yet
+    /// visible to the read interface still reads as unspent, and the service
+    /// would offer the same input to the next funding request.
     pub fn apply_chain_state(&mut self, balance: Balance, unspent: Utxo) {
+        self.release_expired_reservations();
+        // An outpoint the chain no longer reports as unspent has been spent,
+        // so the uncertain transaction landed and the reservation is done.
+        self.reserved
+            .retain(|key, _| unspent.iter().any(|entry| &outpoint_key(entry) == key));
+
         self.balance = balance;
         self.unspent = unspent;
+        if !self.reserved.is_empty() {
+            self.withhold_reserved();
+        }
         self.unspent.sort_by_key(|x| x.value);
+    }
+
+    /// Drop the cached copy of every reserved outpoint, and take its value off
+    /// the reported balance so the two agree.
+    fn withhold_reserved(&mut self) {
+        self.unspent
+            .retain(|entry| !self.reserved.contains_key(&outpoint_key(entry)));
+        for reserved in self.reserved.values() {
+            let value = reserved.entry.value;
+            if reserved.entry.height < 0 {
+                self.balance.unconfirmed -= value;
+            } else {
+                self.balance.confirmed -= value;
+            }
+        }
+    }
+
+    fn release_expired_reservations(&mut self) {
+        let now = Instant::now();
+        self.reserved.retain(|key, reserved| {
+            let held = now.duration_since(reserved.since) < UNCERTAIN_SPEND_RESERVATION;
+            if !held {
+                log::info!(
+                    "releasing reserved outpoint {}:{} -- no longer spent on chain after {}s, so \
+                     the uncertain funding transaction never landed",
+                    key.0,
+                    key.1,
+                    UNCERTAIN_SPEND_RESERVATION.as_secs()
+                );
+            }
+            held
+        });
+    }
+
+    /// Number of outpoints currently withheld from funding.
+    #[cfg(test)]
+    pub fn reserved_outpoint_count(&self) -> usize {
+        self.reserved.len()
+    }
+
+    /// Age every reservation by `by`, so a test can reach the expiry without
+    /// waiting for it.
+    #[cfg(test)]
+    fn backdate_reservations(&mut self, by: Duration) {
+        for reserved in self.reserved.values_mut() {
+            reserved.since -= by;
+        }
     }
 
     /// Return balance as JSON string
@@ -371,6 +479,7 @@ impl Client {
             FundingSpendPlan {
                 spent_indices: vec![index],
                 change_entry,
+                spent_outpoints: vec![unspent.clone()],
             },
         ))
     }
@@ -426,6 +535,10 @@ impl Client {
             FundingSpendPlan {
                 spent_indices: selected_indices.to_vec(),
                 change_entry,
+                spent_outpoints: selected_indices
+                    .iter()
+                    .filter_map(|index| self.unspent.get(*index).cloned())
+                    .collect(),
             },
         ))
     }
@@ -449,6 +562,50 @@ impl Client {
 
     pub fn commit_funding_spend(&mut self, plan: FundingSpendPlan) {
         self.spend_utxos(&plan.spent_indices, plan.change_entry);
+    }
+
+    /// Commit a spend whose transaction may or may not have reached the
+    /// network, reserving its inputs so no later refresh offers them again.
+    ///
+    /// Pessimistic on purpose. The two ways of being wrong are not equal: if
+    /// the transaction landed and this service kept treating the inputs as
+    /// spendable, the next funding request would build a conflicting
+    /// transaction and be refused by the network -- a failure the service
+    /// creates for itself and cannot detect. If it never landed, the inputs
+    /// sit idle until the reservation expires and the next refresh restores
+    /// them. Idle funds heal; a double spend does not.
+    ///
+    /// The change output is deliberately *not* added to the cache: it exists
+    /// only if the transaction landed, and unlike the inputs, wrongly counting
+    /// it would have the service try to spend an output that may not exist.
+    pub fn commit_uncertain_funding_spend(&mut self, plan: FundingSpendPlan) {
+        let spent: std::collections::HashSet<usize> = plan.spent_indices.iter().copied().collect();
+        self.unspent = self
+            .unspent
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !spent.contains(index))
+            .map(|(_, utxo)| utxo.clone())
+            .collect();
+
+        let now = Instant::now();
+        for entry in plan.spent_outpoints {
+            let value = entry.value;
+            if entry.height < 0 {
+                self.balance.unconfirmed -= value;
+            } else {
+                self.balance.confirmed -= value;
+            }
+            log::warn!(
+                "reserving outpoint {}:{} for up to {}s: its funding transaction was handed to \
+                 the broadcaster and the outcome is unknown",
+                entry.tx_hash,
+                entry.tx_pos,
+                UNCERTAIN_SPEND_RESERVATION.as_secs()
+            );
+            self.reserved
+                .insert(outpoint_key(&entry), ReservedOutpoint { entry, since: now });
+        }
     }
 
     /// Create one funding transaction and update the local UTXO cache.
@@ -635,5 +792,170 @@ mod tests {
         assert_eq!(plan_a.spent_indices, plan_b.spent_indices);
         client.commit_funding_spend(plan_a);
         assert!(client.plan_funding_tx(&fund_request).is_ok());
+    }
+
+    // ---- Reserved outpoints after an uncertain broadcast (issue #66) ----
+
+    fn utxo(tx_hash: &str, tx_pos: u32, value: i64, height: i32) -> UtxoEntry {
+        UtxoEntry {
+            height,
+            tx_pos,
+            tx_hash: tx_hash.to_string(),
+            value,
+        }
+    }
+
+    /// A client holding exactly `unspent`, with a matching balance.
+    fn client_holding(unspent: Utxo) -> Client {
+        let client_config = ClientConfig {
+            client_id: TEST_CLIENT_ID.to_string(),
+            wif_key: crate::test_support::TEST_WIF.to_string(),
+            api_key: None,
+        };
+        let mut client = Client::try_new(&client_config).unwrap();
+        let balance = Balance {
+            confirmed: unspent.iter().map(|u| u.value).sum(),
+            unconfirmed: 0,
+        };
+        client.apply_chain_state(balance, unspent);
+        client
+    }
+
+    /// Reserve the first cached outpoint, as an uncertain broadcast does.
+    fn reserve_first(client: &mut Client) -> UtxoEntry {
+        let entry = client.unspent[0].clone();
+        client.commit_uncertain_funding_spend(FundingSpendPlan {
+            spent_indices: vec![0],
+            change_entry: utxo("change", 0, 1, 0),
+            spent_outpoints: vec![entry.clone()],
+        });
+        entry
+    }
+
+    /// The defect in #66. A funding transaction reaches the network, the
+    /// deadline fires before the answer does, and the refresh that follows
+    /// still sees the input as unspent because the transaction is not
+    /// confirmed yet. Without the reservation the cache takes that at face
+    /// value and offers the same input to the next funding request, which
+    /// builds a transaction the network can only refuse.
+    #[test]
+    fn sr_fund_012_a_refresh_does_not_resurrect_a_reserved_outpoint() {
+        let chain = vec![utxo("aa", 0, 5_000, 100), utxo("bb", 1, 7_000, 100)];
+        let mut client = client_holding(chain.clone());
+        let reserved = reserve_first(&mut client);
+
+        // the read interface has not seen the spend yet, so it reports both
+        client.apply_chain_state(
+            Balance {
+                confirmed: 12_000,
+                unconfirmed: 0,
+            },
+            chain,
+        );
+
+        assert_eq!(client.reserved_outpoint_count(), 1);
+        assert!(
+            !client
+                .unspent
+                .iter()
+                .any(|u| u.tx_hash == reserved.tx_hash && u.tx_pos == reserved.tx_pos),
+            "the reserved outpoint came back and could be spent again"
+        );
+        assert_eq!(client.unspent.len(), 1);
+    }
+
+    /// The reservation is not a leak: once the chain stops reporting the
+    /// outpoint as unspent, the uncertain transaction has landed and there is
+    /// nothing left to protect against.
+    #[test]
+    fn sr_fund_012_a_reservation_is_released_once_the_chain_agrees_it_is_spent() {
+        let mut client = client_holding(vec![utxo("aa", 0, 5_000, 100), utxo("bb", 1, 7_000, 100)]);
+        reserve_first(&mut client);
+        assert_eq!(client.reserved_outpoint_count(), 1);
+
+        // the spend is visible now: "aa:0" is gone and the change has arrived
+        client.apply_chain_state(
+            Balance {
+                confirmed: 11_800,
+                unconfirmed: 0,
+            },
+            vec![utxo("bb", 1, 7_000, 100), utxo("cc", 0, 4_800, -1)],
+        );
+
+        assert_eq!(client.reserved_outpoint_count(), 0);
+        assert_eq!(client.unspent.len(), 2);
+    }
+
+    /// The other way the uncertainty resolves: the transaction never landed.
+    /// The outpoint is still spendable, so the reservation must let go of it
+    /// rather than stranding the funds for the life of the process.
+    #[test]
+    fn sr_fund_012_a_reservation_expires_so_funds_return_if_nothing_landed() {
+        let chain = vec![utxo("aa", 0, 5_000, 100), utxo("bb", 1, 7_000, 100)];
+        let mut client = client_holding(chain.clone());
+        reserve_first(&mut client);
+
+        client.backdate_reservations(UNCERTAIN_SPEND_RESERVATION + Duration::from_secs(1));
+        client.apply_chain_state(
+            Balance {
+                confirmed: 12_000,
+                unconfirmed: 0,
+            },
+            chain,
+        );
+
+        assert_eq!(client.reserved_outpoint_count(), 0);
+        assert_eq!(client.unspent.len(), 2, "the funds came back");
+        assert_eq!(client.get_balance().confirmed, 12_000);
+    }
+
+    /// Balance and UTXO set have to tell the same story, or `/balance` invites
+    /// a funding request that `/fund` then refuses for want of a UTXO.
+    #[test]
+    fn sr_fund_012_a_reserved_outpoint_is_off_the_balance_too() {
+        let chain = vec![utxo("aa", 0, 5_000, 100), utxo("bb", 1, 7_000, 100)];
+        let mut client = client_holding(chain.clone());
+        reserve_first(&mut client);
+        assert_eq!(client.get_balance().confirmed, 7_000);
+
+        // and it stays off across a refresh that still reports it
+        client.apply_chain_state(
+            Balance {
+                confirmed: 12_000,
+                unconfirmed: 0,
+            },
+            chain,
+        );
+        assert_eq!(client.get_balance().confirmed, 7_000);
+    }
+
+    /// The change output of an uncertain transaction exists only if that
+    /// transaction landed. Counting it would have the service try to spend an
+    /// output that may never have been created -- the same defect as #66, in
+    /// the other direction.
+    #[test]
+    fn sr_fund_012_an_uncertain_commit_does_not_add_the_change_output() {
+        let mut client = client_holding(vec![utxo("aa", 0, 5_000, 100)]);
+        client.commit_uncertain_funding_spend(FundingSpendPlan {
+            spent_indices: vec![0],
+            change_entry: utxo("change", 0, 4_800, 0),
+            spent_outpoints: vec![utxo("aa", 0, 5_000, 100)],
+        });
+        assert!(client.unspent.is_empty(), "{:?}", client.unspent);
+    }
+
+    /// A certain broadcast is unaffected: the spend is committed outright,
+    /// change and all, and nothing is reserved.
+    #[test]
+    fn sr_fund_012_a_successful_broadcast_reserves_nothing() {
+        let mut client = client_holding(vec![utxo("aa", 0, 5_000, 100)]);
+        client.commit_funding_spend(FundingSpendPlan {
+            spent_indices: vec![0],
+            change_entry: utxo("change", 0, 4_800, 0),
+            spent_outpoints: vec![utxo("aa", 0, 5_000, 100)],
+        });
+        assert_eq!(client.reserved_outpoint_count(), 0);
+        assert_eq!(client.unspent.len(), 1);
+        assert_eq!(client.unspent[0].value, 4_800);
     }
 }

@@ -249,7 +249,8 @@ The status is derived from the code, so a caller that cannot read the body — a
 | `unknown_client` | 404 / 400 | No such `client_id`. 404 where the id is a path segment, 400 where it is a body field | Fix configuration; never retryable as-is |
 | `client_exists` | 409 | `client_id` is already configured | `POST /client` only |
 | `invalid_request` | 400 | The request is malformed | Fix the request; never retryable unchanged |
-| `broadcast_failed` | 502 | Transaction built and signed, but the node rejected it or was unreachable | Retry may succeed |
+| `broadcast_failed` | 502 | Transaction built and signed, but the node rejected it or never took it | Nothing was spent; retry may succeed |
+| `broadcast_outcome_unknown` | 504 | The transaction was handed over and its fate is unknown — it may be on the network | **Do not retry with a new `idempotency_key`**; see below |
 | `partial_broadcast` | 422 | Some of the requested transactions broadcast, some did not | **Read the body** — the successful ones are in it |
 | `chain_unavailable` | 503 | The blockchain interface could not be reached | Retryable |
 | `internal` | 500 | Unexpected internal failure | Report it |
@@ -257,6 +258,17 @@ The status is derived from the code, so a caller that cannot read the body — a
 | `rate_limited` | 429 | Request rate exceeded | Retry after the interval in `description` |
 | `key_in_progress` | 409 | A request with this `idempotency_key` is still being processed | Retry shortly |
 | `idempotency_key_reused` | 409 | This `idempotency_key` was used with a different request | Use a fresh `idempotency_key` |
+
+### When the outcome is unknown
+
+`broadcast_outcome_unknown` is not a failure. It means the funding transaction was handed to the broadcaster and the service could not learn what happened to it — the mapi-lite submit deadline expired with the request in flight, or the answer came back unreadable. The transaction may well be on the network.
+
+Two things follow, and both are deliberate:
+
+* **The service treats the inputs as spent.** They are removed from the client's UTXO cache and reserved, so no later refresh offers them to the next funding request while the transaction may be live. Otherwise the service would build a second transaction spending the same inputs, which the network can only treat as a conflict. If the transaction turns out never to have landed, the reservation expires and the funds return on the next refresh — briefly idle funds are the cheaper mistake.
+* **The idempotency record is kept.** Retrying with the original `idempotency_key` is answered `key_in_progress` until the record expires, rather than funding again. That is the honest answer: the service does not know the outcome either.
+
+A caller that needs to know what happened should look at the chain for the transaction, not ask the service again. Retrying with a **new** `idempotency_key` will fund a second time, which is exactly what the first request may already have done.
 
 Examples:
 

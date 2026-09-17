@@ -80,8 +80,41 @@ impl MapiBroadcaster {
 }
 
 impl From<ClientError> for BroadcastError {
+    /// Split a client error by what it says about the transaction, not by how
+    /// bad it looks.
+    ///
+    /// The question is only ever "might mapi-lite have taken this and relayed
+    /// it?". A connection that was refused took nothing. A request that was
+    /// sent and never answered may have taken everything.
     fn from(error: ClientError) -> Self {
-        BroadcastError::Upstream(error.to_string())
+        let detail = error.to_string();
+        match error {
+            // Sent, and no answer came back within the request timeout. The
+            // server may have relayed the transaction and been slow to say so.
+            ClientError::Transport(e) if e.is_timeout() => BroadcastError::Indeterminate(detail),
+            // The server answered and the answer is unreadable, so it took the
+            // transaction and its verdict is lost to us.
+            ClientError::Decode(_) | ClientError::BadSignature => {
+                BroadcastError::Indeterminate(detail)
+            }
+            // A refused or unresolvable connection never delivered anything,
+            // and an HTTP error status is the server declining to act. Both
+            // leave the transaction where it was built.
+            //
+            // `RetriesExhausted` lands here too, and that one is a judgement
+            // call: uls-client renders the last attempt's cause to a string,
+            // and a refused connection and an expired timeout render
+            // identically, so the distinction cannot be recovered. Calling it
+            // determinate is right for the failure that actually produces it
+            // in practice -- a mapi-lite that is down refuses connections in
+            // milliseconds and exhausts the budget long before the submit
+            // deadline, while a mapi-lite that is merely slow burns the
+            // deadline first and is reported as indeterminate by the caller
+            // above. That argument holds only while the retry budget cannot
+            // fit inside `total_timeout_seconds`; see the note in
+            // `MapiBroadcaster::broadcast_tx`.
+            _ => BroadcastError::Upstream(detail),
+        }
     }
 }
 
@@ -107,6 +140,25 @@ impl TxBroadcaster for MapiBroadcaster {
         // sequence gets a ceiling of its own: against a mapi-lite that accepts
         // connections and never answers, the caller and the worker serving it
         // are freed at the deadline rather than at attempts * timeout.
+        //
+        // The deadline also does the classifying, because uls-client renders
+        // the last attempt's cause to a string and a refused connection and an
+        // expired timeout render identically (see `From<ClientError>`). What
+        // separates them is how long they take:
+        //
+        // * a mapi-lite that accepts the request and goes quiet spends
+        //   `timeout_seconds` per attempt, so the deadline fires while a
+        //   request is in flight -- correctly unknown;
+        // * a mapi-lite that is down refuses connections in milliseconds, so
+        //   only the back-off between attempts takes any time and the budget
+        //   exhausts first -- correctly a plain failure.
+        //
+        // That holds while `timeout_seconds * (max_retries + 1)` exceeds
+        // `total_timeout_seconds` and the back-off total does not. At the
+        // defaults both hold comfortably: 3 x 30s of attempts against a 45s
+        // deadline, and 3s of back-off inside it. Squeeze the deadline down
+        // towards the back-off and a down mapi-lite starts being reported as
+        // an unknown outcome, reserving inputs nothing ever spent.
         let payload = match tokio::time::timeout(
             self.submit_deadline,
             self.submit.submit_transactions(&[request]),
@@ -115,10 +167,16 @@ impl TxBroadcaster for MapiBroadcaster {
         {
             Ok(result) => result?,
             Err(_) => {
-                return Err(BroadcastError::Upstream(format!(
+                // Cancelling the request says nothing about what the server
+                // did with it: a mapi-lite that is slow rather than broken may
+                // have relayed the transaction already and be about to answer.
+                // So this is an unknown outcome, not a failure, and the
+                // service treats the inputs as spent (see
+                // `Service::execute_funding`).
+                return Err(BroadcastError::Indeterminate(format!(
                     "mapi-lite did not answer within {}s (mapi_lite.total_timeout_seconds)",
                     self.submit_deadline.as_secs()
-                )))
+                )));
             }
         };
 
@@ -126,7 +184,11 @@ impl TxBroadcaster for MapiBroadcaster {
         // disagree about the batch contract, and guessing which result is
         // ours would be worse than refusing.
         let [result] = payload.txs.as_slice() else {
-            return Err(BroadcastError::Upstream(format!(
+            // The server answered, so it took the transaction, but the answer
+            // is not one this client can read. What it did with the
+            // transaction is therefore unknown rather than known to have
+            // failed.
+            return Err(BroadcastError::Indeterminate(format!(
                 "submitted 1 transaction but mapi-lite returned {} results",
                 payload.txs.len()
             )));
@@ -162,9 +224,13 @@ impl TxBroadcaster for MapiBroadcaster {
         // local hash -- for a transaction that will never confirm, with its
         // UTXOs already marked spent. Refused for the same reason the batch
         // length is: a disagreement here is not ours to guess through.
+        //
+        // Unknown rather than failed, though: the server reported success, so
+        // something was accepted, and this service cannot tell whether the
+        // transaction it built was part of it.
         let expected = tx.hash().encode();
         if result.txid != expected {
-            return Err(BroadcastError::Upstream(format!(
+            return Err(BroadcastError::Indeterminate(format!(
                 "mapi-lite reported txid {} for a funding transaction hashing to {expected}",
                 result.txid
             )));
@@ -259,6 +325,16 @@ mod tests {
         match error {
             BroadcastError::Upstream(detail) => detail,
             other => panic!("expected an upstream error, got {other:?}"),
+        }
+    }
+
+    /// The detail of an unknown outcome -- and an assertion that it is one,
+    /// since the whole point of the variant is that it is handled differently
+    /// from a failure.
+    fn indeterminate_detail(error: BroadcastError) -> String {
+        match error {
+            BroadcastError::Indeterminate(detail) => detail,
+            other => panic!("expected an indeterminate outcome, got {other:?}"),
         }
     }
 
@@ -393,7 +469,7 @@ mod tests {
             .broadcast_tx(&sample_tx())
             .await
             .expect_err("no result for our transaction");
-        assert!(upstream_detail(error).contains("returned 0 results"));
+        assert!(indeterminate_detail(error).contains("returned 0 results"));
     }
 
     /// A txid that is not the one we hashed means the transaction on the
@@ -413,7 +489,7 @@ mod tests {
             .broadcast_tx(&tx)
             .await
             .expect_err("a foreign txid is not our transaction");
-        let detail = upstream_detail(error);
+        let detail = indeterminate_detail(error);
         assert!(detail.contains("deadbeef"), "{detail}");
         assert!(detail.contains(&tx.hash().encode()), "{detail}");
     }
@@ -468,7 +544,9 @@ mod tests {
             started.elapsed() < Duration::from_secs(10),
             "the deadline did not fire"
         );
-        assert!(upstream_detail(error).contains("total_timeout_seconds"));
+        // Unknown, not failed: the request was cancelled in flight, and a
+        // cancelled request says nothing about what the server did with it.
+        assert!(indeterminate_detail(error).contains("total_timeout_seconds"));
     }
 
     #[tokio::test]
@@ -493,6 +571,30 @@ mod tests {
         assert!(upstream_detail(error).contains("retries exhausted"));
     }
 
+    /// A connection that was refused delivered nothing, so it is a plain
+    /// failure: reporting it as an unknown outcome would have the service
+    /// reserve inputs that were demonstrably never spent, and a mapi-lite that
+    /// is simply down would eat the wallet.
+    #[tokio::test]
+    async fn sr_fund_011_an_unreachable_mapi_lite_is_a_failure_not_an_unknown_outcome() {
+        // A port nothing is listening on: the connection is refused rather
+        // than accepted and left hanging.
+        let mut config = MapiLiteConfig::for_base_url("http://127.0.0.1:1");
+        config.timeout_seconds = 2;
+        config.max_retries = 0;
+        config.total_timeout_seconds = 5;
+        let broadcaster = MapiBroadcaster::new(&config).expect("broadcaster builds");
+
+        let error = broadcaster
+            .broadcast_tx(&sample_tx())
+            .await
+            .expect_err("nothing is listening");
+        assert!(
+            matches!(error, BroadcastError::Upstream(_)),
+            "a refused connection took nothing, got {error:?}"
+        );
+    }
+
     #[tokio::test]
     async fn mapi_broadcaster_rejects_a_tampered_envelope() {
         let server = MockServer::start().await;
@@ -510,7 +612,10 @@ mod tests {
             .broadcast_tx(&tx)
             .await
             .expect_err("tampered");
-        assert!(upstream_detail(error).contains("signature"));
+        // Unknown rather than failed: an envelope arrived, so the server acted
+        // on the transaction, and this client simply cannot trust what it says
+        // about it.
+        assert!(indeterminate_detail(error).contains("signature"));
     }
 
     #[tokio::test]
@@ -564,7 +669,9 @@ mod tests {
             started.elapsed() < Duration::from_secs(3),
             "probe did not time out"
         );
-        assert!(!upstream_detail(error).is_empty());
+        // The variant is beside the point here -- a probe only answers
+        // reachable or not -- but it must carry a reason for the log.
+        assert!(!error.to_string().is_empty());
     }
 
     #[tokio::test]

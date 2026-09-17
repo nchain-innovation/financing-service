@@ -27,9 +27,11 @@ pub const MAPI_LITE: &str = "mapi-lite";
 
 /// Why a broadcast did not succeed.
 ///
-/// The split matters to a caller deciding what to do next: a rejection is the
-/// upstream's verdict on the transaction, an upstream error says nothing about
-/// the transaction at all.
+/// The split matters to a caller deciding what to do next, and to this service
+/// deciding what to believe about its own wallet. A rejection is the upstream's
+/// verdict on the transaction; an upstream error says nothing about the
+/// transaction at all; an indeterminate outcome says the transaction may be on
+/// the network and we cannot find out.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BroadcastError {
     /// The upstream answered and refused the transaction.
@@ -41,6 +43,14 @@ pub enum BroadcastError {
     /// The upstream could not be reached or did not answer usably: transport
     /// failure, HTTP error status, undecodable body, bad response signature.
     Upstream(String),
+    /// The transaction was handed to the upstream and its fate is unknown.
+    ///
+    /// Distinct from [`BroadcastError::Upstream`] because it is not a failure,
+    /// it is an absence of information, and the two call for opposite
+    /// handling. A transaction that never left cannot have spent anything; a
+    /// transaction that may have left may have spent its inputs, and the
+    /// service must not offer those inputs to the next funding request.
+    Indeterminate(String),
 }
 
 impl std::fmt::Display for BroadcastError {
@@ -51,6 +61,9 @@ impl std::fmt::Display for BroadcastError {
                 retryable,
             } => write!(f, "rejected: {description} (retryable: {retryable})"),
             BroadcastError::Upstream(detail) => write!(f, "upstream error: {detail}"),
+            BroadcastError::Indeterminate(detail) => {
+                write!(f, "outcome unknown: {detail}")
+            }
         }
     }
 }
@@ -73,8 +86,8 @@ pub trait TxBroadcaster: Send + Sync {
     async fn broadcast_tx(&self, tx: &Tx) -> Result<String, BroadcastError>;
 
     /// Reachability probe, used at startup and by `GET /ready`. Should be
-    /// cheap and bounded in time: the Docker health check allows three
-    /// seconds in total.
+    /// cheap and bounded in time: a readiness probe allows a few seconds in
+    /// total.
     async fn health_check(&self) -> Result<(), BroadcastError>;
 }
 

@@ -782,6 +782,38 @@ mod tests {
         (app, service)
     }
 
+    /// An app whose broadcaster reports every submit as an unknown outcome,
+    /// as a mapi-lite whose deadline expires does.
+    async fn build_app_with_uncertain_broadcaster() -> (
+        impl ActixService<Request, Response = ServiceResponse, Error = Error>,
+        Arc<Service>,
+    ) {
+        let config = test_config(&unique_dynamic_config_path());
+        let blockchain = test_blockchain_interface(&config).await;
+        let broadcaster = crate::test_support::UncertainBroadcaster::new();
+        let service = Arc::new(
+            Service::new_for_test_with_broadcaster(&config, blockchain, broadcaster).await,
+        );
+        let app_state = web::Data::new(AppState {
+            service: Arc::clone(&service),
+        });
+        let app = test::init_service(
+            App::new()
+                .app_data(app_state)
+                .service(index)
+                .service(health)
+                .service(ready)
+                .service(status)
+                .service(balance)
+                .service(get_funds)
+                .service(add_client)
+                .service(delete_client)
+                .service(get_address),
+        )
+        .await;
+        (app, service)
+    }
+
     fn fund_body(
         client_id: &str,
         satoshi: u64,
@@ -2031,5 +2063,64 @@ mod tests {
         )
         .await;
         assert_eq!(err.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ---- Unknown broadcast outcome (issue #66) ----
+
+    /// An unknown outcome gets its own code and its own status. A caller --
+    /// or a proxy that sees only the status -- must be able to tell it from
+    /// `broadcast_failed`, where nothing was spent and a plain retry is fine.
+    #[actix_web::test]
+    async fn sr_fund_011_fund_reports_an_unknown_outcome_as_504_not_502() {
+        let (app, _service) = build_app_with_uncertain_broadcaster().await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/fund")
+                .set_json(fund_body(TEST_CLIENT_ID, 123, 1, LOCKING_SCRIPT_HEX))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["code"], "broadcast_outcome_unknown");
+        let description = body["description"].as_str().expect("a description");
+        assert!(
+            description.contains("idempotency_key"),
+            "the caller is told how to retry safely: {description}"
+        );
+    }
+
+    /// The idempotency record is deliberately *not* released on this path.
+    /// The outcome is unknown, so answering a retry by funding again is the
+    /// one thing that must not happen; the caller is told the request is
+    /// still in progress until the record expires.
+    #[actix_web::test]
+    async fn sr_fund_011_an_unknown_outcome_does_not_release_the_idempotency_key() {
+        let (app, _service) = build_app_with_uncertain_broadcaster().await;
+        let mut body = fund_body(TEST_CLIENT_ID, 123, 1, LOCKING_SCRIPT_HEX);
+        body["idempotency_key"] = json!("unknown-outcome-1");
+
+        let first = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/fund")
+                .set_json(body.clone())
+                .to_request(),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::GATEWAY_TIMEOUT);
+
+        let retry = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/fund")
+                .set_json(body)
+                .to_request(),
+        )
+        .await;
+        assert_eq!(retry.status(), StatusCode::CONFLICT);
+        let retry_body: Value = test::read_body_json(retry).await;
+        assert_eq!(retry_body["code"], "key_in_progress");
     }
 }

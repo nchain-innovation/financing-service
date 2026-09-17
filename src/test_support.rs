@@ -383,6 +383,46 @@ impl TxBroadcaster for FailingBroadcaster {
     }
 }
 
+/// Broadcaster that reports an unknown outcome, as a mapi-lite whose submit
+/// deadline expires does.
+///
+/// It records the transactions it was handed, so a test can tell what the
+/// service believes was sent versus what it does with the wallet afterwards.
+pub struct UncertainBroadcaster {
+    handed: std::sync::Mutex<Vec<String>>,
+}
+
+impl UncertainBroadcaster {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            handed: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Txids of every transaction handed to this broadcaster, in order.
+    pub fn handed(&self) -> Vec<String> {
+        self.handed.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl TxBroadcaster for UncertainBroadcaster {
+    fn name(&self) -> &str {
+        "uncertain"
+    }
+
+    async fn broadcast_tx(&self, tx: &Tx) -> Result<String, BroadcastError> {
+        self.handed.lock().unwrap().push(tx.hash().encode());
+        Err(BroadcastError::Indeterminate(
+            "simulated submit deadline expiry".to_string(),
+        ))
+    }
+
+    async fn health_check(&self) -> Result<(), BroadcastError> {
+        Ok(())
+    }
+}
+
 /// Stands in for the mapi-lite broadcaster above the HTTP layer.
 ///
 /// It carries the mapi-lite name, so the service treats it as mapi-lite --
