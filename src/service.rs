@@ -15,7 +15,7 @@ use tokio::sync::{Mutex, RwLock};
 use crate::{
     address_watcher::AddressWatcher,
     blockchain_factory::{blockchain_factory, Backend},
-    broadcaster::{factory::broadcaster_factory, TxBroadcaster, MAPI_LITE},
+    broadcaster::{factory::broadcaster_factory, BroadcastError, TxBroadcaster, MAPI_LITE},
     client::{Client, FundRequest, FundingSpendPlan},
     config::{ClientConfig, Config},
     dynamic_config::DynamicConfig,
@@ -730,10 +730,37 @@ impl Service {
                 }
                 Ok(response)
             }
-            Err(description) => {
+            Err(error) => {
+                if error.code == ErrorCode::BroadcastOutcomeUnknown {
+                    Self::reserve_uncertain_funding(service, &prepared).await;
+                }
+                // Safe to run even after a reservation: a refresh restores
+                // what the chain reports minus anything still reserved.
                 let _ = Self::refresh_client_chain_state(service, &fund_request.client_id).await;
-                Err(description)
+                Err(error)
             }
+        }
+    }
+
+    /// Treat a prepared funding's inputs as spent although the broadcast
+    /// outcome is unknown.
+    ///
+    /// Called instead of [`Self::commit_prepared_funding`] when the
+    /// broadcaster could not say what became of the transaction. Failure to
+    /// apply it is logged rather than returned: the caller is already being
+    /// told its funding did not complete, and there is nothing it could do
+    /// with a second error.
+    async fn reserve_uncertain_funding(service: &Arc<Service>, prepared: &PreparedFunding) {
+        match service.client_handle(&prepared.client_id).await {
+            Some(client) => client
+                .write()
+                .await
+                .commit_uncertain_funding_spend(prepared.spend_plan.clone()),
+            None => log::warn!(
+                "cannot reserve the inputs of an uncertain funding transaction: unknown client_id \
+                 {}",
+                prepared.client_id
+            ),
         }
     }
 
@@ -781,6 +808,9 @@ impl Service {
                             combined.txs.extend(partial.txs);
                         }
                         Err(cause) => {
+                            if cause.code == ErrorCode::BroadcastOutcomeUnknown {
+                                Self::reserve_uncertain_funding(service, &prepared).await;
+                            }
                             if tx_index == 0 {
                                 resync_after_multiple_tx_failure(service, fund_request).await;
                                 return Err(MultipleTxFundError::complete(
@@ -833,17 +863,28 @@ impl Service {
             "funding tx hex = {}",
             tx_as_hexstr(&tx).map_err(CodedError::internal)?
         );
-        // The client sees a fixed code and message whatever the upstream said;
-        // the detail goes to the log, where an operator can act on it.
+        // The client sees a fixed message whatever the upstream said; the
+        // detail goes to the log, where an operator can act on it. The code
+        // does carry one distinction, because the caller's next move depends
+        // on it: a broadcast that failed spent nothing, a broadcast whose
+        // outcome is unknown may have spent everything.
         broadcaster.broadcast_tx(&tx).await.map_err(|e| {
             log::warn!(
                 "Failed to broadcast funding transaction via {}: {e}",
                 broadcaster.name()
             );
-            CodedError::new(
-                ErrorCode::BroadcastFailed,
-                "Failed to broadcast funding transaction.",
-            )
+            match e {
+                BroadcastError::Indeterminate(_) => CodedError::new(
+                    ErrorCode::BroadcastOutcomeUnknown,
+                    "The funding transaction was sent and its outcome is unknown; it may be on \
+                     the network. Do not retry with a new idempotency_key, which would risk \
+                     funding twice.",
+                ),
+                _ => CodedError::new(
+                    ErrorCode::BroadcastFailed,
+                    "Failed to broadcast funding transaction.",
+                ),
+            }
         })?;
         let hash = tx.hash();
         response.outpoints = (1..prepared.no_of_outpoints + 1)
@@ -1184,6 +1225,93 @@ mod tests {
         assert_eq!(response.outpoints.len(), 1);
         assert_eq!(broadcaster.broadcast_count(), 1);
         assert_eq!(blockchain.broadcast_count(), 0);
+    }
+
+    /// The defect in #66, end to end. A funding transaction is handed to the
+    /// broadcaster, the outcome is unknown, and the next funding request must
+    /// not spend the same input -- which would put a conflicting transaction
+    /// on the network for the first one's inputs.
+    ///
+    /// Both requests are identical, so if the second one selected the same
+    /// UTXO it would build a byte-identical transaction and hand over the same
+    /// txid. Different txids mean different inputs.
+    #[tokio::test]
+    async fn sr_fund_012_an_uncertain_broadcast_does_not_leave_its_input_spendable() {
+        use crate::test_support::{CountingBlockchain, UncertainBroadcaster};
+
+        let config = test_config(&unique_dynamic_config_path());
+        let blockchain = CountingBlockchain::new(&config).await;
+        let broadcaster = UncertainBroadcaster::new();
+        let service = service_with(&config, blockchain.clone(), broadcaster.clone()).await;
+
+        let request = sample_fund_request(TEST_CLIENT_ID);
+        let first = fund_single_transaction(&service, &request)
+            .await
+            .expect_err("an unknown outcome is not a success");
+        assert_eq!(first.code, ErrorCode::BroadcastOutcomeUnknown);
+
+        let second = fund_single_transaction(&service, &request)
+            .await
+            .expect_err("the second broadcast is equally uncertain");
+        assert_eq!(second.code, ErrorCode::BroadcastOutcomeUnknown);
+
+        let handed = broadcaster.handed();
+        assert_eq!(handed.len(), 2, "both attempts reached the broadcaster");
+        assert_ne!(
+            handed[0], handed[1],
+            "the second funding transaction spends the same input as the first, which the \
+             network can only treat as a conflict"
+        );
+    }
+
+    /// A broadcast that is *known* to have failed spent nothing, so its input
+    /// must stay available -- reserving there would strand funds for no
+    /// reason. The distinction is the whole point of the new variant.
+    #[tokio::test]
+    async fn sr_fund_012_a_failed_broadcast_leaves_its_input_spendable() {
+        use crate::test_support::{CountingBlockchain, FailingBroadcaster};
+
+        let config = test_config(&unique_dynamic_config_path());
+        let blockchain = CountingBlockchain::new(&config).await;
+        // fails from the first call
+        let broadcaster = FailingBroadcaster::new(0);
+        let service = service_with(&config, blockchain.clone(), broadcaster.clone()).await;
+
+        let request = sample_fund_request(TEST_CLIENT_ID);
+        let error = fund_single_transaction(&service, &request)
+            .await
+            .expect_err("the broadcast failed");
+        assert_eq!(error.code, ErrorCode::BroadcastFailed);
+
+        let client = service.client_handle(TEST_CLIENT_ID).await.unwrap();
+        assert_eq!(
+            client.read().await.reserved_outpoint_count(),
+            0,
+            "nothing reached the network, so nothing should be reserved"
+        );
+    }
+
+    /// The reservation has to survive the refresh that runs on the same error
+    /// path, or it would be undone the moment it was made.
+    #[tokio::test]
+    async fn sr_fund_012_the_reservation_survives_the_refresh_on_the_error_path() {
+        use crate::test_support::{CountingBlockchain, UncertainBroadcaster};
+
+        let config = test_config(&unique_dynamic_config_path());
+        let blockchain = CountingBlockchain::new(&config).await;
+        let broadcaster = UncertainBroadcaster::new();
+        let service = service_with(&config, blockchain.clone(), broadcaster.clone()).await;
+
+        let _ = fund_single_transaction(&service, &sample_fund_request(TEST_CLIENT_ID)).await;
+
+        let client = service.client_handle(TEST_CLIENT_ID).await.unwrap();
+        assert_eq!(client.read().await.reserved_outpoint_count(), 1);
+
+        // and an explicit refresh, as the periodic one does, does not free it
+        Service::refresh_client_chain_state(&service, TEST_CLIENT_ID)
+            .await
+            .expect("refresh succeeds");
+        assert_eq!(client.read().await.reserved_outpoint_count(), 1);
     }
 
     #[tokio::test]

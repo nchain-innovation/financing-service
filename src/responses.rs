@@ -29,8 +29,20 @@ pub enum ErrorCode {
     /// The request itself is malformed. Never retryable unchanged.
     InvalidRequest,
     /// The funding transaction was built and signed but the node rejected it
-    /// or was unreachable. The client's own retry may succeed.
+    /// or was unreachable. Nothing was spent, so the client's own retry may
+    /// succeed.
     BroadcastFailed,
+    /// The funding transaction was handed to the broadcaster and its fate is
+    /// unknown -- the submit deadline expired, or the answer could not be
+    /// read. It may be on the network.
+    ///
+    /// The service has already treated its inputs as spent, so its own wallet
+    /// is safe either way. A caller must not retry with a fresh
+    /// `idempotency_key`: that would fund a second time. Retrying with the
+    /// original `idempotency_key` is refused with `key_in_progress` until the
+    /// record expires, which is the honest answer -- the service does not know
+    /// the outcome either, and the chain is where to look for it.
+    BroadcastOutcomeUnknown,
     /// Some of the requested funding transactions broadcast and some did not.
     /// The successful ones are in the response body.
     PartialBroadcast,
@@ -73,8 +85,14 @@ impl ErrorCode {
             | ErrorCode::NoSuitableUtxo
             | ErrorCode::KeyInProgress
             | ErrorCode::IdempotencyKeyReused => StatusCode::CONFLICT,
-            // upstream node rejected the transaction or was unreachable
+            // upstream node rejected the transaction or was unreachable, so
+            // it never took it
             ErrorCode::BroadcastFailed => StatusCode::BAD_GATEWAY,
+            // the upstream may have taken the transaction and we cannot tell.
+            // A separate status from 502 on purpose: anything between the
+            // caller and this service that retries on a status alone must be
+            // able to see that this one is not a clean "it did not happen".
+            ErrorCode::BroadcastOutcomeUnknown => StatusCode::GATEWAY_TIMEOUT,
             ErrorCode::ChainUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             ErrorCode::Internal => StatusCode::INTERNAL_SERVER_ERROR,
             ErrorCode::Unauthorized => StatusCode::UNAUTHORIZED,
