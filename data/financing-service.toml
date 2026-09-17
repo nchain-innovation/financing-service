@@ -45,7 +45,8 @@ filename = "./data/dynamic.toml"
 
 # Optional. When present, funding transactions are broadcast through mapi-lite
 # instead of the [blockchain_interface] above; chain reads (balances, UTXOs)
-# still use [blockchain_interface]. GET /health then probes mapi-lite too.
+# still use [blockchain_interface]. GET /ready then probes mapi-lite too;
+# GET /health stays a pure liveness check.
 # Only base_url is required; the rest are the defaults.
 # [mapi_lite]
 # base_url = "http://127.0.0.1:8080"

@@ -188,9 +188,9 @@ pub struct MapiLiteConfig {
     /// Per-request timeout for transaction submits, in seconds.
     #[serde(default = "default_mapi_lite_timeout_seconds")]
     pub timeout_seconds: u64,
-    /// Timeout for the mapi-lite probe behind `GET /health`, in seconds. Must
-    /// be under the Docker health check's three seconds, and is rejected at
-    /// startup otherwise: a probe slower than the health check's own timeout
+    /// Timeout for the mapi-lite probe behind `GET /ready`, in seconds. Must
+    /// be under three seconds, and is rejected at startup otherwise: a probe
+    /// slower than the few seconds a readiness probe allows
     /// would mark the container unhealthy even while mapi-lite is fine.
     #[serde(default = "default_mapi_lite_health_timeout_seconds")]
     pub health_timeout_seconds: u64,
@@ -225,9 +225,11 @@ fn default_mapi_lite_total_timeout_seconds() -> u64 {
     45
 }
 
-/// `health_timeout_seconds` has to leave the Docker health check
-/// (`--timeout=3s`) room to receive the answer, so it is rejected at or above
-/// that bound rather than only documented.
+/// `/ready` answers orchestrator readiness probes, which allow a probe a few
+/// seconds at most (Docker's health check defaults to `--timeout=3s`). A
+/// mapi-lite probe slower than that is killed by the caller rather than
+/// answered, marking the instance unready on every check even while mapi-lite
+/// is fine -- so the bound is rejected at startup rather than only documented.
 const MAPI_LITE_HEALTH_TIMEOUT_LIMIT_SECONDS: u64 = 3;
 
 impl MapiLiteConfig {
@@ -286,8 +288,8 @@ impl MapiLiteConfig {
         if self.health_timeout_seconds >= MAPI_LITE_HEALTH_TIMEOUT_LIMIT_SECONDS {
             return Err(format!(
                 "mapi_lite.health_timeout_seconds must be less than \
-                 {MAPI_LITE_HEALTH_TIMEOUT_LIMIT_SECONDS}, so GET /health answers inside the \
-                 Docker health check's own timeout, got {}",
+                 {MAPI_LITE_HEALTH_TIMEOUT_LIMIT_SECONDS}, so GET /ready answers inside a \
+                 readiness probe's own timeout, got {}",
                 self.health_timeout_seconds
             ));
         }
@@ -1127,12 +1129,12 @@ filename = "./data/dynamic.toml"
             .contains("mapi_lite.total_timeout_seconds"));
     }
 
-    /// A probe slower than the Docker health check's own `--timeout=3s` would
-    /// mark the container unhealthy on every check even while mapi-lite is
-    /// fine, so the documented ceiling is enforced rather than just written
-    /// down.
+    /// A mapi-lite probe slower than the few seconds a readiness probe allows
+    /// is killed by the caller rather than answered, marking the instance
+    /// unready on every check even while mapi-lite is fine. So the documented
+    /// ceiling is enforced rather than just written down.
     #[test]
-    fn sr_cfg_008_mapi_lite_validate_rejects_a_health_timeout_the_health_check_cannot_wait_for() {
+    fn sr_cfg_008_mapi_lite_validate_rejects_a_health_timeout_a_probe_cannot_wait_for() {
         for seconds in [3, 4, 10] {
             let mut config = MapiLiteConfig::for_base_url("http://127.0.0.1:8080");
             config.health_timeout_seconds = seconds;

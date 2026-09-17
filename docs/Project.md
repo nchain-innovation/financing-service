@@ -33,8 +33,9 @@ Admin       ──REST──▶       │                │
                             │                │              └── MapiBroadcaster (uls-client ──▶ mapi-lite; when [mapi_lite] is set)
                             │                ├── Per-client wallets (Arc<RwLock<Client>>)
                             │                └── dynamic.toml (runtime clients)
-                            ├── rate_limit (per-IP, /health exempt)
-                            └── /health (liveness, no auth; probes mapi-lite when configured)
+                            ├── rate_limit (per-IP, /health and /ready exempt)
+                            ├── /health (liveness, no auth; no upstream checks)
+                            └── /ready  (readiness, no auth; probes mapi-lite when configured)
 ```
 
 | Module | Role |
@@ -66,9 +67,9 @@ Admin       ──REST──▶       │                │
 * Optional `admin_api_key` for `POST /client`
 * Secret references via `env:VAR`, environment overrides, and `wif_env` / `api_key_env` on `POST /client`
 * Optional OpenTelemetry trace export via OTLP (configurable, disabled by default)
-* Configurable per-IP HTTP rate limiting with `/health` exempt
+* Configurable per-IP HTTP rate limiting with `/health` and `/ready` exempt
 * Balance checks against total wallet balance; funding combines multiple UTXOs when needed; balance endpoint refreshes from chain on each request; `multiple_tx` partial failures return structured successful transaction data; concurrent fund requests for the same client use read-only planning and commit UTXO updates only after broadcast
-* Optional mapi-lite transaction broadcaster (`[mapi_lite]`): broadcasts go to mapi-lite, reads stay on the blockchain interface, `/health` probes mapi-lite and returns 503 when it is down, `/status` names the broadcaster, startup logs the selection
+* Optional mapi-lite transaction broadcaster (`[mapi_lite]`): broadcasts go to mapi-lite, reads stay on the blockchain interface, `/ready` probes mapi-lite and returns 503 when it is down while `/health` stays up, `/status` names the broadcaster, startup logs the selection
 * Docker image with `/health` liveness check
 * CI: build, test, `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo audit`
 * `chain-gang` from crates.io at an exact release, with a committed `Cargo.lock`, for reproducible builds

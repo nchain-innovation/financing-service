@@ -21,7 +21,7 @@ The FS is designed to be as simple as possible, in that light it:
 * FS does not access the client's key, instead the client provides the locking script (script_pubkey).
 
 * FS accesses the blockchain through WhatsOnChain, UTXO as a Service (UaaS), or a node's JSON-RPC endpoint. The first two reach mainnet, testnet and STN; the `rpc` interface additionally reaches regtest, and works against any node you control. See [which interface reaches which network](docs/Configuration.md#which-interface-reaches-which-network).
-* FS can optionally broadcast funding transactions through [mapi-lite](https://github.com/nchain-innovation/mapi-lite) instead of the blockchain interface. Configure a `[mapi_lite]` section and transactions go to mapi-lite while chain reads stay where they were; leave it out and nothing changes. When configured, mapi-lite is part of `GET /health`. See [Configuration](docs/Configuration.md#mapi_lite). Building with this integration needs SSH access to the private mapi-lite repository — see [Dependencies](docs/Dependencies.md).
+* FS can optionally broadcast funding transactions through [mapi-lite](https://github.com/nchain-innovation/mapi-lite) instead of the blockchain interface. Configure a `[mapi_lite]` section and transactions go to mapi-lite while chain reads stay where they were; leave it out and nothing changes. When configured, mapi-lite is part of `GET /ready`, the readiness probe; `GET /health` stays a pure liveness check. See [Configuration](docs/Configuration.md#mapi_lite). Building with this integration needs SSH access to the private mapi-lite repository — see [Dependencies](docs/Dependencies.md).
 * FS maintains an in-memory UTXO cache per client, refreshed periodically from the blockchain and before funding and balance requests. Clients added at runtime are persisted to a dynamic config file.
 * FS is configurable; it reads its configuration on startup.
 
@@ -84,7 +84,7 @@ To build the docker image associated with the service run the following comand i
 ```bash
 ./build.sh
 ```
-This builds the Docker image `financing-service-rust`. The image includes a health check against `GET /health`.
+This builds the Docker image `financing-service-rust`. The image includes a health check against `GET /health`, the liveness endpoint.
 ### 2) To Run the Image
 To start the Docker container:
 ```bash

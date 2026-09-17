@@ -386,7 +386,7 @@ impl TxBroadcaster for FailingBroadcaster {
 /// Stands in for the mapi-lite broadcaster above the HTTP layer.
 ///
 /// It carries the mapi-lite name, so the service treats it as mapi-lite --
-/// `GET /health` probes it and `/status` reports it -- while the probe's
+/// `GET /ready` probes it and `/status` reports it -- while the probe's
 /// verdict is whatever the test asked for. The real client against a mock
 /// server is tested in `broadcaster::mapi`.
 pub struct StubMapiBroadcaster {
