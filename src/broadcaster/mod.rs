@@ -88,7 +88,10 @@ mod tests {
             description: "txn-mempool-conflict".to_string(),
             retryable: false,
         };
-        assert_eq!(rejected.to_string(), "rejected: txn-mempool-conflict (retryable: false)");
+        assert_eq!(
+            rejected.to_string(),
+            "rejected: txn-mempool-conflict (retryable: false)"
+        );
         let upstream = BroadcastError::Upstream("http status 503".to_string());
         assert_eq!(upstream.to_string(), "upstream error: http status 503");
     }

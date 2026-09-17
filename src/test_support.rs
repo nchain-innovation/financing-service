@@ -371,7 +371,9 @@ impl TxBroadcaster for FailingBroadcaster {
     async fn broadcast_tx(&self, tx: &Tx) -> Result<String, BroadcastError> {
         let n = self.broadcasts.fetch_add(1, Ordering::SeqCst) + 1;
         if n > self.fail_after {
-            return Err(BroadcastError::Upstream("simulated broadcast failure".to_string()));
+            return Err(BroadcastError::Upstream(
+                "simulated broadcast failure".to_string(),
+            ));
         }
         Ok(tx.hash().encode())
     }

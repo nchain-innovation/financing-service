@@ -63,8 +63,15 @@ mod tests {
                 &line[start..end]
             })
             .collect();
-        assert_eq!(revs.len(), 2, "expected uls-client and uls-core pins: {revs:?}");
-        assert_eq!(revs[0], revs[1], "uls-client and uls-core pin different revs");
+        assert_eq!(
+            revs.len(),
+            2,
+            "expected uls-client and uls-core pins: {revs:?}"
+        );
+        assert_eq!(
+            revs[0], revs[1],
+            "uls-client and uls-core pin different revs"
+        );
         assert!(
             manifest.contains("git = \"ssh://git@github.com/nchain-innovation/mapi-lite.git\""),
             "cargo needs the ssh:// URL form for the private mapi-lite repo"

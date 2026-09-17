@@ -74,7 +74,9 @@ mod tests {
                 })
             })
             .filter_map(|entry| {
-                entry.lines().find_map(|line| line.trim().strip_prefix("source = "))
+                entry
+                    .lines()
+                    .find_map(|line| line.trim().strip_prefix("source = "))
             })
             .collect();
 

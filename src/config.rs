@@ -1064,7 +1064,10 @@ filename = "./data/dynamic.toml"
         let error = MapiLiteConfig::for_base_url(" ftp://mapi ")
             .validate()
             .expect_err("not an http URL");
-        assert!(error.contains("must start with http:// or https://"), "{error}");
+        assert!(
+            error.contains("must start with http:// or https://"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1077,7 +1080,10 @@ filename = "./data/dynamic.toml"
         assert_eq!(mapi_lite.base_url, "https://mapi.example:8443/");
         assert_eq!(mapi_lite.auth_token.as_deref(), Some("Bearer secret"));
         assert_eq!(mapi_lite.timeout(), std::time::Duration::from_secs(5));
-        assert_eq!(mapi_lite.health_timeout(), std::time::Duration::from_secs(1));
+        assert_eq!(
+            mapi_lite.health_timeout(),
+            std::time::Duration::from_secs(1)
+        );
         assert_eq!(mapi_lite.max_retries, 0);
         assert!(mapi_lite.validate().is_ok());
     }
@@ -1101,15 +1107,24 @@ filename = "./data/dynamic.toml"
     fn sr_cfg_008_mapi_lite_validate_rejects_zero_timeouts() {
         let mut config = MapiLiteConfig::for_base_url("http://127.0.0.1:8080");
         config.timeout_seconds = 0;
-        assert!(config.validate().unwrap_err().contains("mapi_lite.timeout_seconds"));
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .contains("mapi_lite.timeout_seconds"));
 
         let mut config = MapiLiteConfig::for_base_url("http://127.0.0.1:8080");
         config.health_timeout_seconds = 0;
-        assert!(config.validate().unwrap_err().contains("mapi_lite.health_timeout_seconds"));
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .contains("mapi_lite.health_timeout_seconds"));
 
         let mut config = MapiLiteConfig::for_base_url("http://127.0.0.1:8080");
         config.total_timeout_seconds = 0;
-        assert!(config.validate().unwrap_err().contains("mapi_lite.total_timeout_seconds"));
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .contains("mapi_lite.total_timeout_seconds"));
     }
 
     /// A probe slower than the Docker health check's own `--timeout=3s` would
@@ -1121,8 +1136,13 @@ filename = "./data/dynamic.toml"
         for seconds in [3, 4, 10] {
             let mut config = MapiLiteConfig::for_base_url("http://127.0.0.1:8080");
             config.health_timeout_seconds = seconds;
-            let error = config.validate().expect_err("a health timeout at or above 3s is rejected");
-            assert!(error.contains("must be less than 3"), "for {seconds}s: {error}");
+            let error = config
+                .validate()
+                .expect_err("a health timeout at or above 3s is rejected");
+            assert!(
+                error.contains("must be less than 3"),
+                "for {seconds}s: {error}"
+            );
         }
 
         let mut config = MapiLiteConfig::for_base_url("http://127.0.0.1:8080");
@@ -1138,7 +1158,10 @@ filename = "./data/dynamic.toml"
         config.timeout_seconds = 30;
         config.total_timeout_seconds = 10;
         let error = config.validate().expect_err("no attempt can finish");
-        assert!(error.contains("must be at least timeout_seconds"), "{error}");
+        assert!(
+            error.contains("must be at least timeout_seconds"),
+            "{error}"
+        );
 
         config.total_timeout_seconds = 30;
         assert!(config.validate().is_ok());
@@ -1189,7 +1212,10 @@ filename = "./data/dynamic.toml"
         unsafe { env::remove_var("FS_MAPI_LITE_AUTH_TOKEN") };
         let config = config_with_mapi_lite(Some("env:FS_TEST_MAPI_TOKEN"));
         let resolved = config.resolve_secrets().unwrap();
-        assert_eq!(resolved.mapi_lite.unwrap().auth_token.as_deref(), Some("Bearer from-env"));
+        assert_eq!(
+            resolved.mapi_lite.unwrap().auth_token.as_deref(),
+            Some("Bearer from-env")
+        );
         unsafe { env::remove_var("FS_TEST_MAPI_TOKEN") };
     }
 
@@ -1199,7 +1225,10 @@ filename = "./data/dynamic.toml"
         unsafe { env::set_var("FS_MAPI_LITE_AUTH_TOKEN", "Bearer override") };
         let config = config_with_mapi_lite(Some("env:SHOULD_NOT_BE_USED"));
         let resolved = config.resolve_secrets().unwrap();
-        assert_eq!(resolved.mapi_lite.unwrap().auth_token.as_deref(), Some("Bearer override"));
+        assert_eq!(
+            resolved.mapi_lite.unwrap().auth_token.as_deref(),
+            Some("Bearer override")
+        );
         unsafe { env::remove_var("FS_MAPI_LITE_AUTH_TOKEN") };
     }
 

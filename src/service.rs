@@ -836,7 +836,10 @@ impl Service {
         // The client sees a fixed code and message whatever the upstream said;
         // the detail goes to the log, where an operator can act on it.
         broadcaster.broadcast_tx(&tx).await.map_err(|e| {
-            log::warn!("Failed to broadcast funding transaction via {}: {e}", broadcaster.name());
+            log::warn!(
+                "Failed to broadcast funding transaction via {}: {e}",
+                broadcaster.name()
+            );
             CodedError::new(
                 ErrorCode::BroadcastFailed,
                 "Failed to broadcast funding transaction.",
@@ -1256,7 +1259,10 @@ mod tests {
         let blockchain = test_blockchain_interface(&config).await;
         let unhealthy = service_with(&config, blockchain, StubMapiBroadcaster::new(false)).await;
         let probe = unhealthy.mapi_lite_health().await;
-        assert!(matches!(probe, Some(Err(ref detail)) if detail.contains("503")), "{probe:?}");
+        assert!(
+            matches!(probe, Some(Err(ref detail)) if detail.contains("503")),
+            "{probe:?}"
+        );
     }
 
     /// `/health` is unauthenticated and rate-limit exempt, so its probe must
@@ -1282,6 +1288,10 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(1100)).await;
         assert_eq!(service.mapi_lite_health().await, Some(Ok(())));
-        assert_eq!(broadcaster.probe_count(), 2, "a stale verdict should be refreshed");
+        assert_eq!(
+            broadcaster.probe_count(),
+            2,
+            "a stale verdict should be refreshed"
+        );
     }
 }

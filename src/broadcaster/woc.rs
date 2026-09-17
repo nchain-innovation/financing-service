@@ -39,12 +39,18 @@ impl TxBroadcaster for WocBroadcaster {
     async fn broadcast_tx(&self, tx: &Tx) -> Result<String, BroadcastError> {
         // chain-gang's interfaces do not distinguish a rejection from a
         // transport failure in their error type, so everything is upstream.
-        self.inner.broadcast_tx(tx).await.map_err(|e| BroadcastError::Upstream(e.to_string()))?;
+        self.inner
+            .broadcast_tx(tx)
+            .await
+            .map_err(|e| BroadcastError::Upstream(e.to_string()))?;
         Ok(tx.hash().encode())
     }
 
     async fn health_check(&self) -> Result<(), BroadcastError> {
-        self.inner.status().await.map_err(|e| BroadcastError::Upstream(e.to_string()))
+        self.inner
+            .status()
+            .await
+            .map_err(|e| BroadcastError::Upstream(e.to_string()))
     }
 }
 

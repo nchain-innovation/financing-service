@@ -47,8 +47,11 @@ pub struct MapiBroadcaster {
 impl MapiBroadcaster {
     /// Build a broadcaster for the server named by `config`.
     pub fn new(config: &MapiLiteConfig) -> Result<Self, String> {
-        let submit = Self::client(config, config.timeout())?
-            .retry(config.max_retries, RETRY_BACKOFF_BASE, RETRY_BACKOFF_CAP);
+        let submit = Self::client(config, config.timeout())?.retry(
+            config.max_retries,
+            RETRY_BACKOFF_BASE,
+            RETRY_BACKOFF_CAP,
+        );
         // fee_quote does not retry, so the probe needs no retry settings.
         let probe = Self::client(config, config.health_timeout())?;
         Ok(Self {
@@ -271,7 +274,10 @@ mod tests {
             .mount(&server)
             .await;
 
-        let txid = broadcaster(&server).broadcast_tx(&tx).await.expect("accepted");
+        let txid = broadcaster(&server)
+            .broadcast_tx(&tx)
+            .await
+            .expect("accepted");
         assert_eq!(txid, expected);
 
         // The body is a one-element batch carrying the raw transaction hex,
@@ -312,11 +318,17 @@ mod tests {
         let tx = sample_tx();
         Mock::given(method("POST"))
             .and(path("/mapi/txs"))
-            .respond_with(ok(txs_payload(success(&tx.hash().encode(), "Already known"))))
+            .respond_with(ok(txs_payload(success(
+                &tx.hash().encode(),
+                "Already known",
+            ))))
             .mount(&server)
             .await;
 
-        let txid = broadcaster(&server).broadcast_tx(&tx).await.expect("known is fine");
+        let txid = broadcaster(&server)
+            .broadcast_tx(&tx)
+            .await
+            .expect("known is fine");
         assert_eq!(txid, tx.hash().encode());
     }
 
@@ -337,14 +349,20 @@ mod tests {
             .mount(&server)
             .await;
 
-        let error = broadcaster(&server).broadcast_tx(&tx).await.expect_err("rejected");
+        let error = broadcaster(&server)
+            .broadcast_tx(&tx)
+            .await
+            .expect_err("rejected");
 
         match error {
             BroadcastError::Rejected {
                 description,
                 retryable,
             } => {
-                assert!(description.contains("txn-mempool-conflict"), "{description}");
+                assert!(
+                    description.contains("txn-mempool-conflict"),
+                    "{description}"
+                );
                 assert!(description.contains("deadbeef"), "{description}");
                 assert!(!retryable);
             }
@@ -442,8 +460,14 @@ mod tests {
         let broadcaster = MapiBroadcaster::new(&config).expect("broadcaster builds");
 
         let started = std::time::Instant::now();
-        let error = broadcaster.broadcast_tx(&sample_tx()).await.expect_err("deadline");
-        assert!(started.elapsed() < Duration::from_secs(10), "the deadline did not fire");
+        let error = broadcaster
+            .broadcast_tx(&sample_tx())
+            .await
+            .expect_err("deadline");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the deadline did not fire"
+        );
         assert!(upstream_detail(error).contains("total_timeout_seconds"));
     }
 
@@ -462,7 +486,10 @@ mod tests {
         config.max_retries = 1;
         let broadcaster = MapiBroadcaster::new(&config).expect("broadcaster builds");
 
-        let error = broadcaster.broadcast_tx(&sample_tx()).await.expect_err("exhausted");
+        let error = broadcaster
+            .broadcast_tx(&sample_tx())
+            .await
+            .expect_err("exhausted");
         assert!(upstream_detail(error).contains("retries exhausted"));
     }
 
@@ -479,7 +506,10 @@ mod tests {
             .mount(&server)
             .await;
 
-        let error = broadcaster(&server).broadcast_tx(&tx).await.expect_err("tampered");
+        let error = broadcaster(&server)
+            .broadcast_tx(&tx)
+            .await
+            .expect_err("tampered");
         assert!(upstream_detail(error).contains("signature"));
     }
 
@@ -505,7 +535,10 @@ mod tests {
             .mount(&server)
             .await;
 
-        let error = broadcaster(&server).health_check().await.expect_err("unhealthy");
+        let error = broadcaster(&server)
+            .health_check()
+            .await
+            .expect_err("unhealthy");
         assert!(upstream_detail(error).contains("503"));
     }
 
@@ -523,8 +556,14 @@ mod tests {
         let broadcaster = MapiBroadcaster::new(&config).expect("broadcaster builds");
 
         let started = std::time::Instant::now();
-        let error = broadcaster.health_check().await.expect_err("a slow upstream is unhealthy");
-        assert!(started.elapsed() < Duration::from_secs(3), "probe did not time out");
+        let error = broadcaster
+            .health_check()
+            .await
+            .expect_err("a slow upstream is unhealthy");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "probe did not time out"
+        );
         assert!(!upstream_detail(error).is_empty());
     }
 

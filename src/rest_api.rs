@@ -126,8 +126,9 @@ pub async fn health(data: web::Data<AppState>) -> impl Responder {
         Some(Ok(())) => json_ok(&HealthResponse::mapi_lite_ok()),
         Some(Err(error)) => {
             log::warn!("mapi-lite health probe failed: {error}");
-            HttpResponse::ServiceUnavailable()
-                .json(HealthResponse::mapi_lite_unhealthy("mapi-lite probe failed"))
+            HttpResponse::ServiceUnavailable().json(HealthResponse::mapi_lite_unhealthy(
+                "mapi-lite probe failed",
+            ))
         }
     }
 }
@@ -814,7 +815,9 @@ mod tests {
         assert_eq!(body["mapi_lite"]["ok"], false);
         // The detail is generic. /health answers unauthenticated callers, and
         // the upstream error it replaces carries the mapi-lite URL.
-        let detail = body["mapi_lite"]["detail"].as_str().expect("a detail string");
+        let detail = body["mapi_lite"]["detail"]
+            .as_str()
+            .expect("a detail string");
         assert_eq!(detail, "mapi-lite probe failed");
     }
 
