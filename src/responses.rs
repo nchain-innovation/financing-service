@@ -125,14 +125,53 @@ impl std::fmt::Display for CodedError {
     }
 }
 
+/// One component's verdict inside a health response.
+#[derive(Serialize)]
+pub struct CheckResult {
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// Body of `GET /health`.
+///
+/// Without mapi-lite configured this is `{"status":"ok"}`, unchanged from
+/// before the integration existed. With mapi-lite configured the probe's
+/// verdict is added under `mapi_lite`, and `status` becomes `"unhealthy"`
+/// (with HTTP 503) when the probe fails.
 #[derive(Serialize)]
 pub struct HealthResponse {
     pub status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mapi_lite: Option<CheckResult>,
 }
 
 impl HealthResponse {
     pub fn ok() -> Self {
-        Self { status: "ok" }
+        Self {
+            status: "ok",
+            mapi_lite: None,
+        }
+    }
+
+    pub fn mapi_lite_ok() -> Self {
+        Self {
+            status: "ok",
+            mapi_lite: Some(CheckResult {
+                ok: true,
+                detail: None,
+            }),
+        }
+    }
+
+    pub fn mapi_lite_unhealthy(detail: impl Into<String>) -> Self {
+        Self {
+            status: "unhealthy",
+            mapi_lite: Some(CheckResult {
+                ok: false,
+                detail: Some(detail.into()),
+            }),
+        }
     }
 }
 
@@ -152,6 +191,9 @@ pub struct StatusResponse {
     pub version: String,
     pub blockchain_status: BlockchainConnectionStatus,
     pub blockchain_update_time: String,
+    /// Where funding transactions are sent: the configured `interface_type`
+    /// (`woc` in production) or `mapi-lite`.
+    pub broadcaster: String,
 }
 
 #[derive(Serialize)]
@@ -357,6 +399,31 @@ mod tests {
         assert_eq!(error.to_string(), "node unreachable");
         let response = coded_error_response(error);
         assert_eq!(response.status(), actix_http::StatusCode::BAD_GATEWAY);
+    }
+
+    /// The plain `/health` body is a contract with container orchestration,
+    /// so the mapi-lite check must not leak into it when unconfigured.
+    #[test]
+    fn health_response_without_mapi_lite_is_exactly_status_ok() {
+        assert_eq!(
+            serde_json::to_value(HealthResponse::ok()).unwrap(),
+            serde_json::json!({ "status": "ok" })
+        );
+    }
+
+    #[test]
+    fn health_response_with_mapi_lite_carries_the_check() {
+        assert_eq!(
+            serde_json::to_value(HealthResponse::mapi_lite_ok()).unwrap(),
+            serde_json::json!({ "status": "ok", "mapi_lite": { "ok": true } })
+        );
+        assert_eq!(
+            serde_json::to_value(HealthResponse::mapi_lite_unhealthy("503")).unwrap(),
+            serde_json::json!({
+                "status": "unhealthy",
+                "mapi_lite": { "ok": false, "detail": "503" }
+            })
+        );
     }
 
     #[test]

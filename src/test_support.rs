@@ -6,11 +6,13 @@ use std::sync::{
 use async_trait::async_trait;
 use chain_gang::{
     interface::{Balance, BlockchainInterface, TestInterface, Utxo, UtxoEntry},
-    messages::{BlockHeader, Tx},
+    messages::{BlockHeader, OutPoint, Tx, TxIn, TxOut},
     network::Network,
-    util::ChainGangError,
+    script::Script,
+    util::{ChainGangError, Hash256},
 };
 
+use crate::broadcaster::{BroadcastError, TxBroadcaster, MAPI_LITE};
 use crate::config::{BlockchainInterfaceConfig, ClientConfig, Config, DynamicConfigConfig};
 
 /// Serialises the tests that mutate environment variables. The environment is
@@ -30,6 +32,32 @@ pub const TEST_WIF: &str = "cTYmKQzX3CvHJAxe2sctsQaHG8ktiEnpXgyyycVXGg5pRcLJEeLd
 pub const TEST_CLIENT_ID: &str = "id1";
 pub const TEST_ADDRESS: &str = "n1jaAsKZfE6kufLy5DAtAyQ1RzGXwMeNAF";
 pub const LOCKING_SCRIPT_HEX: &str = "76a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac";
+
+/// Signs the envelopes a mock mapi-lite returns. Any valid WIF will do: the
+/// client verifies a response against the `publicKey` the envelope itself
+/// carries, so a self-signed envelope verifies.
+pub const MAPI_TEST_SIGNER_WIF: &str = "KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgd9M7rFU73sVHnoWn";
+
+/// A minimal spend built with chain-gang, so its bytes genuinely serialize
+/// and hash rather than only looking like a transaction.
+pub fn sample_tx() -> Tx {
+    Tx {
+        version: 2,
+        inputs: vec![TxIn {
+            prev_output: OutPoint {
+                hash: Hash256([7u8; 32]),
+                index: 0,
+            },
+            unlock_script: Script(vec![0x51]),
+            sequence: 0xffff_ffff,
+        }],
+        outputs: vec![TxOut {
+            satoshis: 1_000,
+            lock_script: Script(vec![0x51]),
+        }],
+        lock_time: 0,
+    }
+}
 
 pub fn test_config(dynamic_filename: &str) -> Config {
     test_config_with_keys(dynamic_filename, None, None)
@@ -280,5 +308,130 @@ impl BlockchainInterface for FailingBroadcastBlockchain {
 
     async fn get_block_headers(&self) -> Result<String, ChainGangError> {
         self.inner.lock().await.get_block_headers().await
+    }
+}
+
+/// Broadcaster that counts calls and touches no network.
+///
+/// Paired with [`CountingBlockchain`] as the read interface, it shows which of
+/// the two a funding call actually broadcast through.
+pub struct CountingBroadcaster {
+    broadcasts: AtomicU32,
+}
+
+impl CountingBroadcaster {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            broadcasts: AtomicU32::new(0),
+        })
+    }
+
+    pub fn broadcast_count(&self) -> u32 {
+        self.broadcasts.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl TxBroadcaster for CountingBroadcaster {
+    fn name(&self) -> &str {
+        "counting"
+    }
+
+    async fn broadcast_tx(&self, tx: &Tx) -> Result<String, BroadcastError> {
+        self.broadcasts.fetch_add(1, Ordering::SeqCst);
+        Ok(tx.hash().encode())
+    }
+
+    async fn health_check(&self) -> Result<(), BroadcastError> {
+        Ok(())
+    }
+}
+
+/// Broadcaster that fails after a configured number of successes.
+pub struct FailingBroadcaster {
+    fail_after: u32,
+    broadcasts: AtomicU32,
+}
+
+impl FailingBroadcaster {
+    pub fn new(fail_after: u32) -> Arc<Self> {
+        Arc::new(Self {
+            fail_after,
+            broadcasts: AtomicU32::new(0),
+        })
+    }
+}
+
+#[async_trait]
+impl TxBroadcaster for FailingBroadcaster {
+    fn name(&self) -> &str {
+        "failing"
+    }
+
+    async fn broadcast_tx(&self, tx: &Tx) -> Result<String, BroadcastError> {
+        let n = self.broadcasts.fetch_add(1, Ordering::SeqCst) + 1;
+        if n > self.fail_after {
+            return Err(BroadcastError::Upstream(
+                "simulated broadcast failure".to_string(),
+            ));
+        }
+        Ok(tx.hash().encode())
+    }
+
+    async fn health_check(&self) -> Result<(), BroadcastError> {
+        Ok(())
+    }
+}
+
+/// Stands in for the mapi-lite broadcaster above the HTTP layer.
+///
+/// It carries the mapi-lite name, so the service treats it as mapi-lite --
+/// `GET /health` probes it and `/status` reports it -- while the probe's
+/// verdict is whatever the test asked for. The real client against a mock
+/// server is tested in `broadcaster::mapi`.
+pub struct StubMapiBroadcaster {
+    healthy: bool,
+    broadcasts: AtomicU32,
+    probes: AtomicU32,
+}
+
+impl StubMapiBroadcaster {
+    pub fn new(healthy: bool) -> Arc<Self> {
+        Arc::new(Self {
+            healthy,
+            broadcasts: AtomicU32::new(0),
+            probes: AtomicU32::new(0),
+        })
+    }
+
+    pub fn broadcast_count(&self) -> u32 {
+        self.broadcasts.load(Ordering::SeqCst)
+    }
+
+    /// How many health probes actually reached the broadcaster, so a test can
+    /// tell a cached verdict from a fresh one.
+    pub fn probe_count(&self) -> u32 {
+        self.probes.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl TxBroadcaster for StubMapiBroadcaster {
+    fn name(&self) -> &str {
+        MAPI_LITE
+    }
+
+    async fn broadcast_tx(&self, tx: &Tx) -> Result<String, BroadcastError> {
+        self.broadcasts.fetch_add(1, Ordering::SeqCst);
+        Ok(tx.hash().encode())
+    }
+
+    async fn health_check(&self) -> Result<(), BroadcastError> {
+        self.probes.fetch_add(1, Ordering::SeqCst);
+        if self.healthy {
+            Ok(())
+        } else {
+            Err(BroadcastError::Upstream("http status 503".to_string()))
+        }
     }
 }

@@ -42,6 +42,76 @@ mod tests {
         );
     }
 
+    /// The line an operator reads to learn where funding transactions go.
+    #[test]
+    fn sr_bchn_010_main_logs_which_broadcaster_is_in_use() {
+        let source = include_str!("main.rs");
+        assert!(source.contains("describe_broadcaster(&config)"));
+    }
+
+    /// uls-client and uls-core share types; two revisions would give two
+    /// incompatible sets. Both pins in the manifest must name one commit.
+    #[test]
+    fn sr_bchn_009_uls_client_and_uls_core_are_pinned_to_one_mapi_lite_revision() {
+        let manifest = std::fs::read_to_string("Cargo.toml").unwrap();
+        let revs: Vec<&str> = manifest
+            .lines()
+            .filter(|line| line.starts_with("uls-client") || line.starts_with("uls-core"))
+            .map(|line| {
+                let start = line.find("rev = \"").expect("a rev pin") + "rev = \"".len();
+                let end = line[start..].find('"').expect("closing quote") + start;
+                &line[start..end]
+            })
+            .collect();
+        assert_eq!(
+            revs.len(),
+            2,
+            "expected uls-client and uls-core pins: {revs:?}"
+        );
+        assert_eq!(
+            revs[0], revs[1],
+            "uls-client and uls-core pin different revs"
+        );
+        assert!(
+            manifest.contains("git = \"ssh://git@github.com/nchain-innovation/mapi-lite.git\""),
+            "cargo needs the ssh:// URL form for the private mapi-lite repo"
+        );
+    }
+
+    /// The private mapi-lite repo is fetched by the system git so the
+    /// developer's (or CI's) ssh-agent authenticates it.
+    #[test]
+    fn sr_nfr_009_cargo_fetches_git_dependencies_with_the_system_git() {
+        let cargo_config = std::fs::read_to_string(".cargo/config.toml").unwrap();
+        assert!(cargo_config.contains("git-fetch-with-cli = true"));
+    }
+
+    #[test]
+    fn sr_nfr_009_ci_loads_the_mapi_lite_deploy_key_before_building() {
+        let workflow = std::fs::read_to_string(".github/workflows/rust.yml").unwrap();
+        assert!(workflow.contains("MAPI_LITE_DEPLOY_KEY"));
+        assert!(workflow.contains("webfactory/ssh-agent"));
+    }
+
+    #[test]
+    fn sr_nfr_009_docker_build_mounts_ssh_for_the_dependency_fetch() {
+        let dockerfile = std::fs::read_to_string("Dockerfile").unwrap();
+        assert!(dockerfile.contains("--mount=type=ssh"));
+        let build = std::fs::read_to_string("build.sh").unwrap();
+        assert!(build.contains("--ssh default"));
+    }
+
+    #[test]
+    fn sr_bchn_009_configuration_and_readme_document_mapi_lite() {
+        let configuration = std::fs::read_to_string("docs/Configuration.md").unwrap();
+        assert!(configuration.contains("## [mapi_lite]"));
+        assert!(configuration.contains("FS_MAPI_LITE_AUTH_TOKEN"));
+        let readme = std::fs::read_to_string("README.md").unwrap();
+        assert!(readme.contains("Configuration.md#mapi_lite"));
+        let endpoints = std::fs::read_to_string("docs/SupportedEndpoints.md").unwrap();
+        assert!(endpoints.contains("\"unhealthy\""));
+    }
+
     #[test]
     fn sr_cfg_005_dockerfile_healthcheck_calls_health_endpoint() {
         let dockerfile = std::fs::read_to_string("Dockerfile").unwrap();

@@ -15,11 +15,30 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    # v7 runs on Node 24. v4 ran on Node 20, which GitHub deprecated on its
-    # runners; the warning it emitted named no step, so: this was the one.
-    # taiki-e/install-action below is a composite (shell) action and has no
-    # Node runtime to deprecate.
+    # uls-client comes from the PRIVATE mapi-lite repo over SSH, so the
+    # checkout is not what needs the credential -- the dependency fetch is.
+    # Without the key, the first failure would be an opaque git error from
+    # deep inside cargo, so fail here instead with something actionable.
+    - name: Check the mapi-lite deploy key is configured
+      env:
+        KEY: ${{ secrets.MAPI_LITE_DEPLOY_KEY }}
+      run: |
+        if [ -z "$KEY" ]; then
+          echo "::error::Secret MAPI_LITE_DEPLOY_KEY is not set. This build fetches" \
+               "uls-client from the private nchain-innovation/mapi-lite repo over SSH." \
+               "Add a read-only deploy key for that repo as this repository's" \
+               "MAPI_LITE_DEPLOY_KEY secret. See docs/Dependencies.md."
+          exit 1
+        fi
     - uses: actions/checkout@v7
+    # .cargo/config.toml sets net.git-fetch-with-cli = true, so the runner's
+    # own git performs the fetch and picks the key up from the agent exactly
+    # as a developer's git does. The action also writes github.com into
+    # known_hosts. chain-gang needs none of this: it comes from crates.io.
+    - name: Load the mapi-lite deploy key into ssh-agent
+      uses: webfactory/ssh-agent@v0.9.0
+      with:
+        ssh-private-key: ${{ secrets.MAPI_LITE_DEPLOY_KEY }}
     - name: Check formatting
       run: cargo fmt --all -- --check
     - name: Clippy

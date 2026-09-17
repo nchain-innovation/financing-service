@@ -13,5 +13,7 @@ VERSION=v2.1
 PUBLISH_TAG=nchain/innovation-$BASE_TAG:$VERSION
 
 # multi build, tag and push base images
-# docker buildx build --builder cloud-nchain-rndprototyping --platform linux/amd64,linux/arm64 --push -t $PUBLISH_TAG .
-docker buildx build  --platform linux/amd64,linux/arm64 --push -t $PUBLISH_TAG .
+# `--ssh default` forwards your ssh-agent into the dependency fetch: uls-client
+# comes from the private mapi-lite repo over SSH (see docs/Dependencies.md).
+# docker buildx build --builder cloud-nchain-rndprototyping --platform linux/amd64,linux/arm64 --ssh default --push -t $PUBLISH_TAG .
+docker buildx build  --platform linux/amd64,linux/arm64 --ssh default --push -t $PUBLISH_TAG .

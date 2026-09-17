@@ -1,4 +1,8 @@
-use std::{collections::HashMap, sync::Arc, time::SystemTime};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant, SystemTime},
+};
 
 use chain_gang::{
     interface::{Balance, BlockchainInterface, Utxo},
@@ -11,6 +15,7 @@ use tokio::sync::{Mutex, RwLock};
 use crate::{
     address_watcher::AddressWatcher,
     blockchain_factory::{blockchain_factory, Backend},
+    broadcaster::{factory::broadcaster_factory, TxBroadcaster, MAPI_LITE},
     client::{Client, FundRequest, FundingSpendPlan},
     config::{ClientConfig, Config},
     dynamic_config::DynamicConfig,
@@ -110,16 +115,37 @@ pub struct Service {
     blockchain_status: RwLock<BlockchainConnectionStatus>,
     blockchain_update_time: RwLock<Option<SystemTime>>,
     blockchain_interface: Arc<dyn BlockchainInterface + Send + Sync>,
+    /// Where funding transactions are sent. Wraps `blockchain_interface`
+    /// unless `[mapi_lite]` is configured. See [`crate::broadcaster`].
+    broadcaster: Arc<dyn TxBroadcaster>,
     clients: RwLock<HashMap<String, Arc<RwLock<Client>>>>,
     dynamic_config: Mutex<DynamicConfig>,
     admin_api_key: Option<String>,
     idempotency: Mutex<IdempotencyStore>,
     /// Set only for backends that must be told which addresses to follow.
     address_watcher: Option<Arc<dyn AddressWatcher>>,
+    /// The last mapi-lite probe verdict, reused by `GET /health` until it
+    /// goes stale. See [`Service::mapi_lite_health`].
+    mapi_health: Mutex<Option<CachedHealth>>,
+    /// How long a probe verdict is reused for. Zero without `[mapi_lite]`,
+    /// where nothing is ever probed.
+    mapi_health_ttl: Duration,
+}
+
+/// A mapi-lite probe verdict and the moment it was taken.
+struct CachedHealth {
+    taken_at: Instant,
+    /// The probe's own error text, kept for the log line rather than for the
+    /// `/health` body, which stays generic.
+    verdict: Result<(), String>,
 }
 
 impl Service {
-    fn build(config: &Config, backend: Backend) -> Result<Service, String> {
+    fn build(
+        config: &Config,
+        backend: Backend,
+        broadcaster: Arc<dyn TxBroadcaster>,
+    ) -> Result<Service, String> {
         let Backend {
             interface: blockchain_interface,
             address_watcher,
@@ -154,6 +180,7 @@ impl Service {
             blockchain_status: RwLock::new(BlockchainConnectionStatus::Unknown),
             blockchain_update_time: RwLock::new(None),
             blockchain_interface,
+            broadcaster,
             clients: RwLock::new(clients),
             dynamic_config: Mutex::new(dynamic_config),
             admin_api_key: config
@@ -166,6 +193,12 @@ impl Service {
                 config.idempotency.max_entries,
             )),
             address_watcher,
+            mapi_health: Mutex::new(None),
+            mapi_health_ttl: config
+                .mapi_lite
+                .as_ref()
+                .map(|mapi_lite| mapi_lite.health_timeout())
+                .unwrap_or_default(),
         })
     }
 
@@ -208,7 +241,32 @@ impl Service {
             format!("Unable to connect to blockchain, ensure that the service is running: {e}")
         })?;
 
-        let service = Self::build(config, backend)?;
+        // The write path. Without [mapi_lite] it wraps the interface probed
+        // just above, so only mapi-lite needs a probe of its own -- and gets
+        // one, to tell the operator at startup rather than on the first /fund.
+        //
+        // A failed probe is reported but does not stop startup, the way a
+        // refused address import does not (see
+        // watch_configured_client_addresses). Refusing to start ties this
+        // service's lifecycle to mapi-lite's: the container health check would
+        // restart the process, the probe would fail again, and the service
+        // would sit in a restart loop -- taking /status, balances and every
+        // other read path, none of which need mapi-lite, down with it, and
+        // unable to recover on its own. Serving degraded and saying so through
+        // GET /health leaves the operator a service that heals when mapi-lite
+        // comes back.
+        let broadcaster = broadcaster_factory(config, Arc::clone(&backend.interface))?;
+        if let Some(mapi_lite) = &config.mapi_lite {
+            if let Err(e) = broadcaster.health_check().await {
+                log::warn!(
+                    "Unable to reach mapi-lite at {} at startup: {e}. Funding will fail until it \
+                     is reachable; GET /health reports the service unhealthy meanwhile.",
+                    mapi_lite.base_url()
+                );
+            }
+        }
+
+        let service = Self::build(config, backend, broadcaster)?;
         // Before the first balance read, so the backend already knows the
         // addresses it is about to be asked about.
         service.watch_configured_client_addresses().await;
@@ -224,11 +282,39 @@ impl Service {
         Self::new_for_test_with_watcher(config, blockchain_interface, None).await
     }
 
+    /// As production without `[mapi_lite]`: broadcasts go through the
+    /// blockchain interface.
     #[cfg(test)]
     pub async fn new_for_test_with_watcher(
         config: &Config,
         blockchain_interface: Arc<dyn BlockchainInterface + Send + Sync>,
         address_watcher: Option<Arc<dyn AddressWatcher>>,
+    ) -> Service {
+        use crate::broadcaster::woc::WocBroadcaster;
+        let broadcaster: Arc<dyn TxBroadcaster> = Arc::new(WocBroadcaster::new(
+            Arc::clone(&blockchain_interface),
+            &config.blockchain_interface.interface_type,
+        ));
+        Self::new_for_test_full(config, blockchain_interface, address_watcher, broadcaster).await
+    }
+
+    /// Reads through `blockchain_interface`, writes through `broadcaster`,
+    /// as production with `[mapi_lite]` does.
+    #[cfg(test)]
+    pub async fn new_for_test_with_broadcaster(
+        config: &Config,
+        blockchain_interface: Arc<dyn BlockchainInterface + Send + Sync>,
+        broadcaster: Arc<dyn TxBroadcaster>,
+    ) -> Service {
+        Self::new_for_test_full(config, blockchain_interface, None, broadcaster).await
+    }
+
+    #[cfg(test)]
+    async fn new_for_test_full(
+        config: &Config,
+        blockchain_interface: Arc<dyn BlockchainInterface + Send + Sync>,
+        address_watcher: Option<Arc<dyn AddressWatcher>>,
+        broadcaster: Arc<dyn TxBroadcaster>,
     ) -> Service {
         blockchain_interface
             .status()
@@ -241,6 +327,7 @@ impl Service {
                 interface: blockchain_interface,
                 address_watcher,
             },
+            broadcaster,
         )
         .expect("Invalid client configuration in test setup");
         service.watch_configured_client_addresses().await;
@@ -353,6 +440,7 @@ impl Service {
             version: env!("CARGO_PKG_VERSION").to_string(),
             blockchain_status: *self.blockchain_status.read().await,
             blockchain_update_time: update_time,
+            broadcaster: self.broadcaster.name().to_string(),
         }
     }
 
@@ -484,8 +572,53 @@ impl Service {
         self.clients.read().await.len()
     }
 
-    pub fn blockchain_interface(&self) -> Arc<dyn BlockchainInterface + Send + Sync> {
-        Arc::clone(&self.blockchain_interface)
+    /// The write path for funding transactions.
+    pub fn broadcaster(&self) -> Arc<dyn TxBroadcaster> {
+        Arc::clone(&self.broadcaster)
+    }
+
+    /// Whether funding transactions go through mapi-lite.
+    pub fn mapi_lite_configured(&self) -> bool {
+        self.broadcaster.name() == MAPI_LITE
+    }
+
+    /// Probe mapi-lite for `GET /health`, reusing a recent verdict.
+    ///
+    /// `None` when mapi-lite is not configured: there is then nothing to
+    /// probe, and `/health` stays the pure liveness check it always was.
+    ///
+    /// The verdict is cached for `mapi_lite.health_timeout_seconds`, because
+    /// `/health` is unauthenticated *and* exempt from the rate limiter
+    /// (SR-SEC-013), so without a cache anyone who can reach the port can turn
+    /// health traffic into an unbounded stream of requests to mapi-lite and
+    /// starve the funding path from an endpoint that costs them nothing. One
+    /// probe per TTL bounds that, and still answers the Docker health check
+    /// (every 30s) with a fresh result each time.
+    pub async fn mapi_lite_health(&self) -> Option<Result<(), String>> {
+        if !self.mapi_lite_configured() {
+            return None;
+        }
+
+        // Held across the probe on purpose: concurrent callers wait for the
+        // one in flight rather than each starting their own, which is the
+        // point of the cache. The probe is bounded by health_timeout.
+        let mut cached = self.mapi_health.lock().await;
+        if let Some(entry) = cached.as_ref() {
+            if entry.taken_at.elapsed() < self.mapi_health_ttl {
+                return Some(entry.verdict.clone());
+            }
+        }
+
+        let verdict = self
+            .broadcaster
+            .health_check()
+            .await
+            .map_err(|e| e.to_string());
+        *cached = Some(CachedHealth {
+            taken_at: Instant::now(),
+            verdict: verdict.clone(),
+        });
+        Some(verdict)
     }
 
     pub fn admin_auth_required(&self) -> bool {
@@ -544,14 +677,14 @@ impl Service {
     pub async fn prepare_funding_outpoints(
         service: &Arc<Service>,
         fund_request: &FundRequest,
-    ) -> Result<(Arc<dyn BlockchainInterface + Send + Sync>, PreparedFunding), String> {
+    ) -> Result<(Arc<dyn TxBroadcaster>, PreparedFunding), String> {
         let client = service
             .client_handle(&fund_request.client_id)
             .await
             .ok_or_else(|| format!("Unknown client_id {}", fund_request.client_id))?;
         let (tx, spend_plan) = client.read().await.plan_funding_tx(fund_request)?;
         Ok((
-            service.blockchain_interface(),
+            service.broadcaster(),
             PreparedFunding {
                 client_id: fund_request.client_id.clone(),
                 txs: vec![tx],
@@ -584,10 +717,10 @@ impl Service {
             return Err(error);
         }
 
-        let (blockchain, prepared) = Self::prepare_funding_outpoints(service, fund_request)
+        let (broadcaster, prepared) = Self::prepare_funding_outpoints(service, fund_request)
             .await
             .map_err(CodedError::internal)?;
-        match Self::broadcast_prepared_funding(blockchain, &prepared).await {
+        match Self::broadcast_prepared_funding(broadcaster, &prepared).await {
             Ok(response) => {
                 if let Err(description) = Self::commit_prepared_funding(service, &prepared).await {
                     log::warn!("commit_prepared_funding failed: {}", description);
@@ -632,8 +765,8 @@ impl Service {
                     .unwrap_or_default()],
             };
             match Self::prepare_funding_outpoints(service, &per_tx_request).await {
-                Ok((blockchain, prepared)) => {
-                    match Self::broadcast_prepared_funding(blockchain, &prepared).await {
+                Ok((broadcaster, prepared)) => {
+                    match Self::broadcast_prepared_funding(broadcaster, &prepared).await {
                         Ok(partial) => {
                             if let Err(description) =
                                 Self::commit_prepared_funding(service, &prepared).await
@@ -685,7 +818,7 @@ impl Service {
 
     /// Broadcast prepared funding transactions without holding client locks.
     pub async fn broadcast_prepared_funding(
-        blockchain: Arc<dyn BlockchainInterface + Send + Sync>,
+        broadcaster: Arc<dyn TxBroadcaster>,
         prepared: &PreparedFunding,
     ) -> Result<FundingResponse, CodedError> {
         let tx = prepared
@@ -700,8 +833,13 @@ impl Service {
             "funding tx hex = {}",
             tx_as_hexstr(&tx).map_err(CodedError::internal)?
         );
-        blockchain.broadcast_tx(&tx).await.map_err(|e| {
-            log::warn!("Failed to broadcast funding transaction: {:?}", e);
+        // The client sees a fixed code and message whatever the upstream said;
+        // the detail goes to the log, where an operator can act on it.
+        broadcaster.broadcast_tx(&tx).await.map_err(|e| {
+            log::warn!(
+                "Failed to broadcast funding transaction via {}: {e}",
+                broadcaster.name()
+            );
             CodedError::new(
                 ErrorCode::BroadcastFailed,
                 "Failed to broadcast funding transaction.",
@@ -1016,5 +1154,144 @@ mod tests {
             .await
             .map_err(CodedError::internal)?;
         Service::execute_funding(service, fund_request).await
+    }
+
+    /// A service reading through `blockchain` and writing through
+    /// `broadcaster`, as production does with `[mapi_lite]` configured.
+    async fn service_with(
+        config: &Config,
+        blockchain: Arc<dyn BlockchainInterface + Send + Sync>,
+        broadcaster: Arc<dyn TxBroadcaster>,
+    ) -> Arc<Service> {
+        Arc::new(Service::new_for_test_with_broadcaster(config, blockchain, broadcaster).await)
+    }
+
+    /// With a broadcaster injected, the blockchain interface serves reads
+    /// only: not one broadcast may reach it.
+    #[tokio::test]
+    async fn sr_bchn_009_execute_funding_uses_the_broadcaster_not_the_blockchain_interface() {
+        use crate::test_support::{CountingBlockchain, CountingBroadcaster};
+
+        let config = test_config(&unique_dynamic_config_path());
+        let blockchain = CountingBlockchain::new(&config).await;
+        let broadcaster = CountingBroadcaster::new();
+        let service = service_with(&config, blockchain.clone(), broadcaster.clone()).await;
+
+        let response = fund_single_transaction(&service, &sample_fund_request(TEST_CLIENT_ID))
+            .await
+            .expect("funding should succeed");
+
+        assert_eq!(response.outpoints.len(), 1);
+        assert_eq!(broadcaster.broadcast_count(), 1);
+        assert_eq!(blockchain.broadcast_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn sr_bchn_009_fund_with_multiple_transactions_uses_the_broadcaster() {
+        use crate::test_support::{CountingBlockchain, CountingBroadcaster};
+
+        let config = test_config(&unique_dynamic_config_path());
+        let blockchain = CountingBlockchain::new(&config).await;
+        let broadcaster = CountingBroadcaster::new();
+        let service = service_with(&config, blockchain.clone(), broadcaster.clone()).await;
+
+        let fund_request = FundRequest {
+            client_id: TEST_CLIENT_ID.to_string(),
+            satoshi: 123,
+            no_of_outpoints: 3,
+            multiple_tx: true,
+            locking_scripts: vec![hex::decode(LOCKING_SCRIPT_HEX).unwrap()],
+        };
+        let response = Service::fund_with_multiple_transactions(&service, &fund_request)
+            .await
+            .expect("multiple_tx funding should succeed");
+
+        assert_eq!(response.txs.len(), 3);
+        assert_eq!(broadcaster.broadcast_count(), 3);
+        assert_eq!(blockchain.broadcast_count(), 0);
+    }
+
+    /// A broadcaster failure is reported with the same code the blockchain
+    /// interface's failure always was, and leaves the UTXO cache resynced, so
+    /// the client contract does not depend on which broadcaster is in use.
+    #[tokio::test]
+    async fn broadcaster_failure_is_broadcast_failed_and_resyncs_chain_state() {
+        use crate::test_support::FailingBroadcaster;
+
+        let config = test_config(&unique_dynamic_config_path());
+        let blockchain = test_blockchain_interface(&config).await;
+        let service = service_with(&config, blockchain, FailingBroadcaster::new(0)).await;
+
+        let error = fund_single_transaction(&service, &sample_fund_request(TEST_CLIENT_ID))
+            .await
+            .expect_err("the broadcaster fails");
+        assert_eq!(error.code, ErrorCode::BroadcastFailed);
+
+        assert!(service
+            .funding_balance_error(&sample_fund_request(TEST_CLIENT_ID))
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn sr_bchn_011_mapi_lite_health_is_none_without_mapi_lite() {
+        let config = test_config(&unique_dynamic_config_path());
+        let blockchain = test_blockchain_interface(&config).await;
+        let service = Service::new_for_test(&config, blockchain).await;
+
+        assert!(!service.mapi_lite_configured());
+        assert!(service.mapi_lite_health().await.is_none());
+        assert_eq!(service.get_status().await.broadcaster, "test");
+    }
+
+    #[tokio::test]
+    async fn sr_bchn_011_mapi_lite_health_reports_the_probe_result() {
+        use crate::test_support::StubMapiBroadcaster;
+
+        let config = test_config(&unique_dynamic_config_path());
+
+        let blockchain = test_blockchain_interface(&config).await;
+        let healthy = service_with(&config, blockchain, StubMapiBroadcaster::new(true)).await;
+        assert!(healthy.mapi_lite_configured());
+        assert_eq!(healthy.mapi_lite_health().await, Some(Ok(())));
+        assert_eq!(healthy.get_status().await.broadcaster, MAPI_LITE);
+
+        let blockchain = test_blockchain_interface(&config).await;
+        let unhealthy = service_with(&config, blockchain, StubMapiBroadcaster::new(false)).await;
+        let probe = unhealthy.mapi_lite_health().await;
+        assert!(
+            matches!(probe, Some(Err(ref detail)) if detail.contains("503")),
+            "{probe:?}"
+        );
+    }
+
+    /// `/health` is unauthenticated and rate-limit exempt, so its probe must
+    /// not reach mapi-lite once per request. Within the TTL the verdict is
+    /// reused; past it a fresh probe is taken.
+    #[tokio::test]
+    async fn sr_bchn_011_mapi_lite_health_is_cached_for_the_health_timeout() {
+        use crate::test_support::StubMapiBroadcaster;
+
+        let mut config = test_config(&unique_dynamic_config_path());
+        let mut mapi_lite = crate::config::MapiLiteConfig::for_base_url("http://127.0.0.1:8080");
+        mapi_lite.health_timeout_seconds = 1;
+        config.mapi_lite = Some(mapi_lite);
+
+        let blockchain = test_blockchain_interface(&config).await;
+        let broadcaster = StubMapiBroadcaster::new(true);
+        let service = service_with(&config, blockchain, broadcaster.clone()).await;
+
+        for _ in 0..5 {
+            assert_eq!(service.mapi_lite_health().await, Some(Ok(())));
+        }
+        assert_eq!(broadcaster.probe_count(), 1, "the verdict should be reused");
+
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(service.mapi_lite_health().await, Some(Ok(())));
+        assert_eq!(
+            broadcaster.probe_count(),
+            2,
+            "a stale verdict should be refreshed"
+        );
     }
 }

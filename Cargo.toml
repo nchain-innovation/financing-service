@@ -25,5 +25,23 @@ tracing-opentelemetry = "0.33"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 actix-governor = "0.10.0"
 
+# The optional mapi-lite transaction broadcaster ([mapi_lite] in config).
+# uls-client is mapi-lite's typed HTTP client and uls-core its wire types; both
+# live in the PRIVATE nchain-innovation/mapi-lite repo, so they are git+ssh
+# pins (cargo needs the ssh:// URL form, and .cargo/config.toml hands the fetch
+# to the system git). They MUST name the same rev, and that rev's chain-gang
+# requirement must be satisfiable by the chain-gang line above, or the graph
+# carries two chain-gangs and their types stop unifying. This is the same rev
+# teranode-event-rs pins. See docs/Dependencies.md before changing it.
+uls-client = { git = "ssh://git@github.com/nchain-innovation/mapi-lite.git", rev = "ab3c95846a72976783e5f2d901b69d75768426bc" }
+uls-core = { git = "ssh://git@github.com/nchain-innovation/mapi-lite.git", rev = "ab3c95846a72976783e5f2d901b69d75768426bc" }
+# Only to build the timeout-bearing HTTP clients handed to uls-client, which
+# has no timeout setting of its own. Same major.minor as mapi-lite's so one
+# reqwest resolves; its TLS backend is whatever uls-client enables.
+reqwest = { version = "0.13", default-features = false }
+
 [dev-dependencies]
 actix-http = "3"
+# MapiBroadcaster tests: a mock mapi-lite serving the real wire shapes, with
+# uls-core signing the envelopes the way the server does.
+wiremock = "0.6"

@@ -7,6 +7,7 @@ use actix_web::{web, App, HttpServer};
 mod address_watcher;
 mod auth;
 mod blockchain_factory;
+mod broadcaster;
 mod client;
 mod config;
 mod dynamic_config;
@@ -34,6 +35,9 @@ use crate::{
 #[cfg(test)]
 mod system_requirements;
 
+#[cfg(test)]
+mod dependency_graph;
+
 /// Main - Read config and setup Web server.
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
@@ -56,6 +60,9 @@ async fn main() -> std::io::Result<()> {
         log::error!("Unable to start service: {e}");
         std::io::Error::other(e)
     })?;
+    // Which way funding transactions leave the service. Reads always go
+    // through [blockchain_interface]; this names the write path.
+    log::info!("{}", broadcaster::factory::describe_broadcaster(&config));
     if service.admin_auth_required() {
         log::info!("Admin API key authentication enabled for POST /client");
     } else {
