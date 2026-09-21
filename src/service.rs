@@ -504,7 +504,7 @@ impl Service {
         let mut status = BlockchainConnectionStatus::Connected;
         for ((client, _), chain_state) in handles.into_iter().zip(chain_updates) {
             match chain_state {
-                Ok((balance, utxo)) => client.write().await.apply_chain_state(balance, utxo),
+                Ok(utxo) => client.write().await.apply_chain_state(utxo),
                 Err(e) => {
                     log::warn!("update_balance - failed {}", e);
                     status = BlockchainConnectionStatus::Failed;
@@ -527,10 +527,7 @@ impl Service {
         let address = client.read().await.get_address();
         let chain_state =
             fetch_chain_state(service.blockchain_interface.as_ref(), &address).await?;
-        client
-            .write()
-            .await
-            .apply_chain_state(chain_state.0, chain_state.1);
+        client.write().await.apply_chain_state(chain_state);
         *service.blockchain_status.write().await = BlockchainConnectionStatus::Connected;
         *service.blockchain_update_time.write().await = Some(SystemTime::now());
         Ok(())
@@ -668,17 +665,12 @@ impl Service {
     }
 
     #[cfg(test)]
-    pub async fn set_test_chain_state(
-        &self,
-        client_id: &str,
-        balance: Balance,
-        unspent: Utxo,
-    ) -> Result<(), String> {
+    pub async fn set_test_chain_state(&self, client_id: &str, unspent: Utxo) -> Result<(), String> {
         let client = self
             .client_handle(client_id)
             .await
             .ok_or_else(|| format!("Unknown client_id {client_id}"))?;
-        client.write().await.apply_chain_state(balance, unspent);
+        client.write().await.apply_chain_state(unspent);
         Ok(())
     }
 
@@ -956,19 +948,21 @@ fn partial_broadcast_error(
     MultipleTxFundError::complete(ErrorCode::BroadcastFailed, message)
 }
 
+/// The client's unspent set, which the balance is then derived from.
+///
+/// One request, not two. A separate balance query can disagree with the
+/// unspent set -- WhatsOnChain's is deprecated and under-reports unconfirmed
+/// outputs -- and the unspent set is the one that decides what can be funded,
+/// so it is the one that is asked for. Halving the requests per refresh also
+/// halves what the rate limit has to cover.
 async fn fetch_chain_state(
     blockchain: &dyn BlockchainInterface,
     address: &str,
-) -> Result<(Balance, Utxo), String> {
-    let balance = blockchain
-        .get_balance(address)
-        .await
-        .map_err(|e| format!("get_balance failed: {e}"))?;
-    let utxo = blockchain
+) -> Result<Utxo, String> {
+    blockchain
         .get_utxo(address)
         .await
-        .map_err(|e| format!("get_utxo failed: {e}"))?;
-    Ok((balance, utxo))
+        .map_err(|e| format!("get_utxo failed: {e}"))
 }
 
 #[cfg(test)]
@@ -1062,7 +1056,7 @@ mod tests {
             .expect("test client")
             .write()
             .await
-            .apply_chain_state(Balance::default(), Vec::new());
+            .apply_chain_state(Vec::new());
 
         Service::refresh_client_chain_state(&service, TEST_CLIENT_ID)
             .await

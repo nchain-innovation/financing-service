@@ -392,6 +392,10 @@ curl -H "Authorization: Bearer your-client-api-key" \
 }
 ```
 
+**Unconfirmed outputs are spendable.** `POST /fund` draws on the whole unspent set, so `max_fundable` counts `unconfirmed` as well as `confirmed`, and a funding request can be satisfied entirely from outputs that are still in the mempool. That is deliberate — a funding service that waited for confirmation would be unusable on a chain where its own change output is the next input — but it does mean a funded outpoint can depend on a parent transaction that has not been mined. Callers that need confirmed inputs specifically should check `confirmed` before requesting.
+
+Both figures are **derived from the unspent set**, not asked for separately. A separate balance query can disagree with the UTXOs it is meant to describe — WhatsOnChain's `/address/{address}/balance` is deprecated and was reporting `unconfirmed: 0` for addresses whose unspent set plainly held unconfirmed outputs — and when they disagree, the unspent set is the one that decides what can be funded. Deriving means `confirmed`, `unconfirmed` and `max_fundable` always describe the same set of coins, and that the balance reflects a funding transaction the moment it spends from them rather than at the next refresh.
+
 `max_fundable` is **the most a single `POST /fund` can ask for right now**, assuming one standard P2PKH outpoint. Use it rather than deriving a figure from the balance.
 
 It is not `confirmed + unconfirmed` minus a fee you can guess. Fees come out of the same UTXOs, and every input the transaction has to spend adds bytes and so adds fee — so a wallet holding its balance in many small pieces can fund far less than one holding the same total in a single piece. Where the difference is large, the UTXOs are fragmented: a request between `max_fundable` and what the balance suggests is refused with `no_suitable_utxo`, whose description says what consolidating would raise the limit to.

@@ -173,6 +173,23 @@ mod tests {
         assert!(configuration.contains("OTEL_EXPORTER_OTLP_ENDPOINT"));
     }
 
+    /// The ticket's first point was that the documentation never said whether
+    /// unconfirmed outputs could be used as funds, so a reader had to guess --
+    /// and guessed wrong. The behaviour is pinned by a test in `client`; this
+    /// pins that it is also written down, which is the half a caller can see.
+    #[test]
+    fn sr_fund_019_endpoints_document_unconfirmed_eligibility() {
+        let endpoints = std::fs::read_to_string("docs/SupportedEndpoints.md").unwrap();
+        assert!(
+            endpoints.contains("Unconfirmed outputs are spendable"),
+            "the balance endpoint must state whether unconfirmed funds can be spent"
+        );
+        assert!(
+            endpoints.contains("derived from the unspent set"),
+            "and that the figures come from the unspent set rather than a separate query"
+        );
+    }
+
     #[test]
     fn sr_lim_006_opentelemetry_exports_traces_only() {
         let manifest = std::fs::read_to_string("Cargo.toml").unwrap();
