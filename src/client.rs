@@ -134,6 +134,10 @@ pub struct Client {
     /// Held out of `unspent` -- and out of every refresh that would otherwise
     /// resurrect them -- until the chain agrees they are spent or the
     /// reservation expires. See [`UNCERTAIN_SPEND_RESERVATION`].
+    /// When the unspent set was last taken from the chain, or `None` if it
+    /// has not been, or has been marked stale. Drives the freshness check
+    /// that keeps a burst of requests from each fetching the same answer.
+    chain_state_at: Option<Instant>,
     /// Keyed by outpoint, valued by when it was reserved. Only the moment is
     /// needed: the balance is derived from what is left in `unspent`, so
     /// removing the entry from there is all it takes to withhold its value.
@@ -164,6 +168,7 @@ impl Client {
             wallet,
             address,
             unspent: Vec::new(),
+            chain_state_at: None,
             reserved: HashMap::new(),
             pending_change: HashMap::new(),
         })
@@ -194,6 +199,7 @@ impl Client {
     /// visible to the read interface still reads as unspent, and the service
     /// would offer the same input to the next funding request.
     pub fn apply_chain_state(&mut self, unspent: Utxo) {
+        self.chain_state_at = Some(Instant::now());
         self.release_expired_reservations();
         self.expire_pending_change();
 
@@ -282,6 +288,29 @@ impl Client {
         for since in self.reserved.values_mut() {
             *since -= by;
         }
+    }
+
+    /// Whether the cached chain state is younger than `max_age`.
+    ///
+    /// A client that has never been refreshed is never fresh, so the first
+    /// request for it always fetches.
+    pub fn chain_state_is_fresh(&self, max_age: Duration) -> bool {
+        match self.chain_state_at {
+            Some(at) => at.elapsed() < max_age,
+            None => false,
+        }
+    }
+
+    /// Treat the cached chain state as stale, whatever its age.
+    ///
+    /// Used when something has happened that the cache cannot be trusted to
+    /// reflect -- a broadcast the upstream refused, which may mean an input
+    /// this service still believes it owns was spent by someone else, or one
+    /// whose outcome is unknown. Reaching for the chain immediately would cost
+    /// a request the caller cannot use; marking the state stale instead makes
+    /// the *next* request pay for it, and only if one comes.
+    pub fn invalidate_chain_state(&mut self) {
+        self.chain_state_at = None;
     }
 
     /// The client's balance, derived from its unspent set.

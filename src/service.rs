@@ -133,6 +133,8 @@ pub struct Service {
     /// Consecutive failures reaching the blockchain interface, so a run of
     /// them reads as a run and recovery from one is announced.
     chain_health: Mutex<ChainHealth>,
+    /// How old cached chain state may be before a request refreshes it.
+    chain_state_max_age: Duration,
 }
 
 /// A run of failures talking to the blockchain interface.
@@ -210,6 +212,7 @@ impl Service {
             address_watcher,
             mapi_health: Mutex::new(None),
             chain_health: Mutex::new(ChainHealth::default()),
+            chain_state_max_age: config.service.chain_state_max_age(),
             mapi_health_ttl: config
                 .mapi_lite
                 .as_ref()
@@ -552,16 +555,26 @@ impl Service {
             return;
         }
 
+        // Skip whatever a request refreshed inside the window. At the default
+        // -- the window equal to this period -- a client touched by traffic
+        // since the last tick is already current, so the sweep pays only for
+        // the quiet ones.
+        let max_age = service.chain_state_max_age;
         let mut chain_updates = Vec::with_capacity(handles.len());
-        for (_, address) in &handles {
-            chain_updates.push(fetch_chain_state(blockchain.as_ref(), address).await);
+        for (client, address) in &handles {
+            if client.read().await.chain_state_is_fresh(max_age) {
+                chain_updates.push(None);
+                continue;
+            }
+            chain_updates.push(Some(fetch_chain_state(blockchain.as_ref(), address).await));
         }
 
         let mut status = BlockchainConnectionStatus::Connected;
         for ((client, _), chain_state) in handles.into_iter().zip(chain_updates) {
             match chain_state {
-                Ok(utxo) => client.write().await.apply_chain_state(utxo),
-                Err(e) => {
+                None => {}
+                Some(Ok(utxo)) => client.write().await.apply_chain_state(utxo),
+                Some(Err(e)) => {
                     service.record_chain_failure(&e).await;
                     status = BlockchainConnectionStatus::Failed;
                 }
@@ -572,6 +585,52 @@ impl Service {
         }
         *service.blockchain_status.write().await = status;
         *service.blockchain_update_time.write().await = Some(SystemTime::now());
+    }
+
+    /// Refresh one client's chain state unless the cache is still fresh.
+    ///
+    /// The refresh before building a funding transaction exists so the service
+    /// does not select an input something else has already spent. Fetching it
+    /// again when the periodic refresh took it moments ago buys nothing
+    /// against that, and it is the difference between one request per client
+    /// per period and one per request: on a busy service the second is what
+    /// runs into the rate limit and makes funding calls queue behind it.
+    ///
+    /// The window is `service.chain_state_max_age_seconds`, defaulting to
+    /// `utxo_refresh_period`. Wider is cheaper and staler, and the trade is
+    /// the operator's -- see the note on the config field.
+    ///
+    /// A failed broadcast marks the state stale (see
+    /// [`Service::invalidate_chain_state`]), so a conflict caused by building
+    /// on a stale view costs one attempt and not more.
+    pub async fn refresh_client_chain_state_if_stale(
+        service: &Arc<Service>,
+        client_id: &str,
+    ) -> Result<(), String> {
+        let client = service
+            .client_handle(client_id)
+            .await
+            .ok_or_else(|| format!("Unknown client_id {client_id}"))?;
+        if client
+            .read()
+            .await
+            .chain_state_is_fresh(service.chain_state_max_age)
+        {
+            return Ok(());
+        }
+        Self::refresh_client_chain_state(service, client_id).await
+    }
+
+    /// Mark a client's cached chain state stale, so the next request refreshes
+    /// it.
+    ///
+    /// Cheaper than refreshing here: the caller is already being told its
+    /// funding failed and cannot use a fresh answer, and if no further request
+    /// arrives the fetch is never made at all.
+    async fn invalidate_chain_state(service: &Arc<Service>, client_id: &str) {
+        if let Some(client) = service.client_handle(client_id).await {
+            client.write().await.invalidate_chain_state();
+        }
     }
 
     /// Refresh one client's balance and UTXO set from the blockchain.
@@ -809,9 +868,14 @@ impl Service {
                 if error.code == ErrorCode::BroadcastOutcomeUnknown {
                     Self::reserve_uncertain_funding(service, &prepared).await;
                 }
-                // Safe to run even after a reservation: a refresh restores
-                // what the chain reports minus anything still reserved.
-                let _ = Self::refresh_client_chain_state(service, &fund_request.client_id).await;
+                // Marked stale rather than refetched. The cache is already
+                // right -- nothing was spent on a refusal, and an uncertain
+                // outcome has just reserved its inputs -- so a request here
+                // would buy nothing for this caller. What it would buy is a
+                // second opinion for the *next* caller, if the refusal was a
+                // conflict, and marking the state stale gets that without
+                // paying for it when no next caller arrives.
+                Self::invalidate_chain_state(service, &fund_request.client_id).await;
                 Err(error)
             }
         }
@@ -1280,11 +1344,13 @@ mod tests {
             .is_none());
     }
 
+    /// Stands in for the `POST /fund` handler, which refreshes chain state
+    /// only when the cache has gone stale before it builds anything.
     async fn fund_single_transaction(
         service: &Arc<Service>,
         fund_request: &FundRequest,
     ) -> Result<FundingResponse, CodedError> {
-        Service::refresh_client_chain_state(service, &fund_request.client_id)
+        Service::refresh_client_chain_state_if_stale(service, &fund_request.client_id)
             .await
             .map_err(CodedError::internal)?;
         Service::execute_funding(service, fund_request).await
@@ -1317,6 +1383,159 @@ mod tests {
             service.record_chain_success().await,
             None,
             "a second success must not announce recovery again"
+        );
+    }
+
+    // ---- CS-431: fewer refreshes, not just slower ones ----
+
+    use crate::test_support::CountingBlockchain;
+
+    /// A service whose cached chain state stays fresh for `seconds`, reading
+    /// through a counter so refreshes can be counted at the far end.
+    async fn service_with_freshness(seconds: u64) -> (Arc<Service>, Arc<CountingBlockchain>) {
+        let mut config = test_config(&unique_dynamic_config_path());
+        config.service.utxo_refresh_period = seconds;
+        let blockchain = CountingBlockchain::new(&config).await;
+        let service = Arc::new(Service::new_for_test(&config, blockchain.clone()).await);
+        (service, blockchain)
+    }
+
+    /// The saving the ticket is about. Repeated requests inside the window
+    /// reuse what the last refresh fetched instead of each fetching the same
+    /// answer, which is what made a burst queue behind the rate limiter.
+    #[tokio::test]
+    async fn cs_431_requests_inside_the_window_reuse_the_cached_state() {
+        let (service, blockchain) = service_with_freshness(60).await;
+        Service::refresh_client_chain_state(&service, TEST_CLIENT_ID)
+            .await
+            .expect("first refresh");
+        let after_first = blockchain.utxo_read_count();
+
+        for _ in 0..5 {
+            Service::refresh_client_chain_state_if_stale(&service, TEST_CLIENT_ID)
+                .await
+                .expect("cached");
+        }
+
+        assert_eq!(
+            blockchain.utxo_read_count(),
+            after_first,
+            "five requests inside the window should not have fetched again"
+        );
+    }
+
+    /// The window is a window, not a switch: once it passes, the next request
+    /// fetches. Zero means every request refreshes, which is what the service
+    /// did before this change and what an operator gets by setting it.
+    #[tokio::test]
+    async fn cs_431_a_zero_window_refreshes_on_every_request() {
+        let (service, blockchain) = service_with_freshness(0).await;
+        let before = blockchain.utxo_read_count();
+        for _ in 0..3 {
+            Service::refresh_client_chain_state_if_stale(&service, TEST_CLIENT_ID)
+                .await
+                .expect("refresh");
+        }
+        assert_eq!(
+            blockchain.utxo_read_count(),
+            before + 3,
+            "a zero window must not skip anything"
+        );
+    }
+
+    /// The mitigation for a wide window. Building on a stale view risks
+    /// selecting an input something else has spent, and the upstream refusing
+    /// the result is the evidence. That refusal marks the cache stale, so the
+    /// next attempt refreshes rather than repeating the mistake -- and it
+    /// costs nothing when no next attempt comes.
+    #[tokio::test]
+    async fn cs_431_a_refused_broadcast_makes_the_next_request_refresh() {
+        use crate::test_support::RejectingBroadcaster;
+
+        let mut config = test_config(&unique_dynamic_config_path());
+        config.service.utxo_refresh_period = 3600;
+        let blockchain = CountingBlockchain::new(&config).await;
+        let service = service_with(
+            &config,
+            blockchain.clone(),
+            RejectingBroadcaster::new(false),
+        )
+        .await;
+
+        Service::refresh_client_chain_state(&service, TEST_CLIENT_ID)
+            .await
+            .expect("first refresh");
+        let before = blockchain.utxo_read_count();
+
+        // inside a one-hour window, so nothing would refresh on age alone
+        Service::refresh_client_chain_state_if_stale(&service, TEST_CLIENT_ID)
+            .await
+            .expect("cached");
+        assert_eq!(blockchain.utxo_read_count(), before, "still fresh");
+
+        let error = fund_single_transaction(&service, &sample_fund_request(TEST_CLIENT_ID))
+            .await
+            .expect_err("the upstream refuses it");
+        assert_eq!(error.code, ErrorCode::BroadcastRejected);
+
+        Service::refresh_client_chain_state_if_stale(&service, TEST_CLIENT_ID)
+            .await
+            .expect("refresh");
+        assert_eq!(
+            blockchain.utxo_read_count(),
+            before + 1,
+            "a refusal should have made the cache stale"
+        );
+    }
+
+    /// A failed broadcast used to refresh immediately, which spent a request
+    /// on an answer the caller could not use. Marking the state stale defers
+    /// it to a request that wants it, and to none at all if none comes.
+    #[tokio::test]
+    async fn cs_431_a_failed_broadcast_does_not_refresh_on_the_spot() {
+        use crate::test_support::RejectingBroadcaster;
+
+        let mut config = test_config(&unique_dynamic_config_path());
+        config.service.utxo_refresh_period = 3600;
+        let blockchain = CountingBlockchain::new(&config).await;
+        let service = service_with(
+            &config,
+            blockchain.clone(),
+            RejectingBroadcaster::new(false),
+        )
+        .await;
+
+        Service::refresh_client_chain_state(&service, TEST_CLIENT_ID)
+            .await
+            .expect("first refresh");
+        let before = blockchain.utxo_read_count();
+
+        let _ = fund_single_transaction(&service, &sample_fund_request(TEST_CLIENT_ID)).await;
+
+        assert_eq!(
+            blockchain.utxo_read_count(),
+            before,
+            "the error path should not have fetched"
+        );
+    }
+
+    /// The periodic sweep is the other half. A client a request already
+    /// refreshed inside the window does not need fetching again on the tick,
+    /// so a busy service pays for its quiet clients only.
+    #[tokio::test]
+    async fn cs_431_the_periodic_sweep_skips_clients_a_request_refreshed() {
+        let (service, blockchain) = service_with_freshness(3600).await;
+        Service::refresh_client_chain_state(&service, TEST_CLIENT_ID)
+            .await
+            .expect("a request refreshes it");
+        let before = blockchain.utxo_read_count();
+
+        Service::refresh_balances(&service).await;
+
+        assert_eq!(
+            blockchain.utxo_read_count(),
+            before,
+            "the sweep refetched a client that was already current"
         );
     }
 

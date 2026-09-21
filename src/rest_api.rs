@@ -228,7 +228,12 @@ pub async fn get_funds(
         return response;
     }
 
-    if let Err(description) = Service::refresh_client_chain_state(&data.service, client_id).await {
+    // Refreshed only if the cache has gone stale. See
+    // `Service::refresh_client_chain_state_if_stale` for why, and
+    // `service.chain_state_max_age_seconds` for the window.
+    if let Err(description) =
+        Service::refresh_client_chain_state_if_stale(&data.service, client_id).await
+    {
         log::warn!("refresh_client_chain_state failed: {}", description);
         return error_response(ErrorCode::ChainUnavailable, description);
     }
@@ -569,7 +574,9 @@ pub async fn balance(
         return response;
     }
 
-    if let Err(description) = Service::refresh_client_chain_state(&data.service, &client_id).await {
+    if let Err(description) =
+        Service::refresh_client_chain_state_if_stale(&data.service, &client_id).await
+    {
         log::warn!("refresh_client_chain_state failed: {}", description);
         return error_response(ErrorCode::ChainUnavailable, description);
     }

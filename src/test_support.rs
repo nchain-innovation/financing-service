@@ -190,6 +190,9 @@ pub fn unique_dynamic_config_path() -> String {
 pub struct CountingBlockchain {
     inner: tokio::sync::Mutex<TestInterface>,
     broadcasts: AtomicU32,
+    /// Reads of the unspent set. Every chain-state refresh makes exactly one,
+    /// so this counts refreshes as the far end would see them.
+    utxo_reads: AtomicU32,
 }
 
 impl CountingBlockchain {
@@ -201,11 +204,17 @@ impl CountingBlockchain {
         Arc::new(Self {
             inner: tokio::sync::Mutex::new(inner),
             broadcasts: AtomicU32::new(0),
+            utxo_reads: AtomicU32::new(0),
         })
     }
 
     pub fn broadcast_count(&self) -> u32 {
         self.broadcasts.load(Ordering::SeqCst)
+    }
+
+    /// How many times the unspent set has been fetched: one per refresh.
+    pub fn utxo_read_count(&self) -> u32 {
+        self.utxo_reads.load(Ordering::SeqCst)
     }
 }
 
@@ -226,6 +235,7 @@ impl BlockchainInterface for CountingBlockchain {
     }
 
     async fn get_utxo(&self, address: &str) -> Result<Utxo, ChainGangError> {
+        self.utxo_reads.fetch_add(1, Ordering::SeqCst);
         self.inner.lock().await.get_utxo(address).await
     }
 
