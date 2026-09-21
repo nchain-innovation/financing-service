@@ -449,9 +449,9 @@ dependencies = [
 
 [[package]]
 name = "chain-gang"
-version = "0.11.2"
+version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2a06646355b6e58669b87ad4775b943a5dcb60a884f9181ee9ef58cda8f370a"
+checksum = "77d3dd90fe36666fa87d5dbbcdb7de735e57349b202f0029f554d71b1ed8a6b1"
 dependencies = [
  "async-lock",
  "async-trait",
@@ -476,6 +476,7 @@ dependencies = [
  "sha1",
  "sha2",
  "thiserror",
+ "tokio",
  "url",
 ]
 

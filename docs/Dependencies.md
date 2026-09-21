@@ -40,7 +40,9 @@ The same applies to `reqwest`, because `uls-client`'s error type wraps `reqwest:
 
 ### How to bump
 
-**chain-gang:** move mapi-lite first. Once a mapi-lite commit on the new chain-gang exists, in one change here: repin `uls-client` and `uls-core` to that commit, raise `chain-gang` in `Cargo.toml`, run `cargo update -p chain-gang -p uls-client -p uls-core`, run `cargo test`, commit `Cargo.lock`.
+**chain-gang, within the range mapi-lite already asks for** (it asks for `0.11.0`, so anything `0.11.x`): raise the version in `Cargo.toml`, `cargo update -p chain-gang`, `cargo test`, commit `Cargo.lock`. Nothing about mapi-lite changes, because a patch release satisfies the requirement the pinned commit already states and Cargo unifies the two references on one package. `0.11.2` to `0.11.3` was done this way.
+
+**chain-gang, out of that range** (`0.12` and up): move mapi-lite first. Once a mapi-lite commit on the new chain-gang exists, in one change here: repin `uls-client` and `uls-core` to that commit, raise `chain-gang` in `Cargo.toml`, run `cargo update -p chain-gang -p uls-client -p uls-core`, run `cargo test`, commit `Cargo.lock`.
 
 **mapi-lite alone** (no chain-gang change): edit both `rev`s to the same new commit, `cargo update -p uls-client -p uls-core`, `cargo test`, commit `Cargo.lock`. Check that `teranode-event-rs` is on the same commit, or the two services will speak subtly different wire contracts to the one mapi-lite they share.
 

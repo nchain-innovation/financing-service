@@ -92,6 +92,41 @@ mod tests {
         );
     }
 
+    /// The lowest chain-gang this crate is correct against.
+    ///
+    /// 0.11.2 and earlier read WhatsOnChain UTXOs from `/unspent`, which stops
+    /// at 1000 entries and offers no way to ask for the rest, so a busy
+    /// address came back silently truncated. Measured against mainnet
+    /// 1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa: 1000 of 20960 entries, 241612089
+    /// of 2296358944 satoshis. For a funding service that is not a cosmetic
+    /// difference -- the missing UTXOs are spendable, so the service would
+    /// refuse amounts the client can afford. 0.11.3 pages `/unspent/all`.
+    const CHAIN_GANG_FLOOR: (u32, u32, u32) = (0, 11, 3);
+
+    #[test]
+    fn chain_gang_is_new_enough_to_read_a_whole_utxo_set() {
+        let versions = locked_versions(&lockfile(), "chain-gang");
+        let [version] = versions.as_slice() else {
+            // chain_gang_resolves_to_exactly_one_package reports this case
+            return;
+        };
+        let parts: Vec<u32> = version
+            .split('.')
+            .map(|p| p.parse().unwrap_or_else(|_| panic!("version {version:?}")))
+            .collect();
+        let [major, minor, patch] = parts.as_slice() else {
+            panic!("version {version:?} is not major.minor.patch");
+        };
+
+        assert!(
+            (*major, *minor, *patch) >= CHAIN_GANG_FLOOR,
+            "chain-gang {version} is below {CHAIN_GANG_FLOOR:?}, whose paginated \
+             /unspent/all read this crate relies on. Below it a client address with more \
+             than 1000 UTXOs reports only the first 1000, and the service refuses funding \
+             it could cover. See docs/Dependencies.md.",
+        );
+    }
+
     #[test]
     fn the_parser_reads_a_lockfile_correctly() {
         // Against a fixture, not the live lockfile, so the parser stays
