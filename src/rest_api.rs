@@ -574,10 +574,11 @@ pub async fn balance(
         return error_response(ErrorCode::ChainUnavailable, description);
     }
 
-    match data.service.get_balance(&client_id).await {
-        Some(balance) => json_ok(&BalanceResponse {
+    match data.service.get_balance_and_max_fundable(&client_id).await {
+        Some((balance, max_fundable)) => json_ok(&BalanceResponse {
             confirmed: balance.confirmed,
             unconfirmed: balance.unconfirmed,
+            max_fundable,
         }),
         None => error_response(
             ErrorCode::UnknownClient,
@@ -2249,5 +2250,69 @@ mod tests {
         .await;
         let json: Value = test::read_body_json(retry).await;
         assert_eq!(json["code"], "key_in_progress");
+    }
+
+    /// CS-422 asked how a client is supposed to know what it can withdraw.
+    /// The balance endpoint answers it, and the answer is not the balance:
+    /// fees come out of the same UTXOs.
+    #[actix_web::test]
+    async fn cs_422_balance_reports_the_fundable_maximum() {
+        let app = build_app().await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/client/{TEST_CLIENT_ID}/balance"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = test::read_body_json(resp).await;
+
+        let confirmed = body["confirmed"].as_i64().expect("confirmed");
+        let max_fundable = body["max_fundable"]
+            .as_i64()
+            .expect("max_fundable is reported");
+        assert!(
+            max_fundable < confirmed,
+            "fees come out of the balance, so the maximum must be under it: \
+             max_fundable={max_fundable} confirmed={confirmed}"
+        );
+        assert!(max_fundable >= 0);
+    }
+
+    /// And the number has to be usable, not decorative: funding exactly the
+    /// advertised maximum must be accepted.
+    #[actix_web::test]
+    async fn cs_422_the_advertised_maximum_is_accepted_by_fund() {
+        let app = build_app().await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/client/{TEST_CLIENT_ID}/balance"))
+                .to_request(),
+        )
+        .await;
+        let body: Value = test::read_body_json(resp).await;
+        let max_fundable = body["max_fundable"].as_i64().expect("max_fundable") as u64;
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/fund")
+                .set_json(fund_body(
+                    TEST_CLIENT_ID,
+                    max_fundable,
+                    1,
+                    LOCKING_SCRIPT_HEX,
+                ))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the advertised maximum was refused: {:?}",
+            test::read_body(resp).await
+        );
     }
 }

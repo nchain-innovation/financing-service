@@ -244,8 +244,8 @@ The status is derived from the code, so a caller that cannot read the body — a
 
 | `code` | HTTP | Meaning | Caller action |
 |---|---|---|---|
-| `insufficient_balance` | 409 | Total balance cannot cover the request | Top the wallet up; retryable after that |
-| `no_suitable_utxo` | 409 | Balance is sufficient but no combination of UTXOs fits | Split the wallet's UTXOs; retryable after that |
+| `insufficient_balance` | 409 | The balance cannot cover the request once fees are paid, however the UTXOs were arranged | Top the wallet up; the description gives the ceiling |
+| `no_suitable_utxo` | 409 | The balance would cover it, but not split the way it is — spending the extra UTXOs costs more in fees than they add | Consolidate the wallet's UTXOs; the description gives both limits |
 | `unknown_client` | 404 / 400 | No such `client_id`. 404 where the id is a path segment, 400 where it is a body field | Fix configuration; never retryable as-is |
 | `client_exists` | 409 | `client_id` is already configured | `POST /client` only |
 | `invalid_request` | 400 | The request is malformed | Fix the request; never retryable unchanged |
@@ -287,8 +287,10 @@ Examples:
 
 * Unauthorized — `{"code": "unauthorized", "description": "Unauthorized"}` (missing or invalid `api_key` for the client)
 * Unknown client — `{"code": "unknown_client", "description": "Unknown client_id client1"}`
-* Insufficient total balance — `{"code": "insufficient_balance", "description": "Insufficient client balance: 900 satoshi available, 873 required."}`
-* No suitable UTXO set — `{"code": "no_suitable_utxo", "description": "Unable to select UTXOs for funding transaction: largest UTXO is 300 satoshi, 873 required including fees."}`
+* Insufficient total balance — `{"code": "insufficient_balance", "description": "Insufficient client balance: 480 satoshi requested, but of the 1230 satoshi available at most 479 can be paid out once fees are covered."}`
+* No suitable UTXO set — `{"code": "no_suitable_utxo", "description": "Unable to fund 470 satoshi from this UTXO set: at most 379 can be paid out, because spending more of these 7 UTXOs costs more in fees than the inputs are worth. The balance of 1230 satoshi would support up to 479 if it were consolidated into one UTXO."}`
+
+  The two are a pair. `insufficient_balance` means no arrangement of this balance is enough; `no_suitable_utxo` means this arrangement is not, and says what a consolidated one would allow. Both quote a number the caller can act on, and `GET /balance` reports the same limit as `max_fundable` before a request is made.
 * Invalid input — `{"code": "invalid_request", "description": "Invalid satoshi value '0'"}`
 * Partial `multiple_tx` failure — HTTP 422 with successful transactions included when some broadcasts succeed before a later failure:
 
@@ -385,6 +387,11 @@ curl -H "Authorization: Bearer your-client-api-key" \
 ```json
 {
     "confirmed": 99904,
-    "unconfirmed": 95162
+    "unconfirmed": 95162,
+    "max_fundable": 98904
 }
 ```
+
+`max_fundable` is **the most a single `POST /fund` can ask for right now**, assuming one standard P2PKH outpoint. Use it rather than deriving a figure from the balance.
+
+It is not `confirmed + unconfirmed` minus a fee you can guess. Fees come out of the same UTXOs, and every input the transaction has to spend adds bytes and so adds fee — so a wallet holding its balance in many small pieces can fund far less than one holding the same total in a single piece. Where the difference is large, the UTXOs are fragmented: a request between `max_fundable` and what the balance suggests is refused with `no_suitable_utxo`, whose description says what consolidating would raise the limit to.
