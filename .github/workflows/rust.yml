@@ -1,8 +1,16 @@
 name: Rust
 # CI runner image is pinned, not `ubuntu-latest`. That label migrates to Ubuntu 26
-# from 19 October 2026 (actions/runner-images#14748), which would move the OS under
-# every build on a date nobody chose. Pinning decouples the upgrade from that date
-# so it happens deliberately, with someone watching. Tracked as CS-442.
+# between 19 October and 19 November 2026 (actions/runner-images#14748), which
+# would move the OS under every build on a date nobody chose. Pinning decouples
+# the upgrade from that date so it happens deliberately (CS-442).
+#
+# Now on 26.04, moved ahead of the migration on the evidence of a trial run
+# rather than by the calendar (CS-444, run 35712755368 -- green). Staying
+# pinned keeps the next migration a decision too.
+#
+# This workflow caches nothing, so it has none of the cross-image cache problem
+# that made the same move elsewhere a two-part change: there is no target/ dir
+# to restore from the wrong image.
 
 # Every push, on every branch, plus every pull request whatever it targets.
 #
@@ -28,7 +36,7 @@ env:
 jobs:
   build:
 
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
 
     steps:
     # uls-client comes from the PRIVATE mapi-lite repo over SSH, so the
