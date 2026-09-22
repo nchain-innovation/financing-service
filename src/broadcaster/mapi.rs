@@ -135,9 +135,22 @@ impl MapiBroadcaster {
                     conflicts.join(", ")
                 )
             };
+            // A conflict is final whatever the server says about retrying.
+            //
+            // `txn-mempool-conflict` means another transaction already holds
+            // an input of this one. Offering the identical transaction again
+            // cannot succeed -- the conflict is in the inputs, and they are
+            // gone. mapi-lite reports it as `failureRetryable: true`, which is
+            // how a caller ended up being told "retry may succeed" about a
+            // double spend that never would.
+            //
+            // Trusting the flag for everything else: this narrows one case the
+            // response itself contradicts, rather than second-guessing the
+            // upstream's judgement in general.
+            let retryable = result.failure_retryable && conflicts.is_empty();
             return Err(BroadcastError::Rejected {
                 description,
-                retryable: result.failure_retryable,
+                retryable,
             });
         }
 
@@ -507,6 +520,86 @@ mod tests {
             .await
             .expect("known is fine");
         assert_eq!(txid, tx.hash().encode());
+    }
+
+    /// CS-427: mapi-lite reported a `txn-mempool-conflict` with
+    /// `failureRetryable: true`, so the caller was told "retry may succeed"
+    /// about a double spend that never would. A conflict is in the inputs, and
+    /// once another transaction holds them, offering the identical transaction
+    /// again cannot work whatever the server says.
+    #[tokio::test]
+    async fn cs_427_a_conflict_is_final_even_when_the_server_calls_it_retryable() {
+        let server = MockServer::start().await;
+        let tx = sample_tx();
+        let rejection = txs_payload(json!({
+            "returnResult": "failure",
+            "resultDescription": "Mempool error, retry again later. (details: 258 txn-mempool-conflict)",
+            "txid": tx.hash().encode(),
+            // exactly what the ticket recorded
+            "failureRetryable": true,
+            "conflictedWith": [{
+                "txid": "1263e7f90ab93a140e5a4102c00dd12227bbbb4f98a53a62469f69521f863a17",
+                "size": 100,
+                "hex": "00",
+            }],
+        }));
+        Mock::given(method("POST"))
+            .and(path("/mapi/txs"))
+            .respond_with(ok(rejection))
+            .mount(&server)
+            .await;
+
+        match broadcaster(&server)
+            .broadcast_tx(&tx)
+            .await
+            .expect_err("rejected")
+        {
+            BroadcastError::Rejected {
+                description,
+                retryable,
+            } => {
+                assert!(
+                    description.contains("txn-mempool-conflict"),
+                    "{description}"
+                );
+                assert!(description.contains("1263e7f9"), "{description}");
+                assert!(
+                    !retryable,
+                    "a conflict cannot be resolved by resubmitting the same transaction"
+                );
+            }
+            other => panic!("expected a rejection, got {other:?}"),
+        }
+    }
+
+    /// The narrowing is only for conflicts. A rejection the server calls
+    /// retryable and that names no conflict is still retryable -- mempool
+    /// full, say -- and reporting it as final would send a caller away from
+    /// something that would have worked.
+    #[tokio::test]
+    async fn cs_427_a_retryable_rejection_without_a_conflict_stays_retryable() {
+        let server = MockServer::start().await;
+        let tx = sample_tx();
+        let rejection = txs_payload(json!({
+            "returnResult": "failure",
+            "resultDescription": "Mempool full",
+            "txid": tx.hash().encode(),
+            "failureRetryable": true,
+        }));
+        Mock::given(method("POST"))
+            .and(path("/mapi/txs"))
+            .respond_with(ok(rejection))
+            .mount(&server)
+            .await;
+
+        match broadcaster(&server)
+            .broadcast_tx(&tx)
+            .await
+            .expect_err("rejected")
+        {
+            BroadcastError::Rejected { retryable, .. } => assert!(retryable),
+            other => panic!("expected a rejection, got {other:?}"),
+        }
     }
 
     #[tokio::test]

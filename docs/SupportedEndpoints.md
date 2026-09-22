@@ -250,7 +250,7 @@ The status is derived from the code, so a caller that cannot read the body — a
 | `client_exists` | 409 | `client_id` is already configured | `POST /client` only |
 | `invalid_request` | 400 | The request is malformed | Fix the request; never retryable unchanged |
 | `broadcast_failed` | 502 | The upstream could not be reached, or refused the transaction in a way it said was worth retrying | Nothing was spent; retry may succeed |
-| `broadcast_rejected` | 409 | The upstream looked at the transaction and refused it, and said a resubmission would not change that | Nothing was spent, and **retrying will not help** — see below |
+| `broadcast_rejected` | 409 | The upstream looked at the transaction and refused it finally — either because it said so, or because it named a conflicting transaction | Nothing was spent, and **retrying will not help** — see below |
 | `broadcast_outcome_unknown` | 504 | The transaction was handed over and its fate is unknown — it may be on the network | **Do not retry with a new `idempotency_key`**; see below |
 | `partial_broadcast` | 422 | Some of the requested transactions broadcast, some did not | **Read the body** — the successful ones are in it |
 | `chain_unavailable` | 503 | The blockchain interface could not be reached | Retryable |
@@ -262,7 +262,9 @@ The status is derived from the code, so a caller that cannot read the body — a
 
 ### When the transaction is refused
 
-`broadcast_rejected` means the upstream answered, looked at the funding transaction, and will not take it however many times it is offered — `failureRetryable: false` in mapi-lite's terms. The commonest cause is a conflicting spend: another transaction already spends an input this one uses.
+`broadcast_rejected` means the upstream answered, looked at the funding transaction, and will not take it however many times it is offered. That is either `failureRetryable: false` in mapi-lite's terms, or a rejection that **names a conflicting transaction**.
+
+A conflict is treated as final whatever the upstream says about retrying. mapi-lite reports `txn-mempool-conflict` with `failureRetryable: true`, but the conflict is in the transaction's *inputs*: another transaction already holds them, and offering the identical transaction again cannot succeed. Callers were previously told "retry may succeed" about a double spend that never would. A rejection naming no conflict keeps the upstream's own verdict.
 
 Nothing was spent, so the `idempotency_key` is released and can be used again for the corrected request. But the same transaction will never be accepted, so something has to change first — usually the wallet's UTXO set, usually by an operator. The upstream's own reason, and its `retryable` verdict, are in the service log; they are not in the response, which carries a fixed description like every other error here.
 

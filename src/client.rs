@@ -1208,4 +1208,47 @@ mod tests {
             "the chain's confirmed copy is what is reported now"
         );
     }
+
+    /// CS-427: the same defect as CS-426 with a different symptom. Varying the
+    /// satoshi value makes each request build a *different* transaction, so
+    /// they are no longer identical -- but they still select the same input,
+    /// and the second one to reach the network is refused as
+    /// `txn-mempool-conflict`.
+    ///
+    /// Asserting on inputs rather than transaction hashes is what separates
+    /// this from CS-426: distinct hashes are not enough if they spend the same
+    /// coin.
+    #[test]
+    fn cs_427_varying_the_amount_still_must_not_reuse_an_input() {
+        let chain = vec![
+            cs_426_utxo(1, 5_000),
+            cs_426_utxo(2, 6_000),
+            cs_426_utxo(3, 7_000),
+        ];
+        let balance = Balance {
+            confirmed: 18_000,
+            unconfirmed: 0,
+        };
+        let mut client = client_holding(chain.clone());
+
+        let mut spent: Vec<(String, u32)> = Vec::new();
+        for satoshi in [1_000u64, 1_100, 1_200] {
+            let tx = client
+                .create_funding_tx(&cs_426_request(satoshi))
+                .expect("funds");
+            for input in &tx.inputs {
+                spent.push((input.prev_output.hash.encode(), input.prev_output.index));
+            }
+            // the refresh each request makes, against a chain that has not
+            // seen any of these transactions yet
+            client.apply_chain_state(balance, chain.clone());
+        }
+
+        let unique: std::collections::HashSet<_> = spent.iter().collect();
+        assert_eq!(
+            unique.len(),
+            spent.len(),
+            "an input was spent twice, which the network refuses as a conflict: {spent:?}"
+        );
+    }
 }
