@@ -79,6 +79,12 @@ filename = "./data/dynamic.toml"
 # satoshis_per_kb becomes the fallback used before the first quote and whenever
 # one cannot be had. Set use_mapi_fee_quote = false to always use the number
 # below.
+#
+# Change worth less than dust_threshold_satoshis is not paid back as an output
+# -- it stays in the transaction and the miner takes it as fee. A one-satoshi
+# change output costs more to spend than it holds, so paying it back only
+# strands it. Set 0 to pay every change back however small.
 # [fees]
 # satoshis_per_kb = 100
 # use_mapi_fee_quote = true
+# dust_threshold_satoshis = 135
