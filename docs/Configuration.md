@@ -72,6 +72,8 @@ An import that fails is logged as a warning and does not stop the service — th
 
 The service reads chain state often: twice per client per refresh — once for the balance, once for the UTXOs — from the periodic timer, from `GET /balance`, and from `POST /fund` both before building a transaction and again on the error path. Several clients, or one client and a little traffic, and those bursts overlap.
 
+**Those are two *calls*, which are no longer two requests.** Since chain-gang 0.11.3 (CS-456) a balance read is two HTTP requests and a UTXO read is one per 1000 UTXOs — 21 for the busy mainnet address that change was measured against. See the limit's scope below.
+
 WhatsOnChain documents **"up to 3 requests/sec is free"** and answers `429 Too Many Requests` above it. A failed refresh is the mild consequence; sustained violation risks a ban, which no amount of retrying recovers from. So outbound calls are spaced:
 
 ```toml
@@ -83,6 +85,10 @@ Left unset it follows the interface. `woc` talks to a public API and is limited 
 Set it explicitly to override either way — raise it if you have a paid WhatsOnChain plan, lower it for a node you want to go easy on, or set it to `0` to turn the limit off entirely.
 
 The limit applies to the whole service, not per client: concurrent refreshes share one allowance, which is what a per-IP limit at the far end actually measures. At startup the chosen limit is logged at INFO.
+
+**What it paces: calls, not HTTP requests (CS-457).** The limiter decorates the blockchain interface, so it takes one slot per `get_balance` or `get_utxo`, and chain-gang then issues however many requests that call needs inside it. For an address under 1000 UTXOs that is still one request per call and the guarantee holds exactly. Beyond it, this number is a floor on the spacing between calls rather than a ceiling on requests per second.
+
+It cannot currently be enforced at the request level: chain-gang's WhatsOnChain client builds its own HTTP client internally and exposes no way to supply one, so those requests are unreachable from this service. CS-457 tracks it. If you point this at a busy address on a free WhatsOnChain plan, lower `max_requests_per_second` to leave headroom rather than assuming the configured number is what reaches the API.
 
 #### When the interface is unreachable
 

@@ -1,17 +1,38 @@
 //! Keeping the service inside the blockchain interface's rate limit.
 //!
 //! WhatsOnChain publishes "up to 3 requests/sec is free" and answers 429 above
-//! it. Nothing in the service spaced its calls, and it makes two per client per
-//! refresh -- one for the balance, one for the UTXOs -- from a periodic timer,
-//! from `GET /balance`, and from `POST /fund` both before building and again
-//! on the error path. Several clients, or one client and a little traffic, and
-//! the bursts overlap. The reported symptom was a run of 429s within the same
-//! second, and the real risk is not the failed refresh: it is being banned for
-//! sustained violation, which no amount of retrying recovers from.
+//! it. Nothing in the service spaced its calls, and it makes two interface
+//! calls per client per refresh -- one for the balance, one for the UTXOs --
+//! from a periodic timer, from `GET /balance`, and from `POST /fund` both
+//! before building and again on the error path. Several clients, or one client
+//! and a little traffic, and the bursts overlap. The reported symptom was a run
+//! of 429s within the same second, and the real risk is not the failed refresh:
+//! it is being banned for sustained violation, which no amount of retrying
+//! recovers from.
 //!
 //! So the limit is honoured here rather than at each call site. A decorator
-//! around [`BlockchainInterface`] sees every outbound request whatever asked
-//! for it, and no future caller has to remember.
+//! around [`BlockchainInterface`] sees every outbound *call* whatever asked for
+//! it, and no future caller has to remember.
+//!
+//! # What this paces, and what it does not (CS-457)
+//!
+//! **One slot per interface call, not per HTTP request.** Those were the same
+//! thing when this was written against chain-gang 0.11.2. They stopped being
+//! the same in 0.11.3 (CS-456): `get_balance` is now two requests, and
+//! `get_utxo` is one per 1000 UTXOs -- 21 for the mainnet address CS-456
+//! measured. The limiter reserves one slot and chain-gang then issues all of
+//! them inside it.
+//!
+//! This cannot be fixed from here. `WocInterface` builds its own client and
+//! calls `reqwest::get` directly, and `WocInterface::new` takes no arguments,
+//! so there is no client, middleware or hook to supply -- the paging requests
+//! are unreachable from this crate by construction. Restoring the guarantee
+//! needs an upstream change; CS-457 carries the analysis and the options.
+//!
+//! So read `max_requests_per_second` as spacing between *calls*. For an address
+//! under 1000 UTXOs that is still one request each and the original guarantee
+//! holds exactly; beyond it, the configured number is a floor on call spacing
+//! rather than a ceiling on request rate.
 //!
 //! Only the interfaces that talk to someone else's server need this. A node
 //! reached over RPC, or a local UaaS, is the operator's own and is left
