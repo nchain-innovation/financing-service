@@ -52,6 +52,17 @@ struct ReservedOutpoint {
     since: Instant,
 }
 
+/// A change output this service created and broadcast, which the chain has not
+/// reported back yet.
+///
+/// Held whole, because keeping it in the cache means putting it back after a
+/// refresh has replaced the cache with what the chain says.
+#[derive(Clone, Debug)]
+struct PendingChange {
+    entry: UtxoEntry,
+    since: Instant,
+}
+
 #[derive(Clone, Debug)]
 pub struct FundingSpendPlan {
     spent_indices: Vec<usize>,
@@ -114,6 +125,11 @@ pub struct Client {
     /// resurrect them -- until the chain agrees they are spent or the
     /// reservation expires. See [`UNCERTAIN_SPEND_RESERVATION`].
     reserved: HashMap<OutPointKey, ReservedOutpoint>,
+    /// Change this service created and broadcast, which the chain has not
+    /// caught up with. Kept in the cache across refreshes so a client can
+    /// spend its own change without waiting for the chain to confirm what the
+    /// service already knows it sent.
+    pending_change: HashMap<OutPointKey, PendingChange>,
 }
 
 impl Client {
@@ -137,6 +153,7 @@ impl Client {
             balance: Balance::default(),
             unspent: Vec::new(),
             reserved: HashMap::new(),
+            pending_change: HashMap::new(),
         })
     }
 
@@ -169,17 +186,64 @@ impl Client {
     /// would offer the same input to the next funding request.
     pub fn apply_chain_state(&mut self, balance: Balance, unspent: Utxo) {
         self.release_expired_reservations();
+        self.expire_pending_change();
+
         // An outpoint the chain no longer reports as unspent has been spent,
-        // so the uncertain transaction landed and the reservation is done.
-        self.reserved
-            .retain(|key, _| unspent.iter().any(|entry| &outpoint_key(entry) == key));
+        // so the reservation has done its job and can go.
+        //
+        // Except for one this service created itself and the chain has not
+        // reported yet -- change from a transaction still in the mempool.
+        // "The chain stopped reporting it" and "the chain never reported it"
+        // look identical from here, so applying the rule to those would
+        // release the reservation the moment it was made. Those are held
+        // until they expire instead.
+        let ours: std::collections::HashSet<OutPointKey> =
+            self.pending_change.keys().cloned().collect();
+        self.reserved.retain(|key, _| {
+            ours.contains(key) || unspent.iter().any(|entry| &outpoint_key(entry) == key)
+        });
 
         self.balance = balance;
         self.unspent = unspent;
         if !self.reserved.is_empty() {
             self.withhold_reserved();
         }
+        self.restore_pending_change();
         self.unspent.sort_by_key(|x| x.value);
+    }
+
+    /// Forget change that has been pending too long to still be believed.
+    fn expire_pending_change(&mut self) {
+        let now = Instant::now();
+        self.pending_change
+            .retain(|_, pending| now.duration_since(pending.since) < UNCERTAIN_SPEND_RESERVATION);
+    }
+
+    /// Put back the change the service has broadcast but the chain has not
+    /// reported yet, and count it towards the balance so the two agree.
+    ///
+    /// A refresh replaces the cache with what the chain says, and the chain
+    /// does not yet say anything about a transaction still in the mempool. So
+    /// the inputs it spent are held out (`withhold_reserved`) and the change
+    /// it created is put back here -- the two halves of the same gap. An entry
+    /// goes once the chain reports it, which is the chain catching up, or once
+    /// the service has spent it in turn.
+    fn restore_pending_change(&mut self) {
+        let reported: std::collections::HashSet<OutPointKey> =
+            self.unspent.iter().map(outpoint_key).collect();
+        self.pending_change.retain(|key, _| !reported.contains(key));
+        self.pending_change
+            .retain(|key, _| !self.reserved.contains_key(key));
+
+        for pending in self.pending_change.values() {
+            let value = pending.entry.value;
+            if pending.entry.height < 0 {
+                self.balance.unconfirmed += value;
+            } else {
+                self.balance.confirmed += value;
+            }
+            self.unspent.push(pending.entry.clone());
+        }
     }
 
     /// Drop the cached copy of every reserved outpoint, and take its value off
@@ -560,8 +624,35 @@ impl Client {
         self.create_funding_tx_multi_input(fund_request, &selected_indices)
     }
 
+    /// Commit a spend whose transaction was broadcast successfully.
+    ///
+    /// The inputs are reserved, not merely dropped from the cache. Dropping
+    /// them is undone by the very next refresh: the transaction is in the
+    /// mempool and the read interface still reports its inputs as unspent, so
+    /// the cache takes them back and the next funding request selects the same
+    /// one -- building the identical transaction and handing a second caller
+    /// an outpoint that already belongs to the first. Three requests a second
+    /// apart were enough to see it.
+    ///
+    /// The change output is pinned for the same reason in reverse. It is real
+    /// -- the transaction carrying it was broadcast -- but it is not on chain
+    /// yet either, so a refresh would drop it and leave the client unable to
+    /// spend its own change until the chain caught up.
     pub fn commit_funding_spend(&mut self, plan: FundingSpendPlan) {
+        let change_entry = plan.change_entry.clone();
         self.spend_utxos(&plan.spent_indices, plan.change_entry);
+        let now = Instant::now();
+        for entry in plan.spent_outpoints {
+            self.reserved
+                .insert(outpoint_key(&entry), ReservedOutpoint { entry, since: now });
+        }
+        self.pending_change.insert(
+            outpoint_key(&change_entry),
+            PendingChange {
+                entry: change_entry,
+                since: now,
+            },
+        );
     }
 
     /// Commit a spend whose transaction may or may not have reached the
@@ -944,18 +1035,177 @@ mod tests {
         assert!(client.unspent.is_empty(), "{:?}", client.unspent);
     }
 
-    /// A certain broadcast is unaffected: the spend is committed outright,
-    /// change and all, and nothing is reserved.
+    /// A certain broadcast commits the spend outright, change and all -- and
+    /// reserves its inputs too.
+    ///
+    /// This test used to assert the opposite, that a successful broadcast
+    /// reserved nothing. That was wrong, and CS-426 is what it cost: the
+    /// inputs were dropped from the cache but not held, so the next refresh
+    /// took them straight back from a chain that had not seen the transaction
+    /// yet, and the request after that spent them again.
     #[test]
-    fn sr_fund_012_a_successful_broadcast_reserves_nothing() {
+    fn sr_fund_012_a_successful_broadcast_reserves_its_inputs() {
         let mut client = client_holding(vec![utxo("aa", 0, 5_000, 100)]);
         client.commit_funding_spend(FundingSpendPlan {
             spent_indices: vec![0],
             change_entry: utxo("change", 0, 4_800, 0),
             spent_outpoints: vec![utxo("aa", 0, 5_000, 100)],
         });
-        assert_eq!(client.reserved_outpoint_count(), 0);
+        assert_eq!(
+            client.reserved_outpoint_count(),
+            1,
+            "the spent input must be held, not merely dropped"
+        );
         assert_eq!(client.unspent.len(), 1);
-        assert_eq!(client.unspent[0].value, 4_800);
+        assert_eq!(client.unspent[0].value, 4_800, "change is spendable");
+    }
+
+    // ---- CS-426: the same outpoint handed out more than once ----
+
+    /// A real 32-byte txid, because these tests build transactions rather than
+    /// only inspecting the cache.
+    fn cs_426_utxo(seed: u8, value: i64) -> UtxoEntry {
+        utxo(&format!("{:064x}", seed), 0, value, 1_758_719)
+    }
+
+    fn cs_426_request(satoshi: u64) -> FundRequest {
+        FundRequest {
+            client_id: TEST_CLIENT_ID.to_string(),
+            satoshi,
+            no_of_outpoints: 1,
+            multiple_tx: false,
+            locking_scripts: vec![hex::decode(LOCKING_SCRIPT_HEX).unwrap()],
+        }
+    }
+
+    /// The bug as reported. Three identical `POST /fund` calls a second apart
+    /// came back with the same outpoint and the same raw transaction, so three
+    /// callers were each told they owned what was in fact one output.
+    ///
+    /// Each request refreshes, and the chain has not caught up: the first
+    /// transaction is in the mempool and its input still reads as unspent. The
+    /// cache took it back, and the next request spent it again.
+    #[test]
+    fn cs_426_repeated_requests_do_not_hand_out_the_same_outpoint() {
+        let chain = vec![
+            cs_426_utxo(1, 5_000),
+            cs_426_utxo(2, 6_000),
+            cs_426_utxo(3, 7_000),
+        ];
+        let balance = Balance {
+            confirmed: 18_000,
+            unconfirmed: 0,
+        };
+        let mut client = client_holding(chain.clone());
+
+        let mut hashes = Vec::new();
+        for _ in 0..3 {
+            let tx = client
+                .create_funding_tx(&cs_426_request(1_000))
+                .expect("funds");
+            hashes.push(tx.hash().encode());
+            // the refresh each request makes, against a chain that still
+            // reports every input as unspent
+            client.apply_chain_state(balance, chain.clone());
+        }
+
+        hashes.sort();
+        hashes.dedup();
+        assert_eq!(
+            hashes.len(),
+            3,
+            "three requests must produce three different transactions"
+        );
+    }
+
+    /// The mechanism behind it. A refresh replaces the cache with what the
+    /// chain says, and the chain says nothing about a transaction it has not
+    /// seen, so an input the service has just spent must be held out of the
+    /// cache rather than merely removed from it.
+    #[test]
+    fn cs_426_a_refresh_does_not_return_an_input_already_spent() {
+        let chain = vec![cs_426_utxo(1, 5_000), cs_426_utxo(2, 6_000)];
+        let balance = Balance {
+            confirmed: 11_000,
+            unconfirmed: 0,
+        };
+        let mut client = client_holding(chain.clone());
+
+        let tx = client
+            .create_funding_tx(&cs_426_request(1_000))
+            .expect("funds");
+        let spent: Vec<String> = tx
+            .inputs
+            .iter()
+            .map(|input| input.prev_output.hash.encode())
+            .collect();
+
+        client.apply_chain_state(balance, chain);
+
+        for hash in &spent {
+            assert!(
+                !client.unspent.iter().any(|utxo| &utxo.tx_hash == hash),
+                "the refresh handed back an input the service had spent: {hash}"
+            );
+        }
+    }
+
+    /// The other half. The change is real -- its transaction was broadcast --
+    /// but the chain has not reported it either, so a refresh would drop it
+    /// and leave the client unable to spend its own change.
+    #[test]
+    fn cs_426_change_survives_a_refresh_that_has_not_seen_it() {
+        let chain = vec![cs_426_utxo(1, 5_000)];
+        let balance = Balance {
+            confirmed: 5_000,
+            unconfirmed: 0,
+        };
+        let mut client = client_holding(chain.clone());
+
+        client
+            .create_funding_tx(&cs_426_request(1_000))
+            .expect("funds");
+        let before: i64 = client.unspent.iter().map(|u| u.value).sum();
+        assert!(before > 0, "there is change to keep");
+
+        client.apply_chain_state(balance, chain);
+
+        assert_eq!(
+            client.unspent.iter().map(|u| u.value).sum::<i64>(),
+            before,
+            "the refresh dropped change the service had already broadcast"
+        );
+    }
+
+    /// Once the chain catches up it is authoritative again: the spent input is
+    /// gone from what it reports, the change is in it, and the service stops
+    /// holding either.
+    #[test]
+    fn cs_426_the_service_defers_to_the_chain_once_it_catches_up() {
+        let mut client = client_holding(vec![cs_426_utxo(1, 5_000)]);
+        client
+            .create_funding_tx(&cs_426_request(1_000))
+            .expect("funds");
+        let change = client.unspent[0].clone();
+
+        // the chain now reports the change and no longer reports the input
+        client.apply_chain_state(
+            Balance {
+                confirmed: change.value,
+                unconfirmed: 0,
+            },
+            vec![UtxoEntry {
+                height: 900,
+                ..change.clone()
+            }],
+        );
+
+        assert_eq!(client.reserved_outpoint_count(), 0, "reservation released");
+        assert_eq!(client.unspent.len(), 1);
+        assert_eq!(
+            client.get_balance().confirmed,
+            change.value,
+            "the chain's confirmed copy is what is reported now"
+        );
     }
 }
