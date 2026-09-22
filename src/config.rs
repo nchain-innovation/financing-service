@@ -31,11 +31,25 @@ pub struct BlockchainInterfaceConfig {
     /// if it is a descriptor wallet, where `importaddress` is refused.
     #[serde(default = "default_rpc_import_addresses")]
     pub rpc_import_addresses: bool,
+    /// Ceiling on outbound requests per second to the blockchain interface.
+    ///
+    /// Left unset it follows the interface: `woc` talks to a public API that
+    /// documents "up to 3 requests/sec is free" and answers 429 above it, so
+    /// it is limited by default; `rpc` and `uaas` are the operator's own
+    /// servers and are not. Set it explicitly to override either way, or to
+    /// `0` to turn the limit off.
+    #[serde(default)]
+    pub max_requests_per_second: Option<u32>,
 }
 
 fn default_rpc_import_addresses() -> bool {
     true
 }
+
+/// WhatsOnChain's documented free-tier allowance, and so the default for
+/// `interface_type = "woc"`. Exceeding it earns a 429, and sustained
+/// violation earns a ban, which no retry recovers from.
+pub const WOC_REQUESTS_PER_SECOND: u32 = 3;
 
 impl Default for BlockchainInterfaceConfig {
     fn default() -> Self {
@@ -46,11 +60,26 @@ impl Default for BlockchainInterfaceConfig {
             rpc_user: None,
             rpc_password: None,
             rpc_import_addresses: default_rpc_import_addresses(),
+            max_requests_per_second: None,
         }
     }
 }
 
 impl BlockchainInterfaceConfig {
+    /// Outbound requests per second to allow, or `None` for no limit.
+    ///
+    /// An explicit setting always wins, including an explicit `0` meaning
+    /// unlimited. Otherwise only the interfaces that call somebody else's
+    /// server are limited.
+    pub fn outbound_rate_limit(&self) -> Option<u32> {
+        match self.max_requests_per_second {
+            Some(0) => None,
+            Some(limit) => Some(limit),
+            None if self.interface_type == "woc" => Some(WOC_REQUESTS_PER_SECOND),
+            None => None,
+        }
+    }
+
     /// Reject a configuration the chosen interface cannot work with, at
     /// startup rather than on the first request.
     pub fn validate(&self) -> Result<(), String> {
@@ -1367,5 +1396,56 @@ filename = "./data/dynamic.toml"
         assert!(plaintext_fields(Some("Bearer literal")).contains(&field));
         assert!(!plaintext_fields(Some("env:FS_MAPI_LITE_AUTH_TOKEN")).contains(&field));
         assert!(!plaintext_fields(None).contains(&field));
+    }
+
+    /// CS-418: the default has to honour what WhatsOnChain publishes, without
+    /// the operator having to know the number. `woc` is somebody else's
+    /// server; `rpc` and `uaas` are the operator's own and are left alone.
+    #[test]
+    fn cs_418_only_the_public_api_is_rate_limited_by_default() {
+        let woc = BlockchainInterfaceConfig {
+            interface_type: "woc".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(woc.outbound_rate_limit(), Some(WOC_REQUESTS_PER_SECOND));
+        assert_eq!(
+            WOC_REQUESTS_PER_SECOND, 3,
+            "WhatsOnChain documents 'up to 3 requests/sec is free'"
+        );
+
+        for local in ["rpc", "uaas", "test"] {
+            let config = BlockchainInterfaceConfig {
+                interface_type: local.to_string(),
+                ..Default::default()
+            };
+            assert_eq!(config.outbound_rate_limit(), None, "{local}");
+        }
+    }
+
+    /// An operator with a paid plan, or a mirror of their own, can raise it;
+    /// zero turns it off entirely. An explicit setting always wins over the
+    /// per-interface default.
+    #[test]
+    fn cs_418_an_explicit_limit_overrides_the_default_either_way() {
+        let faster = BlockchainInterfaceConfig {
+            interface_type: "woc".to_string(),
+            max_requests_per_second: Some(20),
+            ..Default::default()
+        };
+        assert_eq!(faster.outbound_rate_limit(), Some(20));
+
+        let off = BlockchainInterfaceConfig {
+            interface_type: "woc".to_string(),
+            max_requests_per_second: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(off.outbound_rate_limit(), None);
+
+        let limited_node = BlockchainInterfaceConfig {
+            interface_type: "rpc".to_string(),
+            max_requests_per_second: Some(5),
+            ..Default::default()
+        };
+        assert_eq!(limited_node.outbound_rate_limit(), Some(5));
     }
 }

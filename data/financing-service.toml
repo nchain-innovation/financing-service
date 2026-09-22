@@ -9,6 +9,10 @@ network_type = "testnet"
 # rpc_user = "rpcuser"
 # rpc_password = "env:FS_RPC_PASSWORD"
 # rpc_import_addresses = true
+# Ceiling on outbound requests to the blockchain interface. Defaults to 3 for
+# woc, which documents "up to 3 requests/sec is free" and answers 429 above it;
+# unset for rpc and uaas, which are your own servers. 0 turns it off.
+# max_requests_per_second = 3
 # url = "http://localhost:5010"
 
 [web_interface]

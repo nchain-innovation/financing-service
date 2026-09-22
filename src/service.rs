@@ -130,6 +130,21 @@ pub struct Service {
     /// How long a probe verdict is reused for. Zero without `[mapi_lite]`,
     /// where nothing is ever probed.
     mapi_health_ttl: Duration,
+    /// Consecutive failures reaching the blockchain interface, so a run of
+    /// them reads as a run and recovery from one is announced.
+    chain_health: Mutex<ChainHealth>,
+}
+
+/// A run of failures talking to the blockchain interface.
+///
+/// The bug report's complaint was not only that refreshes failed, but that
+/// nothing said when they stopped failing: the warnings were "the last log
+/// lines", leaving no way to tell a service that had recovered from one still
+/// in trouble. Counting the run gives each warning the length of it, and lets
+/// recovery be announced once.
+#[derive(Default)]
+struct ChainHealth {
+    consecutive_failures: u64,
 }
 
 /// A mapi-lite probe verdict and the moment it was taken.
@@ -194,12 +209,49 @@ impl Service {
             )),
             address_watcher,
             mapi_health: Mutex::new(None),
+            chain_health: Mutex::new(ChainHealth::default()),
             mapi_health_ttl: config
                 .mapi_lite
                 .as_ref()
                 .map(|mapi_lite| mapi_lite.health_timeout())
                 .unwrap_or_default(),
         })
+    }
+
+    /// Note that the blockchain interface answered.
+    ///
+    /// Announces recovery once, naming how long the run of failures was. The
+    /// bug report asked for exactly this: without it, warnings simply stop and
+    /// an operator cannot tell a recovered service from a stuck one.
+    /// Returns the length of the run it recovered from, so the transition is
+    /// testable without reading the log it also writes.
+    async fn record_chain_success(&self) -> Option<u64> {
+        let mut health = self.chain_health.lock().await;
+        if health.consecutive_failures == 0 {
+            return None;
+        }
+        let recovered_from = health.consecutive_failures;
+        health.consecutive_failures = 0;
+        log::info!("blockchain interface recovered after {recovered_from} consecutive failure(s)");
+        Some(recovered_from)
+    }
+
+    /// Length of the current run of failures. Zero when the last attempt
+    /// worked.
+    #[cfg(test)]
+    async fn consecutive_chain_failures(&self) -> u64 {
+        self.chain_health.lock().await.consecutive_failures
+    }
+
+    /// Note that the blockchain interface did not answer, and say so with the
+    /// length of the run so far.
+    async fn record_chain_failure(&self, error: &str) {
+        let mut health = self.chain_health.lock().await;
+        health.consecutive_failures += 1;
+        log::warn!(
+            "blockchain interface failure #{}: {error}",
+            health.consecutive_failures
+        );
     }
 
     /// Claim an idempotency key for a funding request.
@@ -469,9 +521,13 @@ impl Service {
                     .update_balance(self.blockchain_interface.as_ref())
                     .await
                 {
-                    Ok(_) => BlockchainConnectionStatus::Connected,
+                    Ok(_) => {
+                        let _ = self.record_chain_success().await;
+                        BlockchainConnectionStatus::Connected
+                    }
                     Err(e) => {
-                        log::warn!("update_balance - failed {:?}", e);
+                        self.record_chain_failure(&format!("update_balance: {e:?}"))
+                            .await;
                         BlockchainConnectionStatus::Failed
                     }
                 };
@@ -506,10 +562,13 @@ impl Service {
             match chain_state {
                 Ok(utxo) => client.write().await.apply_chain_state(utxo),
                 Err(e) => {
-                    log::warn!("update_balance - failed {}", e);
+                    service.record_chain_failure(&e).await;
                     status = BlockchainConnectionStatus::Failed;
                 }
             }
+        }
+        if matches!(status, BlockchainConnectionStatus::Connected) {
+            let _ = service.record_chain_success().await;
         }
         *service.blockchain_status.write().await = status;
         *service.blockchain_update_time.write().await = Some(SystemTime::now());
@@ -526,7 +585,16 @@ impl Service {
             .ok_or_else(|| format!("Unknown client_id {client_id}"))?;
         let address = client.read().await.get_address();
         let chain_state =
-            fetch_chain_state(service.blockchain_interface.as_ref(), &address).await?;
+            match fetch_chain_state(service.blockchain_interface.as_ref(), &address).await {
+                Ok(state) => {
+                    service.record_chain_success().await;
+                    state
+                }
+                Err(e) => {
+                    service.record_chain_failure(&e).await;
+                    return Err(e);
+                }
+            };
         client.write().await.apply_chain_state(chain_state);
         *service.blockchain_status.write().await = BlockchainConnectionStatus::Connected;
         *service.blockchain_update_time.write().await = Some(SystemTime::now());
@@ -1220,6 +1288,36 @@ mod tests {
             .await
             .map_err(CodedError::internal)?;
         Service::execute_funding(service, fund_request).await
+    }
+
+    /// CS-418 asked for a line saying the interface came back. The reporter's
+    /// complaint was that warnings were "the last log lines", leaving no way
+    /// to tell a recovered service from a stuck one -- so recovery is
+    /// announced once, with the length of the run, and only when there was
+    /// something to recover from.
+    #[tokio::test]
+    async fn cs_418_recovery_is_announced_once_after_a_run_of_failures() {
+        let config = test_config(&unique_dynamic_config_path());
+        let blockchain = test_blockchain_interface(&config).await;
+        let service = Arc::new(Service::new_for_test(&config, blockchain).await);
+
+        // a healthy service announces nothing
+        assert_eq!(service.consecutive_chain_failures().await, 0);
+        assert_eq!(service.record_chain_success().await, None);
+
+        for _ in 0..3 {
+            service.record_chain_failure("429 Too Many Requests").await;
+        }
+        assert_eq!(service.consecutive_chain_failures().await, 3);
+
+        // recovery names the run, once
+        assert_eq!(service.record_chain_success().await, Some(3));
+        assert_eq!(service.consecutive_chain_failures().await, 0);
+        assert_eq!(
+            service.record_chain_success().await,
+            None,
+            "a second success must not announce recovery again"
+        );
     }
 
     /// A service reading through `blockchain` and writing through

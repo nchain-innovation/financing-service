@@ -6,6 +6,7 @@ use chain_gang::interface::{
 
 use crate::address_watcher::AddressWatcher;
 use crate::config::Config;
+use crate::outbound_rate_limit::RateLimited;
 
 /// A configured backend, plus the means to tell it which addresses to watch
 /// when it needs telling.
@@ -18,6 +19,29 @@ pub struct Backend {
 
 /// Takes a config and returns the appropriate configured object that implements BlockchainInterface
 pub fn blockchain_factory(config: &Config) -> Result<Backend, String> {
+    let backend = build_backend(config)?;
+
+    // Wrapped last, so every outbound call goes through it whatever the
+    // interface -- and so the inner interface is fully configured first.
+    // The address watcher keeps talking to the node directly: importing an
+    // address happens once per client at startup and is not what runs into a
+    // rate limit.
+    match config.blockchain_interface.outbound_rate_limit() {
+        Some(rps) => {
+            log::info!(
+                "limiting {} to {rps} request(s) per second",
+                config.blockchain_interface.interface_type
+            );
+            Ok(Backend {
+                interface: Arc::new(RateLimited::new(backend.interface, rps)),
+                address_watcher: backend.address_watcher,
+            })
+        }
+        None => Ok(backend),
+    }
+}
+
+fn build_backend(config: &Config) -> Result<Backend, String> {
     let network = config
         .get_network()
         .map_err(|_| "Unable to decode network from config".to_string())?;
@@ -121,6 +145,7 @@ mod tests {
                 rpc_user: user.map(str::to_string),
                 rpc_password: password.map(str::to_string),
                 rpc_import_addresses: import,
+                ..Default::default()
             },
             ..Default::default()
         }

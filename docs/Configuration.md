@@ -18,6 +18,7 @@ network_type = "testnet"
 # rpc_user = "rpcuser"                    # required for rpc
 # rpc_password = "env:FS_RPC_PASSWORD"    # required for rpc
 # rpc_import_addresses = true             # rpc only; default true
+# max_requests_per_second = 3             # default 3 for woc, unset otherwise
 ```
 
 Supported `network_type` values: `mainnet`, `testnet`, `stn`, `regtest`.
@@ -66,6 +67,40 @@ rpc_import_addresses = false   # default: true
 Turn it off if you manage the node's wallet yourself, or if it is a **descriptor wallet**, where `importaddress` is refused. With imports off, make sure each client's address is already tracked; `GET /client/{client_id}/address` gives you the address.
 
 An import that fails is logged as a warning and does not stop the service — the node may be refusing for a reason you already know about. The warning names the address and says what follows from it: that balance reads zero and funding is refused until the node tracks the address. Worth watching for on first run, because a reachable node reporting an empty wallet otherwise looks like a bug at the caller.
+
+#### Outbound rate limiting
+
+The service reads chain state often: twice per client per refresh — once for the balance, once for the UTXOs — from the periodic timer, from `GET /balance`, and from `POST /fund` both before building a transaction and again on the error path. Several clients, or one client and a little traffic, and those bursts overlap.
+
+WhatsOnChain documents **"up to 3 requests/sec is free"** and answers `429 Too Many Requests` above it. A failed refresh is the mild consequence; sustained violation risks a ban, which no amount of retrying recovers from. So outbound calls are spaced:
+
+```toml
+max_requests_per_second = 3   # woc default; unset for rpc and uaas
+```
+
+Left unset it follows the interface. `woc` talks to a public API and is limited to 3/s. `rpc` and `uaas` are the operator's own servers, so they are not limited at all.
+
+Set it explicitly to override either way — raise it if you have a paid WhatsOnChain plan, lower it for a node you want to go easy on, or set it to `0` to turn the limit off entirely.
+
+The limit applies to the whole service, not per client: concurrent refreshes share one allowance, which is what a per-IP limit at the far end actually measures. At startup the chosen limit is logged at INFO.
+
+#### When the interface is unreachable
+
+A failed refresh is logged as a warning with the length of the run so far:
+
+```
+WARN blockchain interface failure #7: get_utxo failed: ... 429 Too Many Requests
+```
+
+and when it comes back, that is logged too:
+
+```
+INFO blockchain interface recovered after 7 consecutive failure(s)
+```
+
+The recovery line matters as much as the warnings. Without it, warnings simply stop, and a service that has recovered looks exactly like one that has given up. `GET /status` reports `blockchain_status` and `blockchain_update_time` alongside, for the same question asked at a point in time rather than in the log.
+
+Note that `GET /health` stays `ok` throughout: it is a liveness check and deliberately depends on no upstream. `GET /ready` is the endpoint that reflects whether the service can do its job.
 
 **`test` is a fixture, not a backend.** It is an in-process stub used by the unit tests, with a UTXO set injected directly by the test harness. It has no network of its own, so the `network_type` you set alongside it only affects address encoding. It will start and serve requests as a configured backend, but its UTXO set is empty, so balances read zero and funding is refused — useful for exercising the API surface, not for funding anything.
 
