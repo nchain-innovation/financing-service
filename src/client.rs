@@ -302,11 +302,6 @@ impl Client {
         self.address.to_string()
     }
 
-    /// Return the value of the largest unspent UTXO
-    fn get_largest_unspent(&self) -> Option<i64> {
-        self.unspent.iter().max_by_key(|x| x.value).map(|x| x.value)
-    }
-
     /// Return the smallest unspent that is greater than given satoshi
     fn get_smallest_unspent(&self, satoshi: u64) -> Option<&UtxoEntry> {
         self.unspent.iter().find(|utxo| utxo.value > satoshi as i64)
@@ -347,6 +342,71 @@ impl Client {
         }
     }
 
+    /// Bytes in a standard P2PKH output script, the shape `POST /fund` pays
+    /// to unless a caller asks for something else. Used to answer "how much
+    /// can I withdraw" without a request to cost against.
+    const P2PKH_SCRIPT_BYTES: u64 = 25;
+
+    /// The most a single `POST /fund` could ask for right now, assuming one
+    /// standard P2PKH outpoint.
+    ///
+    /// Reported on `GET /balance` because the balance alone does not answer
+    /// the question a caller actually has. Fees come out of the same UTXOs,
+    /// and how the balance is divided changes what it can pay -- so this is
+    /// usually well under `confirmed + unconfirmed`, and a caller that
+    /// subtracts a guessed fee will guess wrong.
+    pub fn max_fundable_p2pkh(&self) -> i64 {
+        self.max_fundable(Self::P2PKH_SCRIPT_BYTES)
+    }
+
+    /// The largest amount a single funding transaction can pay out, given the
+    /// UTXOs this client actually holds.
+    ///
+    /// Not simply "balance minus a fee". Every input added to a transaction
+    /// adds bytes and so adds fee, and a small enough input costs more to
+    /// spend than it brings in -- the fee steps by 500 satoshi at each
+    /// kilobyte, so the input that crosses a boundary can be worth far less
+    /// than it costs. Spending everything is therefore often worse than
+    /// spending some of it, and the real ceiling is the best any number of
+    /// inputs achieves:
+    ///
+    /// ```text
+    /// max over n of ( sum of the n largest UTXOs  -  fee(n inputs) )
+    /// ```
+    ///
+    /// One satoshi is then taken off, because a funding transaction pays its
+    /// change back to the client and an output of zero is not a change output
+    /// -- the builder rejects it.
+    ///
+    /// Returns 0 rather than a negative number when nothing can be funded.
+    fn max_fundable(&self, output_script_bytes: u64) -> i64 {
+        let mut values: Vec<i64> = self.unspent.iter().map(|utxo| utxo.value).collect();
+        values.sort_unstable_by(|a, b| b.cmp(a));
+
+        let mut running = 0i64;
+        let mut best = 0i64;
+        for (index, value) in values.iter().enumerate() {
+            running += value;
+            let fee = Self::estimate_fee(output_script_bytes, index as u32 + 1) as i64;
+            best = best.max(running - fee - 1);
+        }
+        best.max(0)
+    }
+
+    /// The largest amount that could be funded if this client's balance sat in
+    /// a single UTXO.
+    ///
+    /// The ceiling that no amount of tidying can raise: it costs one input's
+    /// worth of fee and nothing more. Comparing against it separates "this
+    /// wallet does not hold enough" from "it holds enough but not in a shape
+    /// that can be spent", which are the two things a caller can act on and
+    /// which need different actions -- top up, or consolidate.
+    fn max_fundable_if_consolidated(&self, output_script_bytes: u64) -> i64 {
+        let total = self.total_unspent();
+        let fee = Self::estimate_fee(output_script_bytes, 1) as i64;
+        (total - fee - 1).max(0)
+    }
+
     fn count_utxos_above(&self, amount: u64) -> usize {
         self.unspent
             .iter()
@@ -364,7 +424,11 @@ impl Client {
             selected.push(index);
             let input_sum: i64 = selected.iter().map(|&i| self.unspent[i].value).sum();
             let total_cost = Self::estimate_total_cost(fund_request, selected.len() as u32) as i64;
-            if input_sum >= total_cost {
+            // Strictly greater, not `>=`. The builder pays change back to the
+            // client and rejects a change output of zero, so a set that covers
+            // the cost exactly is one it cannot build -- accepting it here
+            // turned a fundable-looking request into an internal error.
+            if input_sum > total_cost {
                 return Some(selected);
             }
         }
@@ -441,6 +505,12 @@ impl Client {
     }
 
     /// Return a coded error when the client cannot fund the request.
+    /// Return a coded error when the client cannot fund the request.
+    ///
+    /// The two modes cost quite differently -- one transaction spending as
+    /// many inputs as it needs, or one transaction per outpoint each spending
+    /// a single input -- so they are judged separately rather than through one
+    /// estimate that suits neither.
     pub fn funding_balance_error(&self, fund_request: &FundRequest) -> Option<CodedError> {
         if self.unspent.is_empty() {
             return Some(CodedError::new(
@@ -449,54 +519,95 @@ impl Client {
             ));
         }
 
-        let total_cost = Self::estimate_total_cost(fund_request, 1);
+        if fund_request.no_of_outpoints > 1 && fund_request.multiple_tx {
+            return self.multiple_tx_funding_error(fund_request);
+        }
+        self.single_tx_funding_error(fund_request)
+    }
+
+    /// Whether one transaction can pay every requested outpoint.
+    ///
+    /// Judged against what this UTXO set can actually pay out, not against a
+    /// single-input estimate: the fee depends on how many inputs the
+    /// transaction ends up spending, so an estimate assuming one input
+    /// understates the cost of every wallet that needs more, and reports a
+    /// requirement the caller cannot act on.
+    fn single_tx_funding_error(&self, fund_request: &FundRequest) -> Option<CodedError> {
+        // What the caller is asking the transaction to pay out, change aside.
+        let requested = (fund_request.satoshi * fund_request.no_of_outpoints as u64) as i64;
+        let script_bytes = fund_request.output_script_bytes();
         let total_available = self.total_unspent();
 
-        if total_available <= total_cost as i64 {
+        // Two ceilings, and the gap between them is the diagnosis. The first
+        // is what this balance could pay out if it sat in a single UTXO; the
+        // second is what it can pay out as it actually sits. Asking above the
+        // first needs more money. Asking between them needs the same money in
+        // fewer pieces. The caller can act on either, and they are different
+        // actions.
+        let consolidated_max = self.max_fundable_if_consolidated(script_bytes);
+        let actual_max = self.max_fundable(script_bytes);
+
+        if requested > consolidated_max {
             return Some(CodedError::new(
                 ErrorCode::InsufficientBalance,
                 format!(
-                    "Insufficient client balance: {total_available} satoshi available, {total_cost} required."
+                    "Insufficient client balance: {requested} satoshi requested, but of the \
+                     {total_available} satoshi available at most {consolidated_max} can be paid \
+                     out once fees are covered."
                 ),
             ));
         }
 
-        if fund_request.no_of_outpoints > 1 && fund_request.multiple_tx {
-            // Scripts may differ in size, so require a UTXO large enough for
-            // the most expensive of the transactions rather than assuming all
-            // are the size of the first.
-            let per_tx_cost = (0..fund_request.no_of_outpoints as usize)
-                .map(|index| {
-                    fund_request.satoshi
-                        + Self::estimate_fee(fund_request.script_at(index).len() as u64, 1)
-                })
-                .max()
-                .unwrap_or(fund_request.satoshi);
-            let suitable_utxos = self.count_utxos_above(per_tx_cost);
-            if suitable_utxos < fund_request.no_of_outpoints as usize {
-                return Some(CodedError::new(
-                    ErrorCode::NoSuitableUtxo,
-                    format!(
-                        "Not enough UTXOs for {} separate funding transactions: {suitable_utxos} suitable UTXOs, {} required.",
-                        fund_request.no_of_outpoints, fund_request.no_of_outpoints
-                    ),
-                ));
-            }
-            return None;
-        }
-
-        if self.select_utxo_indices(fund_request).is_none() {
-            let largest = self.get_largest_unspent().unwrap_or(0);
-            let max_inputs = self.unspent.len() as u32;
-            let required_with_all_inputs = Self::estimate_total_cost(fund_request, max_inputs);
+        if requested > actual_max {
             return Some(CodedError::new(
                 ErrorCode::NoSuitableUtxo,
                 format!(
-                    "Unable to select UTXOs for funding transaction: largest UTXO is {largest} satoshi, {required_with_all_inputs} required including fees."
+                    "Unable to fund {requested} satoshi from this UTXO set: at most {actual_max} \
+                     can be paid out, because spending more of these {} UTXOs costs more in fees \
+                     than the inputs are worth. The balance of {total_available} satoshi would \
+                     support up to {consolidated_max} if it were consolidated into one UTXO.",
+                    self.unspent.len()
                 ),
             ));
         }
 
+        None
+    }
+
+    /// Whether a separate transaction can be built for each requested
+    /// outpoint.
+    ///
+    /// Each one spends a single input, so the question is not what the balance
+    /// totals but how many individual UTXOs are big enough to carry an
+    /// outpoint and its fee on their own.
+    fn multiple_tx_funding_error(&self, fund_request: &FundRequest) -> Option<CodedError> {
+        // Scripts may differ in size, so require a UTXO large enough for the
+        // most expensive of the transactions rather than assuming all are the
+        // size of the first.
+        let per_tx_cost = (0..fund_request.no_of_outpoints as usize)
+            .map(|index| {
+                fund_request.satoshi
+                    + Self::estimate_fee(fund_request.script_at(index).len() as u64, 1)
+            })
+            .max()
+            .unwrap_or(fund_request.satoshi);
+
+        let suitable_utxos = self.count_utxos_above(per_tx_cost);
+        if suitable_utxos < fund_request.no_of_outpoints as usize {
+            let total_available = self.total_unspent();
+            return Some(CodedError::new(
+                ErrorCode::NoSuitableUtxo,
+                format!(
+                    "Not enough UTXOs for {} separate funding transactions: {suitable_utxos} of \
+                     the {} UTXOs hold more than the {per_tx_cost} satoshi one transaction needs, \
+                     and {} are required. The balance of {total_available} satoshi is not the \
+                     constraint; how it is divided is.",
+                    fund_request.no_of_outpoints,
+                    self.unspent.len(),
+                    fund_request.no_of_outpoints
+                ),
+            ));
+        }
         None
     }
 
@@ -862,7 +973,23 @@ mod tests {
         let error = client.funding_balance_error(&fund_request).unwrap();
         assert_eq!(error.code, ErrorCode::NoSuitableUtxo);
         assert!(error.description.contains("Not enough UTXOs"));
-        assert!(error.description.contains("2 suitable UTXOs, 3 required"));
+        // 2 UTXOs are big enough, 3 transactions are wanted
+        assert!(
+            error.description.contains("2 of the 2 UTXOs"),
+            "{}",
+            error.description
+        );
+        assert!(
+            error.description.contains("3 are required"),
+            "{}",
+            error.description
+        );
+        // and the caller is told the balance is not what is short
+        assert!(
+            error.description.contains("how it is divided"),
+            "{}",
+            error.description
+        );
     }
 
     #[test]
@@ -1250,5 +1377,203 @@ mod tests {
             spent.len(),
             "an input was spent twice, which the network refuses as a conflict: {spent:?}"
         );
+    }
+
+    // ---- CS-422: funding limits reported honestly ----
+
+    /// A real 32-byte txid. These tests build transactions, not just inspect
+    /// the cache, so the hash has to decode.
+    fn cs_422_utxo(seed: u8, pos: u32, value: i64) -> UtxoEntry {
+        utxo(&format!("{:064x}", seed), pos, value, 1_758_719)
+    }
+
+    /// The wallet from the bug report: 480 + 250 + five 100s = 1230 satoshi.
+    fn cs_422_wallet() -> Client {
+        client_holding(vec![
+            cs_422_utxo(1, 0, 100),
+            cs_422_utxo(2, 1, 100),
+            cs_422_utxo(3, 1, 100),
+            cs_422_utxo(4, 1, 100),
+            cs_422_utxo(5, 1, 100),
+            cs_422_utxo(6, 0, 480),
+            cs_422_utxo(7, 0, 250),
+        ])
+    }
+
+    fn cs_422_request(satoshi: u64) -> FundRequest {
+        FundRequest {
+            client_id: TEST_CLIENT_ID.to_string(),
+            satoshi,
+            no_of_outpoints: 1,
+            multiple_tx: false,
+            locking_scripts: vec![hex::decode(LOCKING_SCRIPT_HEX).unwrap()],
+        }
+    }
+
+    /// What the wallet can really pay out, and why it is so far under the
+    /// balance. Six of the seven UTXOs are worth spending; the seventh pushes
+    /// the transaction over a kilobyte, which costs 500 satoshi of fee to
+    /// bring in 100 satoshi of value.
+    #[test]
+    fn cs_422_max_fundable_accounts_for_the_fee_each_input_adds() {
+        let client = cs_422_wallet();
+        let script_bytes = hex::decode(LOCKING_SCRIPT_HEX).unwrap().len() as u64;
+
+        assert_eq!(client.total_unspent(), 1230);
+        assert_eq!(client.max_fundable(script_bytes), 379);
+        assert_eq!(client.max_fundable_if_consolidated(script_bytes), 479);
+    }
+
+    /// The report's first complaint: asking for 480 was refused as
+    /// "1230 available, 1230 required", which reads as a contradiction. The
+    /// refusal was right -- 480 is genuinely out of reach -- but the figure
+    /// was the cost of a one-input transaction, and this wallet cannot fund
+    /// anything with one input.
+    #[test]
+    fn cs_422_insufficient_balance_reports_what_can_actually_be_paid_out() {
+        let error = cs_422_wallet()
+            .funding_balance_error(&cs_422_request(480))
+            .expect("480 is beyond this wallet");
+        assert_eq!(error.code, ErrorCode::InsufficientBalance);
+        assert!(
+            error.description.contains("480 satoshi requested"),
+            "{}",
+            error.description
+        );
+        assert!(
+            error.description.contains("1230 satoshi available"),
+            "{}",
+            error.description
+        );
+        assert!(
+            error.description.contains("at most 479"),
+            "{}",
+            error.description
+        );
+        // the number that caused the confusion is gone
+        assert!(
+            !error.description.contains("1230 required"),
+            "{}",
+            error.description
+        );
+    }
+
+    /// The report's second complaint: asking for *less* produced a *larger*
+    /// requirement, 1720, which is more than the balance. That figure was the
+    /// cost of spending every UTXO -- an arrangement the service would never
+    /// choose, because the last input loses money.
+    #[test]
+    fn cs_422_no_suitable_utxo_does_not_quote_a_cost_nobody_would_pay() {
+        let error = cs_422_wallet()
+            .funding_balance_error(&cs_422_request(470))
+            .expect("470 is beyond this UTXO set");
+        assert_eq!(error.code, ErrorCode::NoSuitableUtxo);
+        assert!(
+            error.description.contains("at most 379"),
+            "{}",
+            error.description
+        );
+        assert!(
+            error.description.contains("consolidated"),
+            "{}",
+            error.description
+        );
+        assert!(
+            !error.description.contains("1720"),
+            "the all-inputs cost is not a requirement: {}",
+            error.description
+        );
+    }
+
+    /// The two codes now mean different things, and the boundary between them
+    /// is the point where consolidating would stop helping. Below 379 the
+    /// wallet funds as it is; between 380 and 479 it could fund only if it
+    /// were consolidated; above 479 no arrangement is enough.
+    #[test]
+    fn cs_422_the_two_codes_split_at_the_point_consolidating_stops_helping() {
+        let client = cs_422_wallet();
+
+        assert!(client.funding_balance_error(&cs_422_request(379)).is_none());
+
+        let shape = client
+            .funding_balance_error(&cs_422_request(380))
+            .expect("380 needs consolidating");
+        assert_eq!(shape.code, ErrorCode::NoSuitableUtxo);
+
+        let shape = client
+            .funding_balance_error(&cs_422_request(479))
+            .expect("479 needs consolidating");
+        assert_eq!(shape.code, ErrorCode::NoSuitableUtxo);
+
+        let balance = client
+            .funding_balance_error(&cs_422_request(480))
+            .expect("480 needs more money");
+        assert_eq!(balance.code, ErrorCode::InsufficientBalance);
+    }
+
+    /// The report asked how a client is meant to know what it can withdraw.
+    /// The answer has to be a number it can actually spend: funding exactly
+    /// the reported maximum must work, and the transaction must balance.
+    #[test]
+    fn cs_422_the_reported_maximum_can_actually_be_funded() {
+        let mut client = cs_422_wallet();
+        let script_bytes = hex::decode(LOCKING_SCRIPT_HEX).unwrap().len() as u64;
+        let max = client.max_fundable(script_bytes) as u64;
+
+        let request = cs_422_request(max);
+        assert!(
+            client.funding_balance_error(&request).is_none(),
+            "the maximum this wallet reports must be fundable"
+        );
+        let tx = client
+            .create_funding_tx(&request)
+            .expect("and the transaction must build");
+        // one output pays the request, one pays change back, and change is
+        // never zero
+        assert_eq!(tx.outputs.len(), 2);
+        assert!(tx.outputs.iter().any(|out| out.satoshis == max as i64));
+        assert!(tx.outputs[0].satoshis > 0, "change must be positive");
+    }
+
+    /// The guard that keeps the two halves honest. Whatever the pre-check
+    /// admits, the builder must be able to build -- otherwise a request that
+    /// looked fundable dies as an internal error instead of a coded one.
+    /// Sweeping the whole range is cheap and catches a boundary that a
+    /// hand-picked case would not.
+    #[test]
+    fn cs_422_anything_the_check_admits_can_be_built() {
+        for satoshi in 1..=600u64 {
+            let mut client = cs_422_wallet();
+            let request = cs_422_request(satoshi);
+            if client.funding_balance_error(&request).is_some() {
+                continue;
+            }
+            client
+                .create_funding_tx(&request)
+                .unwrap_or_else(|e| panic!("{satoshi} passed the check but would not build: {e}"));
+        }
+    }
+
+    /// A wallet whose single UTXO covers the cost exactly. Selection used to
+    /// accept it on `>=` while the builder demanded a positive change output,
+    /// so the request passed every check and then failed as an internal
+    /// error.
+    #[test]
+    fn cs_422_a_utxo_covering_the_cost_exactly_is_not_offered_as_fundable() {
+        let script_bytes = hex::decode(LOCKING_SCRIPT_HEX).unwrap().len() as u64;
+        let exact = 123 + Client::estimate_fee(script_bytes, 1) as i64;
+        let mut client = client_holding(vec![cs_422_utxo(9, 0, exact)]);
+
+        let request = cs_422_request(123);
+        match client.funding_balance_error(&request) {
+            // refused is correct: there is no room for change
+            Some(error) => assert_eq!(error.code, ErrorCode::InsufficientBalance),
+            // or, if admitted, it must genuinely build
+            None => {
+                client
+                    .create_funding_tx(&request)
+                    .expect("admitted, so it must build");
+            }
+        }
     }
 }

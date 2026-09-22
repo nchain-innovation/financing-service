@@ -235,6 +235,14 @@ pub struct AddressResponse {
 pub struct BalanceResponse {
     pub confirmed: i64,
     pub unconfirmed: i64,
+    /// The most a single `POST /fund` could ask for right now.
+    ///
+    /// Not `confirmed + unconfirmed`: fees come out of the same UTXOs, and
+    /// every input a transaction has to spend adds to the fee, so how the
+    /// balance is divided changes what it can pay out. Without this a caller
+    /// has to guess a fee and the number of inputs, which is what the balance
+    /// endpoint should be telling it.
+    pub max_fundable: i64,
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq)]

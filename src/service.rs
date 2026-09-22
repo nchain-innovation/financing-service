@@ -632,6 +632,10 @@ impl Service {
         }
     }
 
+    /// Balance alone. `GET /balance` reports the fundable maximum beside it
+    /// and uses [`Service::get_balance_and_max_fundable`]; this stays for the
+    /// tests that only care about the balance.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn get_balance(&self, client_id: &str) -> Option<Balance> {
         Some(
             self.client_handle(client_id)
@@ -640,6 +644,17 @@ impl Service {
                 .await
                 .get_balance(),
         )
+    }
+
+    /// Balance together with the most a single `POST /fund` could ask for.
+    ///
+    /// Read under one lock so the two cannot disagree: a refresh between two
+    /// reads would let the endpoint report a maximum that does not belong to
+    /// the balance beside it.
+    pub async fn get_balance_and_max_fundable(&self, client_id: &str) -> Option<(Balance, i64)> {
+        let client = self.client_handle(client_id).await?;
+        let client = client.read().await;
+        Some((client.get_balance(), client.max_fundable_p2pkh()))
     }
 
     pub async fn get_address(&self, client_id: &str) -> Option<String> {
