@@ -1901,13 +1901,11 @@ mod tests {
 
     #[actix_web::test]
     async fn sr_fund_005_fund_endpoint_refreshes_stale_utxo_cache() {
-        use chain_gang::interface::Balance;
-
         let path = unique_dynamic_config_path();
         let config = test_config_with_keys(&path, None, None);
         let (app, service) = build_app_with_service(config).await;
         service
-            .set_test_chain_state(TEST_CLIENT_ID, Balance::default(), Vec::new())
+            .set_test_chain_state(TEST_CLIENT_ID, Vec::new())
             .await
             .expect("test client");
 
@@ -1924,13 +1922,11 @@ mod tests {
 
     #[actix_web::test]
     async fn sr_fund_006_balance_endpoint_refreshes_stale_utxo_cache() {
-        use chain_gang::interface::Balance;
-
         let path = unique_dynamic_config_path();
         let config = test_config_with_keys(&path, None, None);
         let (app, service) = build_app_with_service(config).await;
         service
-            .set_test_chain_state(TEST_CLIENT_ID, Balance::default(), Vec::new())
+            .set_test_chain_state(TEST_CLIENT_ID, Vec::new())
             .await
             .expect("test client");
 

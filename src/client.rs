@@ -2,6 +2,7 @@
 // use k256::ecdsa::{SigningKey, VerifyingKey};
 
 use chain_gang::{
+    interface::blockchain_interface::UNCONFIRMED_HEIGHT,
     interface::{Balance, BlockchainInterface, Utxo, UtxoEntry},
     messages::{OutPoint, Tx, TxIn, TxOut},
     script::Script,
@@ -41,15 +42,26 @@ fn outpoint_key(entry: &UtxoEntry) -> OutPointKey {
     (entry.tx_hash.clone(), entry.tx_pos)
 }
 
-/// An input handed to the network in a transaction whose fate is unknown.
+/// The balance an unspent set adds up to, split the way chain-gang defines it:
+/// a negative height means unconfirmed.
 ///
-/// The entry is kept whole rather than just its key so the withheld value can
-/// be taken off the reported balance too, leaving the balance and the UTXO set
-/// telling the same story.
-#[derive(Clone, Debug)]
-struct ReservedOutpoint {
-    entry: UtxoEntry,
-    since: Instant,
+/// Derived rather than asked for. A separate balance query can disagree with
+/// the UTXO set -- WhatsOnChain's `/address/{a}/balance` is deprecated and was
+/// reporting `unconfirmed: 0` for an address whose unspent set plainly held
+/// unconfirmed outputs -- and when they disagree, the UTXO set is the one that
+/// matters: it is what the service can actually spend, and what every funding
+/// decision is made from. Deriving also means one request per refresh instead
+/// of two, which is the thing the rate limit is spent on.
+pub fn balance_from_unspent(unspent: &Utxo) -> Balance {
+    let mut balance = Balance::default();
+    for entry in unspent {
+        if entry.height < 0 {
+            balance.unconfirmed += entry.value;
+        } else {
+            balance.confirmed += entry.value;
+        }
+    }
+    balance
 }
 
 /// A change output this service created and broadcast, which the chain has not
@@ -115,8 +127,6 @@ pub struct Client {
     /// Funding Wallet
     wallet: Wallet,
     address: String,
-    /// Current funding balance
-    balance: Balance,
     /// Current funding UTXO
     unspent: Utxo,
     /// Outpoints spent by a funding transaction whose outcome is unknown.
@@ -124,7 +134,10 @@ pub struct Client {
     /// Held out of `unspent` -- and out of every refresh that would otherwise
     /// resurrect them -- until the chain agrees they are spent or the
     /// reservation expires. See [`UNCERTAIN_SPEND_RESERVATION`].
-    reserved: HashMap<OutPointKey, ReservedOutpoint>,
+    /// Keyed by outpoint, valued by when it was reserved. Only the moment is
+    /// needed: the balance is derived from what is left in `unspent`, so
+    /// removing the entry from there is all it takes to withhold its value.
+    reserved: HashMap<OutPointKey, Instant>,
     /// Change this service created and broadcast, which the chain has not
     /// caught up with. Kept in the cache across refreshes so a client can
     /// spend its own change without waiting for the chain to confirm what the
@@ -150,7 +163,6 @@ impl Client {
             api_key: config.api_key.clone().filter(|key| !key.is_empty()),
             wallet,
             address,
-            balance: Balance::default(),
             unspent: Vec::new(),
             reserved: HashMap::new(),
             pending_change: HashMap::new(),
@@ -161,19 +173,16 @@ impl Client {
         self.api_key.as_deref()
     }
 
-    /// Given an interface query it for the latest balance
+    /// Query the interface for the latest unspent set, and take the balance
+    /// from it.
     pub async fn update_balance(
         &mut self,
         blockchain_interface: &dyn BlockchainInterface,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        self.balance = blockchain_interface
-            .get_balance(&self.address.to_string())
-            .await?;
-        self.unspent = blockchain_interface
+        let unspent = blockchain_interface
             .get_utxo(&self.address.to_string())
             .await?;
-        // Sort unspent by value
-        self.unspent.sort_by_key(|x| x.value);
+        self.apply_chain_state(unspent);
         Ok(())
     }
 
@@ -184,7 +193,7 @@ impl Client {
     /// it was made: a transaction that has reached the network but is not yet
     /// visible to the read interface still reads as unspent, and the service
     /// would offer the same input to the next funding request.
-    pub fn apply_chain_state(&mut self, balance: Balance, unspent: Utxo) {
+    pub fn apply_chain_state(&mut self, unspent: Utxo) {
         self.release_expired_reservations();
         self.expire_pending_change();
 
@@ -203,10 +212,10 @@ impl Client {
             ours.contains(key) || unspent.iter().any(|entry| &outpoint_key(entry) == key)
         });
 
-        self.balance = balance;
         self.unspent = unspent;
         if !self.reserved.is_empty() {
-            self.withhold_reserved();
+            self.unspent
+                .retain(|entry| !self.reserved.contains_key(&outpoint_key(entry)));
         }
         self.restore_pending_change();
         self.unspent.sort_by_key(|x| x.value);
@@ -220,14 +229,17 @@ impl Client {
     }
 
     /// Put back the change the service has broadcast but the chain has not
-    /// reported yet, and count it towards the balance so the two agree.
+    /// reported yet, so it counts towards the balance.
     ///
     /// A refresh replaces the cache with what the chain says, and the chain
     /// does not yet say anything about a transaction still in the mempool. So
-    /// the inputs it spent are held out (`withhold_reserved`) and the change
-    /// it created is put back here -- the two halves of the same gap. An entry
-    /// goes once the chain reports it, which is the chain catching up, or once
-    /// the service has spent it in turn.
+    /// the inputs it spent are held out of `unspent` and the change it created
+    /// is put back here -- the two halves of the same gap. An entry goes once
+    /// the chain reports it, which is the chain catching up, or once the
+    /// service has spent it in turn.
+    ///
+    /// Putting the entry back in `unspent` is all that is needed for it to
+    /// count: the balance is derived from that set, not tracked alongside it.
     fn restore_pending_change(&mut self) {
         let reported: std::collections::HashSet<OutPointKey> =
             self.unspent.iter().map(outpoint_key).collect();
@@ -236,35 +248,14 @@ impl Client {
             .retain(|key, _| !self.reserved.contains_key(key));
 
         for pending in self.pending_change.values() {
-            let value = pending.entry.value;
-            if pending.entry.height < 0 {
-                self.balance.unconfirmed += value;
-            } else {
-                self.balance.confirmed += value;
-            }
             self.unspent.push(pending.entry.clone());
-        }
-    }
-
-    /// Drop the cached copy of every reserved outpoint, and take its value off
-    /// the reported balance so the two agree.
-    fn withhold_reserved(&mut self) {
-        self.unspent
-            .retain(|entry| !self.reserved.contains_key(&outpoint_key(entry)));
-        for reserved in self.reserved.values() {
-            let value = reserved.entry.value;
-            if reserved.entry.height < 0 {
-                self.balance.unconfirmed -= value;
-            } else {
-                self.balance.confirmed -= value;
-            }
         }
     }
 
     fn release_expired_reservations(&mut self) {
         let now = Instant::now();
-        self.reserved.retain(|key, reserved| {
-            let held = now.duration_since(reserved.since) < UNCERTAIN_SPEND_RESERVATION;
+        self.reserved.retain(|key, since| {
+            let held = now.duration_since(*since) < UNCERTAIN_SPEND_RESERVATION;
             if !held {
                 log::info!(
                     "releasing reserved outpoint {}:{} -- no longer spent on chain after {}s, so \
@@ -288,14 +279,21 @@ impl Client {
     /// waiting for it.
     #[cfg(test)]
     fn backdate_reservations(&mut self, by: Duration) {
-        for reserved in self.reserved.values_mut() {
-            reserved.since -= by;
+        for since in self.reserved.values_mut() {
+            *since -= by;
         }
     }
 
-    /// Return balance as JSON string
+    /// The client's balance, derived from its unspent set.
+    ///
+    /// Not stored. A stored balance drifts: it was refreshed from a separate
+    /// query that could disagree with the UTXO set, and it was not updated
+    /// when a funding transaction spent from that set, so it could outlive
+    /// what it described. Derived, it cannot -- and it is the same quantity
+    /// every funding decision is made from. Anything reserved by an uncertain
+    /// broadcast is already out of `unspent`, so it is out of this too.
     pub fn get_balance(&self) -> Balance {
-        self.balance
+        balance_from_unspent(&self.unspent)
     }
 
     pub fn get_address(&self) -> String {
@@ -643,7 +641,11 @@ impl Client {
             .position(|x| x == unspent)
             .ok_or_else(|| "UTXO not found in local cache.".to_string())?;
         let change_entry = UtxoEntry {
-            height: 0,
+            // Just built and not yet broadcast, let alone mined. Recording it
+            // as height 0 said "confirmed in block 0" under chain-gang's
+            // convention, which put the change on the wrong side of every
+            // confirmed/unconfirmed split that reads it.
+            height: UNCONFIRMED_HEIGHT,
             tx_pos: 0,
             tx_hash: tx.hash().encode(),
             value: change,
@@ -699,7 +701,8 @@ impl Client {
         self.sign_funding_tx_inputs(&mut tx, &input_amounts, &change_script, sighash_flags)?;
 
         let change_entry = UtxoEntry {
-            height: 0,
+            // As above: unconfirmed until it is mined.
+            height: UNCONFIRMED_HEIGHT,
             tx_pos: 0,
             tx_hash: tx.hash().encode(),
             value: change,
@@ -754,8 +757,7 @@ impl Client {
         self.spend_utxos(&plan.spent_indices, plan.change_entry);
         let now = Instant::now();
         for entry in plan.spent_outpoints {
-            self.reserved
-                .insert(outpoint_key(&entry), ReservedOutpoint { entry, since: now });
+            self.reserved.insert(outpoint_key(&entry), now);
         }
         self.pending_change.insert(
             outpoint_key(&change_entry),
@@ -792,12 +794,6 @@ impl Client {
 
         let now = Instant::now();
         for entry in plan.spent_outpoints {
-            let value = entry.value;
-            if entry.height < 0 {
-                self.balance.unconfirmed -= value;
-            } else {
-                self.balance.confirmed -= value;
-            }
             log::warn!(
                 "reserving outpoint {}:{} for up to {}s: its funding transaction was handed to \
                  the broadcaster and the outcome is unknown",
@@ -805,8 +801,7 @@ impl Client {
                 entry.tx_pos,
                 UNCERTAIN_SPEND_RESERVATION.as_secs()
             );
-            self.reserved
-                .insert(outpoint_key(&entry), ReservedOutpoint { entry, since: now });
+            self.reserved.insert(outpoint_key(&entry), now);
         }
     }
 
@@ -1031,11 +1026,7 @@ mod tests {
             api_key: None,
         };
         let mut client = Client::try_new(&client_config).unwrap();
-        let balance = Balance {
-            confirmed: unspent.iter().map(|u| u.value).sum(),
-            unconfirmed: 0,
-        };
-        client.apply_chain_state(balance, unspent);
+        client.apply_chain_state(unspent);
         client
     }
 
@@ -1063,13 +1054,7 @@ mod tests {
         let reserved = reserve_first(&mut client);
 
         // the read interface has not seen the spend yet, so it reports both
-        client.apply_chain_state(
-            Balance {
-                confirmed: 12_000,
-                unconfirmed: 0,
-            },
-            chain,
-        );
+        client.apply_chain_state(chain);
 
         assert_eq!(client.reserved_outpoint_count(), 1);
         assert!(
@@ -1092,13 +1077,7 @@ mod tests {
         assert_eq!(client.reserved_outpoint_count(), 1);
 
         // the spend is visible now: "aa:0" is gone and the change has arrived
-        client.apply_chain_state(
-            Balance {
-                confirmed: 11_800,
-                unconfirmed: 0,
-            },
-            vec![utxo("bb", 1, 7_000, 100), utxo("cc", 0, 4_800, -1)],
-        );
+        client.apply_chain_state(vec![utxo("bb", 1, 7_000, 100), utxo("cc", 0, 4_800, -1)]);
 
         assert_eq!(client.reserved_outpoint_count(), 0);
         assert_eq!(client.unspent.len(), 2);
@@ -1114,13 +1093,7 @@ mod tests {
         reserve_first(&mut client);
 
         client.backdate_reservations(UNCERTAIN_SPEND_RESERVATION + Duration::from_secs(1));
-        client.apply_chain_state(
-            Balance {
-                confirmed: 12_000,
-                unconfirmed: 0,
-            },
-            chain,
-        );
+        client.apply_chain_state(chain);
 
         assert_eq!(client.reserved_outpoint_count(), 0);
         assert_eq!(client.unspent.len(), 2, "the funds came back");
@@ -1137,13 +1110,7 @@ mod tests {
         assert_eq!(client.get_balance().confirmed, 7_000);
 
         // and it stays off across a refresh that still reports it
-        client.apply_chain_state(
-            Balance {
-                confirmed: 12_000,
-                unconfirmed: 0,
-            },
-            chain,
-        );
+        client.apply_chain_state(chain);
         assert_eq!(client.get_balance().confirmed, 7_000);
     }
 
@@ -1219,10 +1186,6 @@ mod tests {
             cs_426_utxo(2, 6_000),
             cs_426_utxo(3, 7_000),
         ];
-        let balance = Balance {
-            confirmed: 18_000,
-            unconfirmed: 0,
-        };
         let mut client = client_holding(chain.clone());
 
         let mut hashes = Vec::new();
@@ -1233,7 +1196,7 @@ mod tests {
             hashes.push(tx.hash().encode());
             // the refresh each request makes, against a chain that still
             // reports every input as unspent
-            client.apply_chain_state(balance, chain.clone());
+            client.apply_chain_state(chain.clone());
         }
 
         hashes.sort();
@@ -1252,10 +1215,6 @@ mod tests {
     #[test]
     fn cs_426_a_refresh_does_not_return_an_input_already_spent() {
         let chain = vec![cs_426_utxo(1, 5_000), cs_426_utxo(2, 6_000)];
-        let balance = Balance {
-            confirmed: 11_000,
-            unconfirmed: 0,
-        };
         let mut client = client_holding(chain.clone());
 
         let tx = client
@@ -1267,7 +1226,7 @@ mod tests {
             .map(|input| input.prev_output.hash.encode())
             .collect();
 
-        client.apply_chain_state(balance, chain);
+        client.apply_chain_state(chain);
 
         for hash in &spent {
             assert!(
@@ -1283,10 +1242,6 @@ mod tests {
     #[test]
     fn cs_426_change_survives_a_refresh_that_has_not_seen_it() {
         let chain = vec![cs_426_utxo(1, 5_000)];
-        let balance = Balance {
-            confirmed: 5_000,
-            unconfirmed: 0,
-        };
         let mut client = client_holding(chain.clone());
 
         client
@@ -1295,7 +1250,7 @@ mod tests {
         let before: i64 = client.unspent.iter().map(|u| u.value).sum();
         assert!(before > 0, "there is change to keep");
 
-        client.apply_chain_state(balance, chain);
+        client.apply_chain_state(chain);
 
         assert_eq!(
             client.unspent.iter().map(|u| u.value).sum::<i64>(),
@@ -1316,16 +1271,10 @@ mod tests {
         let change = client.unspent[0].clone();
 
         // the chain now reports the change and no longer reports the input
-        client.apply_chain_state(
-            Balance {
-                confirmed: change.value,
-                unconfirmed: 0,
-            },
-            vec![UtxoEntry {
-                height: 900,
-                ..change.clone()
-            }],
-        );
+        client.apply_chain_state(vec![UtxoEntry {
+            height: 900,
+            ..change.clone()
+        }]);
 
         assert_eq!(client.reserved_outpoint_count(), 0, "reservation released");
         assert_eq!(client.unspent.len(), 1);
@@ -1352,10 +1301,6 @@ mod tests {
             cs_426_utxo(2, 6_000),
             cs_426_utxo(3, 7_000),
         ];
-        let balance = Balance {
-            confirmed: 18_000,
-            unconfirmed: 0,
-        };
         let mut client = client_holding(chain.clone());
 
         let mut spent: Vec<(String, u32)> = Vec::new();
@@ -1368,7 +1313,7 @@ mod tests {
             }
             // the refresh each request makes, against a chain that has not
             // seen any of these transactions yet
-            client.apply_chain_state(balance, chain.clone());
+            client.apply_chain_state(chain.clone());
         }
 
         let unique: std::collections::HashSet<_> = spent.iter().collect();
@@ -1575,5 +1520,102 @@ mod tests {
                     .expect("admitted, so it must build");
             }
         }
+    }
+
+    // ---- CS-425: unconfirmed funds, and a balance that matches them ----
+
+    /// The question the ticket asks. Unconfirmed outputs *are* spendable, and
+    /// always have been: nothing filters the unspent set by height. The
+    /// reporter concluded otherwise from a `/balance` that under-reported
+    /// them, which is the other half of this fix.
+    ///
+    /// Written as a test so the policy is pinned rather than described: the
+    /// confirmed UTXO alone cannot cover this request.
+    #[test]
+    fn cs_425_unconfirmed_outputs_are_spendable() {
+        let client = client_holding(vec![
+            utxo(&format!("{:064x}", 1), 0, 400, 500),
+            utxo(&format!("{:064x}", 2), 0, 900, UNCONFIRMED_HEIGHT),
+        ]);
+        let script_bytes = hex::decode(LOCKING_SCRIPT_HEX).unwrap().len() as u64;
+
+        assert!(
+            client.max_fundable(script_bytes) > 400,
+            "the unconfirmed 900 is counted towards what can be funded"
+        );
+        let request = cs_422_request(500);
+        assert!(
+            client.funding_balance_error(&request).is_none(),
+            "500 needs the unconfirmed output; the confirmed 400 cannot cover it"
+        );
+    }
+
+    /// The balance has to agree with the unspent set it came from, including
+    /// its unconfirmed part. WhatsOnChain's deprecated balance endpoint
+    /// reported `unconfirmed: 0` for an address whose unspent set plainly held
+    /// unconfirmed outputs, which is what made the service look as though it
+    /// ignored them.
+    #[test]
+    fn cs_425_balance_is_derived_from_the_unspent_set() {
+        let client = client_holding(vec![
+            utxo(&format!("{:064x}", 1), 0, 400, 500),
+            utxo(&format!("{:064x}", 2), 0, 900, UNCONFIRMED_HEIGHT),
+        ]);
+        let balance = client.get_balance();
+        assert_eq!(balance.confirmed, 400);
+        assert_eq!(
+            balance.unconfirmed, 900,
+            "an unconfirmed output must not vanish from the balance"
+        );
+    }
+
+    /// A stored balance drifts away from the UTXOs it describes as soon as a
+    /// funding transaction spends from them. Derived, it cannot.
+    #[test]
+    fn cs_425_the_balance_follows_a_spend_without_a_refresh() {
+        let mut client = cs_422_wallet();
+        assert_eq!(client.get_balance().confirmed, 1230);
+
+        let request = cs_422_request(300);
+        client.create_funding_tx(&request).expect("funds");
+
+        let after = client.get_balance();
+        assert!(
+            after.confirmed + after.unconfirmed < 1230,
+            "the balance still reports the funds the transaction just spent: {after:?}"
+        );
+        assert_eq!(
+            after.confirmed + after.unconfirmed,
+            client.total_unspent(),
+            "balance and unspent set must agree"
+        );
+    }
+
+    /// The change output of a transaction that has not been broadcast, let
+    /// alone mined, is unconfirmed. Recording it as height 0 meant "confirmed
+    /// in block 0" under chain-gang's convention, putting it on the wrong side
+    /// of every confirmed/unconfirmed split.
+    #[test]
+    fn cs_425_change_from_a_new_transaction_is_unconfirmed() {
+        let mut client = cs_422_wallet();
+        let before = client.get_balance();
+        assert_eq!(before.unconfirmed, 0);
+
+        client
+            .create_funding_tx(&cs_422_request(300))
+            .expect("funds");
+
+        // Funding 300 spends six of the seven UTXOs (1130 satoshi) against a
+        // cost of 300 + 750 of fee, leaving 80 of change and the seventh
+        // hundred untouched.
+        let after = client.get_balance();
+        assert_eq!(
+            after.unconfirmed, 80,
+            "the change output should be counted as unconfirmed: {after:?}"
+        );
+        assert_eq!(
+            after.confirmed, 100,
+            "only the UTXO that was not spent stays confirmed: {after:?}"
+        );
     }
 }
