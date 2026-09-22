@@ -1,4 +1,8 @@
 name: Rust
+# CI runner image is pinned, not `ubuntu-latest`. That label migrates to Ubuntu 26
+# from 19 October 2026 (actions/runner-images#14748), which would move the OS under
+# every build on a date nobody chose. Pinning decouples the upgrade from that date
+# so it happens deliberately, with someone watching. Tracked as CS-442.
 
 # Every push, on every branch, plus every pull request whatever it targets.
 #
@@ -24,7 +28,7 @@ env:
 jobs:
   build:
 
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
     # uls-client comes from the PRIVATE mapi-lite repo over SSH, so the
