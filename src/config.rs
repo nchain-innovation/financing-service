@@ -1169,6 +1169,51 @@ utxo_refresh_period = 60
 filename = "./data/dynamic.toml"
 "#;
 
+    /// A config with no [fees] section is valid and takes the documented
+    /// defaults, so CS-451 does not make the section mandatory.
+    #[test]
+    fn cs_451_the_fees_section_is_optional() {
+        let config: Config = toml::from_str(MINIMAL_TOML).unwrap();
+        assert_eq!(config.fees.satoshis_per_kb, DEFAULT_SATOSHIS_PER_KB);
+        assert_eq!(config.fees.satoshis_per_kb, 100);
+        assert!(
+            config.fees.use_mapi_fee_quote,
+            "the quote is used by default when there is a mapi-lite to ask"
+        );
+        assert!(config.fees.validate().is_ok());
+    }
+
+    /// Either field can be set on its own; the other keeps its default.
+    #[test]
+    fn cs_451_each_fee_field_defaults_independently() {
+        let only_rate: Config =
+            toml::from_str(&format!("{MINIMAL_TOML}\n[fees]\nsatoshis_per_kb = 250\n")).unwrap();
+        assert_eq!(only_rate.fees.satoshis_per_kb, 250);
+        assert!(only_rate.fees.use_mapi_fee_quote);
+
+        let only_flag: Config = toml::from_str(&format!(
+            "{MINIMAL_TOML}\n[fees]\nuse_mapi_fee_quote = false\n"
+        ))
+        .unwrap();
+        assert_eq!(only_flag.fees.satoshis_per_kb, DEFAULT_SATOSHIS_PER_KB);
+        assert!(!only_flag.fees.use_mapi_fee_quote);
+    }
+
+    /// A zero rate builds transactions nothing relays, and the service would
+    /// only find that out at broadcast. It fails at startup instead, naming
+    /// the field.
+    #[test]
+    fn cs_451_a_zero_rate_is_refused_at_startup() {
+        let _env = env_lock();
+        let path = write_temp_config(
+            "fees-zero",
+            &format!("{MINIMAL_TOML}\n[fees]\nsatoshis_per_kb = 0\n"),
+        );
+        unsafe { env::remove_var("FS_CONFIG") };
+        let err = load_config("FS_CONFIG", path.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("fees.satoshis_per_kb"), "{err}");
+    }
+
     fn write_temp_config(label: &str, content: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "financing-service-{label}-{}-{}",

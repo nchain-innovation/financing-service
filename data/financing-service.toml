@@ -63,3 +63,22 @@ filename = "./data/dynamic.toml"
 # timeout_seconds = 13
 # health_timeout_seconds = 2
 # max_retries = 2
+
+# The fee the service pays on the transactions it builds. Optional; these are
+# the defaults.
+#
+# The fee is ceil(tx_bytes * satoshis_per_kb / 1000), rounded up so rounding
+# never underpays. An ordinary funding transaction -- one input, two outputs --
+# is 217 bytes, so at 100 sat/KB it pays 22 satoshi.
+#
+# Before v4.3.0 this was hardcoded as ((tx_bytes / 1000) * 500) + 750, which
+# charged 750 for that same transaction. Upgrading without setting these pays
+# the lower rate.
+#
+# With [mapi_lite] configured, the rate is taken from its feeQuote and
+# satoshis_per_kb becomes the fallback used before the first quote and whenever
+# one cannot be had. Set use_mapi_fee_quote = false to always use the number
+# below.
+# [fees]
+# satoshis_per_kb = 100
+# use_mapi_fee_quote = true
