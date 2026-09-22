@@ -135,6 +135,15 @@ pub struct Service {
     chain_health: Mutex<ChainHealth>,
     /// How old cached chain state may be before a request refreshes it.
     chain_state_max_age: Duration,
+    /// The rate every client currently costs its transactions at, in satoshis
+    /// per kilobyte (CS-451).
+    ///
+    /// Held here as well as on each client so that a client added at runtime
+    /// starts at the rate in force rather than the one in the config file,
+    /// which a fee quote may have superseded.
+    fee_satoshis_per_kb: Mutex<u64>,
+    /// Whether to take the rate from mapi-lite's fee quote when there is one.
+    use_mapi_fee_quote: bool,
 }
 
 /// A run of failures talking to the blockchain interface.
@@ -172,9 +181,11 @@ impl Service {
         if let Some(clients_config) = &config.client {
             for client_config in clients_config {
                 let resolved = client_config.clone().resolve_secrets()?;
+                let mut client = Client::try_new(&resolved)?;
+                client.set_fee_satoshis_per_kb(config.fees.satoshis_per_kb);
                 clients.insert(
                     client_config.client_id.clone(),
-                    Arc::new(RwLock::new(Client::try_new(&resolved)?)),
+                    Arc::new(RwLock::new(client)),
                 );
             }
         }
@@ -187,9 +198,11 @@ impl Service {
                 client_config.api_key.as_deref(),
             );
             let resolved = client_config.clone().resolve_secrets()?;
+            let mut client = Client::try_new(&resolved)?;
+            client.set_fee_satoshis_per_kb(config.fees.satoshis_per_kb);
             clients.insert(
                 client_config.client_id.clone(),
-                Arc::new(RwLock::new(Client::try_new(&resolved)?)),
+                Arc::new(RwLock::new(client)),
             );
         }
 
@@ -213,6 +226,8 @@ impl Service {
             mapi_health: Mutex::new(None),
             chain_health: Mutex::new(ChainHealth::default()),
             chain_state_max_age: config.service.chain_state_max_age(),
+            fee_satoshis_per_kb: Mutex::new(config.fees.satoshis_per_kb),
+            use_mapi_fee_quote: config.fees.use_mapi_fee_quote,
             mapi_health_ttl: config
                 .mapi_lite
                 .as_ref()
@@ -450,10 +465,13 @@ impl Service {
             .clone()
             .resolve_secrets()
             .map_err(|e| CodedError::new(ErrorCode::InvalidRequest, e))?;
-        let new_client = Arc::new(RwLock::new(
-            Client::try_new(&resolved)
-                .map_err(|e| CodedError::new(ErrorCode::InvalidRequest, e))?,
-        ));
+        let mut client = Client::try_new(&resolved)
+            .map_err(|e| CodedError::new(ErrorCode::InvalidRequest, e))?;
+        // The rate in force, which a fee quote may have moved on from what the
+        // config file says, so a client added now costs its transactions the
+        // same as one that has been here since startup.
+        client.set_fee_satoshis_per_kb(*self.fee_satoshis_per_kb.lock().await);
+        let new_client = Arc::new(RwLock::new(client));
         {
             let mut clients = self.clients.write().await;
             if clients.contains_key(&client_config.client_id) {
@@ -541,7 +559,49 @@ impl Service {
     }
 
     /// Refresh balances without holding client locks during blockchain I/O.
+    /// Take the fee rate from mapi-lite's quote, if it offers one, and apply
+    /// it to every client (CS-451).
+    ///
+    /// Called on the same sweep that refreshes balances rather than on the
+    /// funding path, so that costing a transaction never waits on a request to
+    /// mapi-lite -- CS-431 had just finished taking such calls off that path.
+    /// The cost is that the rate can be up to one sweep out of date, which for
+    /// a fee quote is a good trade.
+    ///
+    /// Any failure leaves the current rate alone, so a mapi-lite that is down
+    /// stops the rate changing rather than stopping funding.
+    pub async fn refresh_fee_rate(&self) {
+        if !self.use_mapi_fee_quote {
+            return;
+        }
+        let Some(rate) = self.broadcaster.fee_satoshis_per_kb().await else {
+            return;
+        };
+        if rate == 0 {
+            return;
+        }
+        let changed = {
+            let mut current = self.fee_satoshis_per_kb.lock().await;
+            let changed = *current != rate;
+            *current = rate;
+            changed
+        };
+        if changed {
+            log::info!("fee rate now {rate} sat/KB, from the mapi-lite fee quote");
+        }
+        for client in self.client_handles().await {
+            client.write().await.set_fee_satoshis_per_kb(rate);
+        }
+    }
+
+    /// The rate transactions are currently costed at, in satoshis per KB.
+    #[cfg(test)]
+    pub async fn fee_satoshis_per_kb(&self) -> u64 {
+        *self.fee_satoshis_per_kb.lock().await
+    }
+
     pub async fn refresh_balances(service: &Arc<Service>) {
+        service.refresh_fee_rate().await;
         let (blockchain, handles) = {
             let mut snapshot = Vec::new();
             for client in service.client_handles().await {
@@ -1712,6 +1772,108 @@ mod tests {
         assert!(!service.mapi_lite_configured());
         assert!(service.mapi_lite_health().await.is_none());
         assert_eq!(service.get_status().await.broadcaster, "test");
+    }
+
+    /// The quote wins over the configured rate, and reaches the clients that
+    /// actually cost transactions -- not just the service's own copy.
+    #[tokio::test]
+    async fn cs_451_the_mapi_fee_quote_sets_the_rate() {
+        use crate::test_support::StubMapiBroadcaster;
+
+        let config = test_config(&unique_dynamic_config_path());
+        let blockchain = test_blockchain_interface(&config).await;
+        let service =
+            service_with(&config, blockchain, StubMapiBroadcaster::quoting(Some(250))).await;
+
+        assert_eq!(
+            service.fee_satoshis_per_kb().await,
+            config.fees.satoshis_per_kb,
+            "starts at the configured rate"
+        );
+
+        service.refresh_fee_rate().await;
+
+        assert_eq!(service.fee_satoshis_per_kb().await, 250);
+        let client = service.client_handle(TEST_CLIENT_ID).await.expect("client");
+        assert_eq!(
+            client.read().await.fee_satoshis_per_kb(),
+            250,
+            "the rate has to reach the client, which is what costs a transaction"
+        );
+    }
+
+    /// A quote that cannot be had is not a reason to stop funding, nor to fall
+    /// to some other number: the rate in force stays in force.
+    #[tokio::test]
+    async fn cs_451_a_failed_quote_leaves_the_rate_alone() {
+        use crate::test_support::StubMapiBroadcaster;
+
+        let config = test_config(&unique_dynamic_config_path());
+        let blockchain = test_blockchain_interface(&config).await;
+        let broadcaster = StubMapiBroadcaster::quoting(None);
+        let handed: Arc<dyn TxBroadcaster> = broadcaster.clone();
+        let service = service_with(&config, blockchain, handed).await;
+
+        service.refresh_fee_rate().await;
+
+        assert_eq!(broadcaster.quote_count(), 1, "it did ask");
+        assert_eq!(
+            service.fee_satoshis_per_kb().await,
+            config.fees.satoshis_per_kb,
+            "and kept the configured rate when there was no answer"
+        );
+    }
+
+    /// Turning the quote off means the configured rate is authoritative, and
+    /// mapi-lite is not asked at all.
+    #[tokio::test]
+    async fn cs_451_the_quote_can_be_turned_off() {
+        use crate::test_support::StubMapiBroadcaster;
+
+        let mut config = test_config(&unique_dynamic_config_path());
+        config.fees.use_mapi_fee_quote = false;
+        config.fees.satoshis_per_kb = 175;
+
+        let blockchain = test_blockchain_interface(&config).await;
+        let broadcaster = StubMapiBroadcaster::quoting(Some(250));
+        let handed: Arc<dyn TxBroadcaster> = broadcaster.clone();
+        let service = service_with(&config, blockchain, handed).await;
+
+        service.refresh_fee_rate().await;
+
+        assert_eq!(broadcaster.quote_count(), 0, "not even asked");
+        assert_eq!(service.fee_satoshis_per_kb().await, 175);
+        let client = service.client_handle(TEST_CLIENT_ID).await.expect("client");
+        assert_eq!(client.read().await.fee_satoshis_per_kb(), 175);
+    }
+
+    /// A client added after a quote has moved the rate must cost its
+    /// transactions the same as one that was here all along.
+    #[tokio::test]
+    async fn cs_451_a_client_added_later_gets_the_rate_in_force() {
+        use crate::test_support::StubMapiBroadcaster;
+
+        let config = test_config(&unique_dynamic_config_path());
+        let blockchain = test_blockchain_interface(&config).await;
+        let service =
+            service_with(&config, blockchain, StubMapiBroadcaster::quoting(Some(250))).await;
+        service.refresh_fee_rate().await;
+
+        service
+            .add_client(&ClientConfig {
+                client_id: "added-later".to_string(),
+                wif_key: crate::test_support::TEST_WIF.to_string(),
+                api_key: None,
+            })
+            .await
+            .expect("added");
+
+        let client = service.client_handle("added-later").await.expect("client");
+        assert_eq!(
+            client.read().await.fee_satoshis_per_kb(),
+            250,
+            "not the config file's rate, which the quote has superseded"
+        );
     }
 
     #[tokio::test]

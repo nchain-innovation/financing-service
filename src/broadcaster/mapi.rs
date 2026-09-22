@@ -34,6 +34,11 @@ use async_trait::async_trait;
 use chain_gang::messages::Tx;
 use uls_client::{ClientError, MapiClient, SubmitTxRequest};
 use uls_core::status::RESULT_SUCCESS;
+use uls_core::wire::FeeAmount;
+
+/// The fee quote entry that applies to ordinary transactions. mapi quotes a
+/// "standard" and a "data" rate; funding transactions are the former.
+const STANDARD_FEE_TYPE: &str = "standard";
 
 use super::{BroadcastError, TxBroadcaster, MAPI_LITE};
 use crate::{config::MapiLiteConfig, util::tx_as_hexstr};
@@ -355,6 +360,47 @@ impl TxBroadcaster for MapiBroadcaster {
     async fn health_check(&self) -> Result<(), BroadcastError> {
         self.probe.fee_quote().await?;
         Ok(())
+    }
+
+    /// The standard mining fee from mapi-lite's quote, converted to satoshis
+    /// per kilobyte (CS-451).
+    ///
+    /// The quote states a rate as a pair -- so many satoshis per so many bytes
+    /// -- rather than per kilobyte, so it is scaled here, rounding up so the
+    /// service never charges itself less than the miner asked for.
+    ///
+    /// `None` on any failure, which leaves the configured rate standing: a
+    /// quote that cannot be fetched, is unsigned, names no standard fee, or
+    /// gives a nonsensical zero rate is not a reason to stop funding. The
+    /// probe client is used because, like the health check, this wants a short
+    /// timeout and no retries.
+    async fn fee_satoshis_per_kb(&self) -> Option<u64> {
+        let quote = match self.probe.fee_quote().await {
+            Ok(quote) => quote,
+            Err(e) => {
+                log::warn!("fee quote failed, keeping the current fee rate: {e}");
+                return None;
+            }
+        };
+        let standard = quote
+            .fees
+            .iter()
+            .find(|fee| fee.fee_type.eq_ignore_ascii_case(STANDARD_FEE_TYPE))
+            // A quote that names only one fee is taken to mean it for
+            // everything, rather than discarding a usable answer on a label.
+            .or_else(|| quote.fees.first())?;
+
+        let FeeAmount { satoshis, bytes } = &standard.mining_fee;
+        if *bytes == 0 || *satoshis == 0 {
+            log::warn!(
+                "fee quote gave {} satoshis per {} bytes, which is not a usable rate; \
+                 keeping the current one",
+                satoshis,
+                bytes
+            );
+            return None;
+        }
+        Some(satoshis.saturating_mul(1000).div_ceil(*bytes))
     }
 }
 

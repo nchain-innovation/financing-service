@@ -89,6 +89,17 @@ pub trait TxBroadcaster: Send + Sync {
     /// cheap and bounded in time: a readiness probe allows a few seconds in
     /// total.
     async fn health_check(&self) -> Result<(), BroadcastError>;
+
+    /// The rate this upstream says it charges, in satoshis per kilobyte, for
+    /// the service to cost the transactions it builds (CS-451).
+    ///
+    /// `None` is the answer for an upstream with nothing to say about fees --
+    /// broadcasting through the blockchain interface asks no miner anything --
+    /// and leaves the configured rate standing. The default is `None` so that
+    /// a broadcaster only implements this if it genuinely has a quote.
+    async fn fee_satoshis_per_kb(&self) -> Option<u64> {
+        None
+    }
 }
 
 #[cfg(test)]
