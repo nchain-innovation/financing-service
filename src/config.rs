@@ -144,6 +144,27 @@ pub struct TelemetryConfig {
 #[derive(Debug, Default, Deserialize, Clone)]
 pub struct ServiceConfig {
     pub utxo_refresh_period: u64,
+    /// How old the cached chain state may be before a request refreshes it,
+    /// in seconds.
+    ///
+    /// Defaults to `utxo_refresh_period`, so a request reuses whatever the
+    /// periodic refresh last fetched and the steady-state cost is one request
+    /// per client per period however much traffic arrives. Lower it to narrow
+    /// the window in which the service can build on a view of the chain that
+    /// something outside the service has moved on from; `0` refreshes on every
+    /// request, which is what the service did before.
+    #[serde(default)]
+    pub chain_state_max_age_seconds: Option<u64>,
+}
+
+impl ServiceConfig {
+    /// How old cached chain state may be before a request refreshes it.
+    pub fn chain_state_max_age(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.chain_state_max_age_seconds
+                .unwrap_or(self.utxo_refresh_period),
+        )
+    }
 }
 
 /// Retention policy for `POST /fund` idempotency records.

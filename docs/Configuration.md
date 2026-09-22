@@ -208,12 +208,24 @@ Then enable telemetry in config or set `OTEL_TRACES_EXPORTER=otlp` and `OTEL_EXP
 
 ## [service]
 
-Configures the period between UTXO refresh requests from the blockchain (in seconds).
-
 ```toml
 [service]
 utxo_refresh_period = 60
+# chain_state_max_age_seconds = 60   # defaults to utxo_refresh_period
 ```
+
+* `utxo_refresh_period` — seconds between the periodic refresh of every client's chain state.
+* `chain_state_max_age_seconds` — how old that cached state may be before a request refreshes it again. Defaults to `utxo_refresh_period`.
+
+### How often the service reads the chain
+
+Every chain-state refresh is one request to the blockchain interface, and `POST /fund` and `GET /balance` each want current state. Refreshing on every request means the cost scales with traffic, which is what runs into a public API's rate limit — see [Outbound rate limiting](#outbound-rate-limiting).
+
+So a request reuses the cached state while it is younger than `chain_state_max_age_seconds`, and the periodic refresh skips clients a request has already refreshed inside that window. At the default the two are the same length, so the steady-state cost is **one request per client per period however much traffic arrives**.
+
+**The trade is staleness.** Widening the window widens the period in which the service can build a funding transaction against a view of the chain that has moved on. It is narrower than it looks: the service applies its own spends to the cache as it makes them, so this only matters if something *outside* the service spends from the same client key — another service sharing the WIF, or an operator moving funds by hand. If that is your deployment, lower it. `0` refreshes on every request, which is what the service did before this existed.
+
+There is a backstop either way. A broadcast the upstream refuses — which is how a conflicting input shows up — marks the cached state stale, so the attempt after it works from a fresh read. Building on a stale view therefore costs one refused transaction, not a run of them.
 
 ## [idempotency]
 

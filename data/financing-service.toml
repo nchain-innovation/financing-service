@@ -33,6 +33,11 @@ level = "info"
 
 [service]
 utxo_refresh_period = 60
+# How old cached chain state may be before a request refreshes it. Defaults to
+# utxo_refresh_period, so a request reuses what the periodic refresh last
+# fetched. Lower it to narrow the window in which the service can build on a
+# view something outside it has moved on from; 0 refreshes on every request.
+# chain_state_max_age_seconds = 60
 
 [dynamic_config]
 filename = "./data/dynamic.toml"
