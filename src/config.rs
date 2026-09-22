@@ -207,6 +207,19 @@ pub struct FeesConfig {
     /// no effect, because there is nothing to ask.
     #[serde(default = "default_use_mapi_fee_quote")]
     pub use_mapi_fee_quote: bool,
+    /// Change below this many satoshis is not worth an output (CS-452).
+    ///
+    /// A change output this small costs more to spend later than it is worth,
+    /// and an output of one satoshi -- which funding the advertised maximum
+    /// used to produce -- is simply stranded. Rather than create one, the
+    /// service leaves the change out and the amount goes to the miner as extra
+    /// fee, so funding the maximum spends the wallet down cleanly.
+    ///
+    /// This bounds what can be given away: at most `dust_threshold_satoshis`
+    /// minus one, and only on a transaction that would otherwise have created
+    /// an output nobody would spend.
+    #[serde(default = "default_dust_threshold_satoshis")]
+    pub dust_threshold_satoshis: u64,
 }
 
 impl Default for FeesConfig {
@@ -214,6 +227,7 @@ impl Default for FeesConfig {
         FeesConfig {
             satoshis_per_kb: default_satoshis_per_kb(),
             use_mapi_fee_quote: default_use_mapi_fee_quote(),
+            dust_threshold_satoshis: default_dust_threshold_satoshis(),
         }
     }
 }
@@ -245,6 +259,17 @@ fn default_satoshis_per_kb() -> u64 {
 
 fn default_use_mapi_fee_quote() -> bool {
     true
+}
+
+/// Satoshis below which change is folded into the fee rather than paid out.
+///
+/// The P2PKH dust figure at the relay fee BSV nodes actually apply, rather
+/// than Bitcoin Core's better-known 546, which was derived from a relay fee an
+/// order of magnitude higher and would give away far more.
+pub const DEFAULT_DUST_THRESHOLD_SATOSHIS: u64 = 135;
+
+fn default_dust_threshold_satoshis() -> u64 {
+    DEFAULT_DUST_THRESHOLD_SATOSHIS
 }
 
 impl Default for IdempotencyConfig {
@@ -1180,6 +1205,11 @@ filename = "./data/dynamic.toml"
             config.fees.use_mapi_fee_quote,
             "the quote is used by default when there is a mapi-lite to ask"
         );
+        assert_eq!(
+            config.fees.dust_threshold_satoshis,
+            DEFAULT_DUST_THRESHOLD_SATOSHIS
+        );
+        assert_eq!(config.fees.dust_threshold_satoshis, 135);
         assert!(config.fees.validate().is_ok());
     }
 
@@ -1197,6 +1227,17 @@ filename = "./data/dynamic.toml"
         .unwrap();
         assert_eq!(only_flag.fees.satoshis_per_kb, DEFAULT_SATOSHIS_PER_KB);
         assert!(!only_flag.fees.use_mapi_fee_quote);
+
+        let only_dust: Config = toml::from_str(&format!(
+            "{MINIMAL_TOML}\n[fees]\ndust_threshold_satoshis = 0\n"
+        ))
+        .unwrap();
+        assert_eq!(only_dust.fees.dust_threshold_satoshis, 0);
+        assert_eq!(only_dust.fees.satoshis_per_kb, DEFAULT_SATOSHIS_PER_KB);
+        assert!(
+            only_dust.fees.validate().is_ok(),
+            "zero is a valid threshold: it means pay every change back"
+        );
     }
 
     /// A zero rate builds transactions nothing relays, and the service would

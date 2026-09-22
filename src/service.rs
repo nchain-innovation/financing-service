@@ -144,6 +144,9 @@ pub struct Service {
     fee_satoshis_per_kb: Mutex<u64>,
     /// Whether to take the rate from mapi-lite's fee quote when there is one.
     use_mapi_fee_quote: bool,
+    /// Change below this many satoshis goes to the fee rather than to an
+    /// output. Configuration only: a fee quote says nothing about dust.
+    dust_threshold_satoshis: u64,
 }
 
 /// A run of failures talking to the blockchain interface.
@@ -183,6 +186,7 @@ impl Service {
                 let resolved = client_config.clone().resolve_secrets()?;
                 let mut client = Client::try_new(&resolved)?;
                 client.set_fee_satoshis_per_kb(config.fees.satoshis_per_kb);
+                client.set_dust_threshold(config.fees.dust_threshold_satoshis);
                 clients.insert(
                     client_config.client_id.clone(),
                     Arc::new(RwLock::new(client)),
@@ -200,6 +204,7 @@ impl Service {
             let resolved = client_config.clone().resolve_secrets()?;
             let mut client = Client::try_new(&resolved)?;
             client.set_fee_satoshis_per_kb(config.fees.satoshis_per_kb);
+            client.set_dust_threshold(config.fees.dust_threshold_satoshis);
             clients.insert(
                 client_config.client_id.clone(),
                 Arc::new(RwLock::new(client)),
@@ -228,6 +233,7 @@ impl Service {
             chain_state_max_age: config.service.chain_state_max_age(),
             fee_satoshis_per_kb: Mutex::new(config.fees.satoshis_per_kb),
             use_mapi_fee_quote: config.fees.use_mapi_fee_quote,
+            dust_threshold_satoshis: config.fees.dust_threshold_satoshis,
             mapi_health_ttl: config
                 .mapi_lite
                 .as_ref()
@@ -471,6 +477,7 @@ impl Service {
         // config file says, so a client added now costs its transactions the
         // same as one that has been here since startup.
         client.set_fee_satoshis_per_kb(*self.fee_satoshis_per_kb.lock().await);
+        client.set_dust_threshold(self.dust_threshold_satoshis);
         let new_client = Arc::new(RwLock::new(client));
         {
             let mut clients = self.clients.write().await;
@@ -1102,7 +1109,14 @@ impl Service {
             }
         })?;
         let hash = tx.hash();
-        response.outpoints = (1..prepared.no_of_outpoints + 1)
+        // The funded outputs are the last `no_of_outpoints` of the
+        // transaction. They used to be assumed to start at index 1, because a
+        // change output always sat at index 0; since CS-452 a transaction
+        // whose change would have been dust has no change output, and they
+        // start at 0 instead. Derived rather than assumed, so it stays right
+        // either way.
+        let first = tx.outputs.len() as u32 - prepared.no_of_outpoints;
+        response.outpoints = (first..first + prepared.no_of_outpoints)
             .map(|index| OutPoint { hash, index })
             .collect();
         Ok(response)

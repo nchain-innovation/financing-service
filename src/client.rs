@@ -19,7 +19,7 @@ use chain_gang::{
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use crate::config::{ClientConfig, DEFAULT_SATOSHIS_PER_KB};
+use crate::config::{ClientConfig, DEFAULT_DUST_THRESHOLD_SATOSHIS, DEFAULT_SATOSHIS_PER_KB};
 use crate::responses::{CodedError, ErrorCode};
 
 /// How long an outpoint stays reserved after a funding transaction whose
@@ -78,7 +78,9 @@ struct PendingChange {
 #[derive(Clone, Debug)]
 pub struct FundingSpendPlan {
     spent_indices: Vec<usize>,
-    change_entry: UtxoEntry,
+    /// `None` when the change was dust and went to the fee instead, so
+    /// there is no change output to track (CS-452).
+    change_entry: Option<UtxoEntry>,
     /// The inputs this plan spends, by outpoint, so they can be reserved when
     /// the broadcast outcome is unknown. Indices address the UTXO list this
     /// plan was built against and do not survive a refresh; outpoints do.
@@ -148,6 +150,9 @@ pub struct Client {
     /// change while the service runs: when `[mapi_lite]` is configured the
     /// rate is refreshed from its fee quote (CS-451).
     fee_satoshis_per_kb: u64,
+    /// Change below this is folded into the fee instead of being paid out as
+    /// an output nobody would spend (CS-452).
+    dust_threshold: i64,
     /// Change this service created and broadcast, which the chain has not
     /// caught up with. Kept in the cache across refreshes so a client can
     /// spend its own change without waiting for the chain to confirm what the
@@ -178,6 +183,7 @@ impl Client {
             reserved: HashMap::new(),
             pending_change: HashMap::new(),
             fee_satoshis_per_kb: DEFAULT_SATOSHIS_PER_KB,
+            dust_threshold: DEFAULT_DUST_THRESHOLD_SATOSHIS as i64,
         })
     }
 
@@ -336,9 +342,21 @@ impl Client {
         self.address.to_string()
     }
 
-    /// Return the smallest unspent that is greater than given satoshi
+    /// Return the smallest unspent that can cover `satoshi`.
+    ///
+    /// Two passes, because the smallest UTXO that covers the cost is not
+    /// always the one to use. Folding dust change into the fee (CS-452) means
+    /// a UTXO worth a little more than the cost hands the difference to the
+    /// miner, so one whose change is either nothing or worth an output is
+    /// preferred. Only if no such UTXO exists is the dust-folding one taken,
+    /// which keeps the request fundable rather than refusing it to save a
+    /// sum smaller than the dust threshold.
     fn get_smallest_unspent(&self, satoshi: u64) -> Option<&UtxoEntry> {
-        self.unspent.iter().find(|utxo| utxo.value > satoshi as i64)
+        let cost = satoshi as i64;
+        self.unspent
+            .iter()
+            .find(|utxo| self.change_is_acceptable(utxo.value - cost))
+            .or_else(|| self.unspent.iter().find(|utxo| utxo.value >= cost))
     }
 
     fn total_unspent(&self) -> i64 {
@@ -368,6 +386,33 @@ impl Client {
     #[cfg(test)]
     pub fn fee_satoshis_per_kb(&self) -> u64 {
         self.fee_satoshis_per_kb
+    }
+
+    /// Change below this many satoshis is folded into the fee.
+    #[cfg(test)]
+    pub fn dust_threshold(&self) -> i64 {
+        self.dust_threshold
+    }
+
+    /// Set the amount below which change is folded into the fee.
+    pub fn set_dust_threshold(&mut self, dust_threshold: u64) {
+        self.dust_threshold = dust_threshold as i64;
+    }
+
+    /// Whether a transaction leaving `change` wastes nothing: either it pays
+    /// the change back, or there is no change to pay.
+    ///
+    /// Negative means the UTXO cannot cover the cost at all.
+    fn change_is_acceptable(&self, change: i64) -> bool {
+        change == 0 || self.change_is_worth_paying(change)
+    }
+
+    /// Whether `change` is worth paying back to the client.
+    ///
+    /// Zero is not worth an output by definition, and anything under the
+    /// threshold costs more to spend later than it carries.
+    fn change_is_worth_paying(&self, change: i64) -> bool {
+        change >= self.dust_threshold && change > 0
     }
 
     /// Set the rate used to cost future transactions.
@@ -434,9 +479,11 @@ impl Client {
     /// max over n of ( sum of the n largest UTXOs  -  fee(n inputs) )
     /// ```
     ///
-    /// One satoshi is then taken off, because a funding transaction pays its
-    /// change back to the client and an output of zero is not a change output
-    /// -- the builder rejects it.
+    /// Nothing is taken off for change. Funding this amount leaves none, and
+    /// a transaction with no change output is exactly what the builder makes
+    /// when the change would not be worth an output. Taking a satoshi off, as
+    /// this used to, is what produced the stranded one-satoshi output CS-452
+    /// reported: the wallet was drained to a balance it could not spend.
     ///
     /// Returns 0 rather than a negative number when nothing can be funded.
     fn max_fundable(&self, output_script_bytes: u64) -> i64 {
@@ -448,7 +495,7 @@ impl Client {
         for (index, value) in values.iter().enumerate() {
             running += value;
             let fee = self.estimate_fee(output_script_bytes, index as u32 + 1) as i64;
-            best = best.max(running - fee - 1);
+            best = best.max(running - fee);
         }
         best.max(0)
     }
@@ -464,7 +511,7 @@ impl Client {
     fn max_fundable_if_consolidated(&self, output_script_bytes: u64) -> i64 {
         let total = self.total_unspent();
         let fee = self.estimate_fee(output_script_bytes, 1) as i64;
-        (total - fee - 1).max(0)
+        (total - fee).max(0)
     }
 
     fn count_utxos_above(&self, amount: u64) -> usize {
@@ -484,11 +531,12 @@ impl Client {
             selected.push(index);
             let input_sum: i64 = selected.iter().map(|&i| self.unspent[i].value).sum();
             let total_cost = self.estimate_total_cost(fund_request, selected.len() as u32) as i64;
-            // Strictly greater, not `>=`. The builder pays change back to the
-            // client and rejects a change output of zero, so a set that covers
-            // the cost exactly is one it cannot build -- accepting it here
-            // turned a fundable-looking request into an internal error.
-            if input_sum > total_cost {
+            // `>=` again, not the `>` CS-422 needed. That was there because
+            // the builder rejected a change output of zero; it now leaves the
+            // change out entirely when it would be dust, so a set covering the
+            // cost exactly is one it can build -- as a transaction with no
+            // change output at all (CS-452).
+            if input_sum >= total_cost {
                 return Some(selected);
             }
         }
@@ -509,10 +557,22 @@ impl Client {
         change: i64,
         change_script: &Script,
     ) -> Vec<TxOut> {
-        let mut vouts = vec![TxOut {
-            satoshis: change,
-            lock_script: change_script.clone(),
-        }];
+        // Change worth less than the dust threshold gets no output at all: the
+        // amount stays in the transaction and the miner takes it as fee. An
+        // output of a satoshi or two cannot be spent for less than it holds,
+        // so paying it back only strands it -- which is what funding the
+        // advertised maximum used to do (CS-452).
+        //
+        // The funded outputs are therefore always the *last* `no_of_outpoints`
+        // of the transaction, and the caller must not assume they start at
+        // index 1.
+        let mut vouts = Vec::with_capacity(fund_request.no_of_outpoints as usize + 1);
+        if self.change_is_worth_paying(change) {
+            vouts.push(TxOut {
+                satoshis: change,
+                lock_script: change_script.clone(),
+            });
+        }
 
         // One output per requested outpoint, each with its own script, so N
         // outpoints from one request can be independently spendable.
@@ -546,7 +606,7 @@ impl Client {
         Ok(())
     }
 
-    fn spend_utxos(&mut self, spent_indices: &[usize], change_entry: UtxoEntry) {
+    fn spend_utxos(&mut self, spent_indices: &[usize], change_entry: Option<UtxoEntry>) {
         let spent: std::collections::HashSet<usize> = spent_indices.iter().copied().collect();
         self.unspent = self
             .unspent
@@ -560,11 +620,13 @@ impl Client {
                 }
             })
             .collect();
-        self.unspent.push(change_entry);
+        // No entry when the change was dust and went to the fee (CS-452).
+        if let Some(change_entry) = change_entry {
+            self.unspent.push(change_entry);
+        }
         self.unspent.sort_by_key(|utxo| utxo.value);
     }
 
-    /// Return a coded error when the client cannot fund the request.
     /// Return a coded error when the client cannot fund the request.
     ///
     /// The two modes cost quite differently -- one transaction spending as
@@ -679,7 +741,7 @@ impl Client {
     ) -> Result<(Tx, FundingSpendPlan), String> {
         let change_script = self.wallet.get_locking_script();
         let change = unspent.value - total_cost as i64;
-        if change <= 0 {
+        if change < 0 {
             return Err("Insufficient UTXO value for funding transaction.".to_string());
         }
 
@@ -702,7 +764,7 @@ impl Client {
             .iter()
             .position(|x| x == unspent)
             .ok_or_else(|| "UTXO not found in local cache.".to_string())?;
-        let change_entry = UtxoEntry {
+        let change_entry = self.change_is_worth_paying(change).then(|| UtxoEntry {
             // Just built and not yet broadcast, let alone mined. Recording it
             // as height 0 said "confirmed in block 0" under chain-gang's
             // convention, which put the change on the wrong side of every
@@ -711,7 +773,7 @@ impl Client {
             tx_pos: 0,
             tx_hash: tx.hash().encode(),
             value: change,
-        };
+        });
 
         Ok((
             tx,
@@ -737,7 +799,7 @@ impl Client {
         let total_cost =
             self.estimate_total_cost(fund_request, selected_indices.len() as u32) as i64;
         let change = input_sum - total_cost;
-        if change <= 0 {
+        if change < 0 {
             return Err("Insufficient UTXO value for funding transaction.".to_string());
         }
 
@@ -762,13 +824,13 @@ impl Client {
         let sighash_flags = SIGHASH_ALL | SIGHASH_FORKID;
         self.sign_funding_tx_inputs(&mut tx, &input_amounts, &change_script, sighash_flags)?;
 
-        let change_entry = UtxoEntry {
+        let change_entry = self.change_is_worth_paying(change).then(|| UtxoEntry {
             // As above: unconfirmed until it is mined.
             height: UNCONFIRMED_HEIGHT,
             tx_pos: 0,
             tx_hash: tx.hash().encode(),
             value: change,
-        };
+        });
 
         Ok((
             tx,
@@ -821,13 +883,17 @@ impl Client {
         for entry in plan.spent_outpoints {
             self.reserved.insert(outpoint_key(&entry), now);
         }
-        self.pending_change.insert(
-            outpoint_key(&change_entry),
-            PendingChange {
-                entry: change_entry,
-                since: now,
-            },
-        );
+        // A transaction whose change went to the fee has no change output to
+        // pin, so there is nothing to hold across a refresh (CS-452).
+        if let Some(change_entry) = change_entry {
+            self.pending_change.insert(
+                outpoint_key(&change_entry),
+                PendingChange {
+                    entry: change_entry,
+                    since: now,
+                },
+            );
+        }
     }
 
     /// Commit a spend whose transaction may or may not have reached the
@@ -914,17 +980,21 @@ mod tests {
         // rate fails here with a number rather than as a wall of hex.
         //
         // At 100 sat/KB a one-input, two-output transaction is 217 bytes and
-        // costs 22 satoshi, so the smallest UTXO that can pay 123 and still
-        // leave change is the 240. (Under the superseded step fee the same
-        // request cost 750 and had to reach for the 9_564_208 one.)
+        // costs 22 satoshi. The 240 UTXO could cover that, but its change
+        // would be 95 -- under the dust threshold, so it would go to the miner
+        // rather than back to the client. Selection therefore prefers the
+        // 9_564_208 one, whose change is worth an output (CS-452).
         assert_eq!(tx.inputs.len(), 1, "one input suffices at this rate");
         assert_eq!(tx.outputs.len(), 2);
-        assert_eq!(tx.outputs[0].satoshis, 95, "change: 240 - 123 - 22");
+        assert_eq!(
+            tx.outputs[0].satoshis, 9_564_063,
+            "change: 9564208 - 123 - 22, paid back rather than given away"
+        );
         assert_eq!(tx.outputs[1].satoshis, 123, "the requested amount");
 
         assert_eq!(
             tx_as_hexstr(&tx).unwrap(),
-            "01000000015e791b771be3af3ed1447d311071a1e15e127c4343a58debcb8e40c1e57272f6000000006a4730440220375ccfd8bac40cbacba5102626d0356fce0c0cccc2ca336825535aea2f4f9d4b02205e2e3bb7997f65eaaa61b64f75bb4d820be301741d312ad7b9c0d10eb42ce83b412103a8ae071ddd8690b94755c7112ca304bcac45c15904cc013f0ad6c2ea0b1019b2ffffffff025f000000000000001976a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac7b000000000000001976a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac00000000"
+            "0100000001786563262f7e951eea3d9db3e4997daeba748ffa99219e298401dfe99d1033e5000000006a47304402201eb6436cc3c93464e8c9c359285ddd564e3e081c27f5576e63caefd15facaa7802203e8b027e40c0bd506061e7446d1676f91e2e207474ff069c1004b12bb021c061412103a8ae071ddd8690b94755c7112ca304bcac45c15904cc013f0ad6c2ea0b1019b2ffffffff029fef9100000000001976a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac7b000000000000001976a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac00000000"
         );
     }
 
@@ -1164,8 +1234,8 @@ mod tests {
         assert_eq!(client.total_unspent(), 1010);
         assert_eq!(
             client.max_fundable(Client::P2PKH_SCRIPT_BYTES),
-            977,
-            "1000 - 22 - 1, leaving the 10 alone rather than paying 15 for it"
+            978,
+            "1000 - 22, leaving the 10 alone rather than paying 15 for it"
         );
     }
 
@@ -1189,12 +1259,118 @@ mod tests {
         assert_eq!(DEFAULT_SATOSHIS_PER_KB, 100);
     }
 
+    /// The ticket's transaction: funding the advertised maximum produced two
+    /// outputs, the second worth one satoshi, and left the client holding a
+    /// balance of 1 that it could never spend. There is now no second output.
+    #[test]
+    fn cs_452_funding_the_maximum_leaves_no_dust_output() {
+        let mut client = client_holding_at_rate(vec![cs_422_utxo(1, 0, 5_000)], 100);
+        let script_bytes = Client::P2PKH_SCRIPT_BYTES;
+        let max = client.max_fundable(script_bytes) as u64;
+        assert_eq!(max, 4_978, "5000 - 22, with nothing held back for change");
+
+        let tx = client
+            .create_funding_tx(&cs_422_request(max))
+            .expect("the advertised maximum must build");
+
+        assert_eq!(tx.outputs.len(), 1, "no change output at all");
+        assert_eq!(tx.outputs[0].satoshis, 4_978);
+        let after = client.get_balance();
+        assert_eq!(
+            after.confirmed + after.unconfirmed,
+            0,
+            "spent out, not left holding an unspendable satoshi: {after:?}"
+        );
+    }
+
+    /// Change below the threshold is not paid back as a tiny output; it stays
+    /// in the transaction, which means the miner takes it as fee.
+    #[test]
+    fn cs_452_dust_change_goes_to_the_fee_rather_than_an_output() {
+        // 5_100 covers 5_000 plus the 22 fee and leaves 78, under the 135
+        // threshold. It is the only UTXO, so there is nothing better to pick.
+        let mut client = client_holding_at_rate(vec![cs_422_utxo(1, 0, 5_100)], 100);
+        let tx = client
+            .create_funding_tx(&cs_422_request(5_000))
+            .expect("still fundable");
+
+        assert_eq!(tx.outputs.len(), 1, "the 78 is not worth an output");
+        assert_eq!(tx.outputs[0].satoshis, 5_000);
+
+        let paid_out: i64 = tx.outputs.iter().map(|out| out.satoshis).sum();
+        assert_eq!(
+            5_100 - paid_out,
+            100,
+            "the whole remainder, fee plus the dust, goes to the miner"
+        );
+    }
+
+    /// Given a choice, the service does not pick the UTXO that would hand its
+    /// change to the miner.
+    #[test]
+    fn cs_452_a_utxo_that_would_leave_dust_is_not_preferred() {
+        // 5_100 leaves 78 of dust; 9_000 leaves 3_978, which is worth an
+        // output. The smaller one would otherwise win, being smallest-first.
+        let mut client = client_holding_at_rate(
+            vec![cs_422_utxo(1, 0, 5_100), cs_422_utxo(2, 0, 9_000)],
+            100,
+        );
+        let tx = client
+            .create_funding_tx(&cs_422_request(5_000))
+            .expect("fundable");
+
+        assert_eq!(tx.outputs.len(), 2, "change is paid back, not given away");
+        assert_eq!(tx.outputs[0].satoshis, 3_978, "9000 - 5000 - 22");
+        assert_eq!(client.get_balance().unconfirmed, 3_978);
+    }
+
+    /// A UTXO covering the cost exactly is fundable again. CS-422 had to
+    /// exclude it because the builder rejected a zero change output; it now
+    /// builds one with no change output instead.
+    #[test]
+    fn cs_452_a_utxo_covering_the_cost_exactly_is_fundable() {
+        let exact =
+            5_000 + client_holding(Vec::new()).estimate_fee(Client::P2PKH_SCRIPT_BYTES, 1) as i64;
+        let mut client = client_holding_at_rate(vec![cs_422_utxo(1, 0, exact)], 100);
+
+        let request = cs_422_request(5_000);
+        assert!(
+            client.funding_balance_error(&request).is_none(),
+            "covering the cost exactly is enough"
+        );
+        let tx = client.create_funding_tx(&request).expect("and it builds");
+        assert_eq!(tx.outputs.len(), 1);
+    }
+
+    /// A threshold of zero turns the behaviour off: every positive change is
+    /// paid back, however small.
+    #[test]
+    fn cs_452_a_zero_threshold_pays_back_even_one_satoshi() {
+        let mut client = client_holding_at_rate(vec![cs_422_utxo(1, 0, 5_023)], 100);
+        client.set_dust_threshold(0);
+        let tx = client
+            .create_funding_tx(&cs_422_request(5_000))
+            .expect("fundable");
+        assert_eq!(tx.outputs.len(), 2);
+        assert_eq!(tx.outputs[0].satoshis, 1, "5023 - 5000 - 22");
+    }
+
+    /// The default matches what the configuration documents.
+    #[test]
+    fn cs_452_a_new_client_starts_at_the_default_threshold() {
+        assert_eq!(
+            client_holding(Vec::new()).dust_threshold(),
+            DEFAULT_DUST_THRESHOLD_SATOSHIS as i64
+        );
+        assert_eq!(DEFAULT_DUST_THRESHOLD_SATOSHIS, 135);
+    }
+
     /// Reserve the first cached outpoint, as an uncertain broadcast does.
     fn reserve_first(client: &mut Client) -> UtxoEntry {
         let entry = client.unspent[0].clone();
         client.commit_uncertain_funding_spend(FundingSpendPlan {
             spent_indices: vec![0],
-            change_entry: utxo("change", 0, 1, 0),
+            change_entry: Some(utxo("change", 0, 1, 0)),
             spent_outpoints: vec![entry.clone()],
         });
         entry
@@ -1282,7 +1458,7 @@ mod tests {
         let mut client = client_holding(vec![utxo("aa", 0, 5_000, 100)]);
         client.commit_uncertain_funding_spend(FundingSpendPlan {
             spent_indices: vec![0],
-            change_entry: utxo("change", 0, 4_800, 0),
+            change_entry: Some(utxo("change", 0, 4_800, 0)),
             spent_outpoints: vec![utxo("aa", 0, 5_000, 100)],
         });
         assert!(client.unspent.is_empty(), "{:?}", client.unspent);
@@ -1301,7 +1477,7 @@ mod tests {
         let mut client = client_holding(vec![utxo("aa", 0, 5_000, 100)]);
         client.commit_funding_spend(FundingSpendPlan {
             spent_indices: vec![0],
-            change_entry: utxo("change", 0, 4_800, 0),
+            change_entry: Some(utxo("change", 0, 4_800, 0)),
             spent_outpoints: vec![utxo("aa", 0, 5_000, 100)],
         });
         assert_eq!(
@@ -1518,7 +1694,9 @@ mod tests {
     ///
     /// At 100 sat/KB every one of the seven UTXOs is worth spending -- an
     /// input adds 148 bytes, so it costs 15 satoshi to bring in 100 -- and the
-    /// ceiling is all seven minus the fee for seven. Consolidated, the same
+    /// ceiling is all seven minus the fee for seven, with nothing held back
+    /// for change: funding exactly that builds a transaction with no change
+    /// output at all (CS-452). Consolidated, the same
     /// coins would cost one input's fee instead of seven, which is why the two
     /// figures differ and why the error codes below split. Under the
     /// superseded step fee the seventh input crossed a kilobyte and cost 500
@@ -1531,8 +1709,8 @@ mod tests {
         let script_bytes = hex::decode(LOCKING_SCRIPT_HEX).unwrap().len() as u64;
 
         assert_eq!(client.total_unspent(), 1230);
-        assert_eq!(client.max_fundable(script_bytes), 1118);
-        assert_eq!(client.max_fundable_if_consolidated(script_bytes), 1207);
+        assert_eq!(client.max_fundable(script_bytes), 1119);
+        assert_eq!(client.max_fundable_if_consolidated(script_bytes), 1208);
     }
 
     /// The report's first complaint: asking for 480 was refused as
@@ -1543,11 +1721,11 @@ mod tests {
     #[test]
     fn cs_422_insufficient_balance_reports_what_can_actually_be_paid_out() {
         let error = cs_422_wallet()
-            .funding_balance_error(&cs_422_request(1208))
-            .expect("1208 is beyond this wallet");
+            .funding_balance_error(&cs_422_request(1209))
+            .expect("1209 is beyond this wallet");
         assert_eq!(error.code, ErrorCode::InsufficientBalance);
         assert!(
-            error.description.contains("1208 satoshi requested"),
+            error.description.contains("1209 satoshi requested"),
             "{}",
             error.description
         );
@@ -1557,7 +1735,7 @@ mod tests {
             error.description
         );
         assert!(
-            error.description.contains("at most 1207"),
+            error.description.contains("at most 1208"),
             "{}",
             error.description
         );
@@ -1581,7 +1759,7 @@ mod tests {
             .expect("1150 is beyond this UTXO set as it stands");
         assert_eq!(error.code, ErrorCode::NoSuitableUtxo);
         assert!(
-            error.description.contains("at most 1118"),
+            error.description.contains("at most 1119"),
             "{}",
             error.description
         );
@@ -1598,30 +1776,30 @@ mod tests {
     }
 
     /// The two codes now mean different things, and the boundary between them
-    /// is the point where consolidating would stop helping. Up to 1118 the
-    /// wallet funds as it is; between 1119 and 1207 it could fund only if it
-    /// were consolidated; above 1207 no arrangement is enough.
+    /// is the point where consolidating would stop helping. Up to 1119 the
+    /// wallet funds as it is; between 1120 and 1208 it could fund only if it
+    /// were consolidated; above 1208 no arrangement is enough.
     #[test]
     fn cs_422_the_two_codes_split_at_the_point_consolidating_stops_helping() {
         let client = cs_422_wallet();
 
         assert!(client
-            .funding_balance_error(&cs_422_request(1118))
+            .funding_balance_error(&cs_422_request(1119))
             .is_none());
 
         let shape = client
-            .funding_balance_error(&cs_422_request(1119))
-            .expect("1119 needs consolidating");
+            .funding_balance_error(&cs_422_request(1120))
+            .expect("1120 needs consolidating");
         assert_eq!(shape.code, ErrorCode::NoSuitableUtxo);
 
         let shape = client
-            .funding_balance_error(&cs_422_request(1207))
-            .expect("1207 needs consolidating");
+            .funding_balance_error(&cs_422_request(1208))
+            .expect("1208 needs consolidating");
         assert_eq!(shape.code, ErrorCode::NoSuitableUtxo);
 
         let balance = client
-            .funding_balance_error(&cs_422_request(1208))
-            .expect("1208 needs more money");
+            .funding_balance_error(&cs_422_request(1209))
+            .expect("1209 needs more money");
         assert_eq!(balance.code, ErrorCode::InsufficientBalance);
     }
 
@@ -1642,11 +1820,23 @@ mod tests {
         let tx = client
             .create_funding_tx(&request)
             .expect("and the transaction must build");
-        // one output pays the request, one pays change back, and change is
-        // never zero
-        assert_eq!(tx.outputs.len(), 2);
-        assert!(tx.outputs.iter().any(|out| out.satoshis == max as i64));
-        assert!(tx.outputs[0].satoshis > 0, "change must be positive");
+        // Funding the advertised maximum spends the wallet out exactly, so
+        // there is no change output at all. This is CS-452: the maximum used
+        // to be one satoshi lower, which left a one-satoshi output that cost
+        // more to spend than it held, and a balance the client could not use.
+        assert_eq!(
+            tx.outputs.len(),
+            1,
+            "no change output, so nothing is stranded"
+        );
+        assert_eq!(tx.outputs[0].satoshis, max as i64);
+
+        let after = client.get_balance();
+        assert_eq!(
+            after.confirmed + after.unconfirmed,
+            0,
+            "the wallet is spent out, not left holding dust: {after:?}"
+        );
     }
 
     /// The guard that keeps the two halves honest. Whatever the pre-check
