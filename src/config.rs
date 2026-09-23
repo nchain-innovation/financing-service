@@ -1197,6 +1197,9 @@ filename = "./data/dynamic.toml"
         .unwrap();
         assert_eq!(only_flag.fees.satoshis_per_kb, DEFAULT_SATOSHIS_PER_KB);
         assert!(!only_flag.fees.use_mapi_fee_quote);
+
+        // Those are the only two. The dust threshold is derived from the rate
+        // rather than configured, so there is no third key (CS-452).
     }
 
     /// A zero rate builds transactions nothing relays, and the service would

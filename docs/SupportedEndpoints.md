@@ -161,6 +161,8 @@ curl -H "Authorization: Bearer your-client-api-key" \
 `satoshi` and `locking_script` describe the output this outpoint refers to. **They are read from the transaction that was broadcast, not echoed from the request**, so a client can verify what was actually paid rather than assume the request was honoured.
 
 That matters when spending the outpoint: a BSV (BIP-143) signature commits to both the previous output's value and its locking script, so if either differed from what the client assumed, the signature would not verify and the node would reject the spending transaction with a script error that says nothing about the funding value being wrong.
+
+**Read `index` rather than assuming it.** A funding transaction normally pays change back at output 0, which puts the first funded output at 1 — as above. When the change would be worth less than the dust threshold it is not paid back at all (see [`[fees]`](Configuration.md#dust-change-goes-to-the-fee)), and the funded outputs start at **0** instead. Funding the reported `max_fundable` always takes that form, because it spends the client out exactly. A caller that hardcodes 1 will reference an output that does not exist.
 ### Locking scripts per outpoint
 
 `POST /fund` accepts the locking script in either of two forms. Exactly one is required.

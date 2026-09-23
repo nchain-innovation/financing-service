@@ -1635,8 +1635,10 @@ mod tests {
             .iter()
             .map(|t| {
                 let tx = decode_tx(t["tx"].as_str().unwrap());
-                // output 1 is the funded output; 0 is change
-                hex::encode(&tx.outputs[1].lock_script.0)
+                // The funded outputs are last. There is not always a change
+                // output at index 0 -- when the change would be dust it is
+                // folded into the fee instead (CS-452).
+                hex::encode(&tx.outputs.last().expect("an output").lock_script.0)
             })
             .collect();
         seen.sort();
@@ -2316,6 +2318,54 @@ mod tests {
             StatusCode::OK,
             "the advertised maximum was refused: {:?}",
             test::read_body(resp).await
+        );
+    }
+
+    /// Funding the advertised maximum spends the wallet out, so the
+    /// transaction has no change output and the funded outpoint is at index 0
+    /// rather than 1. The reported index has to follow, or the caller is
+    /// handed a reference to an output that does not exist (CS-452).
+    #[actix_web::test]
+    async fn cs_452_the_reported_index_follows_a_missing_change_output() {
+        let app = build_app().await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/client/{TEST_CLIENT_ID}/balance"))
+                .to_request(),
+        )
+        .await;
+        let body: Value = test::read_body_json(resp).await;
+        let max_fundable = body["max_fundable"].as_i64().expect("max_fundable") as u64;
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/fund")
+                .set_json(fund_body(
+                    TEST_CLIENT_ID,
+                    max_fundable,
+                    1,
+                    LOCKING_SCRIPT_HEX,
+                ))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = test::read_body_json(resp).await;
+
+        let tx = decode_tx(body["txs"][0]["tx"].as_str().expect("a transaction"));
+        assert_eq!(tx.outputs.len(), 1, "no change output when spent out");
+
+        let outpoint = &body["outpoints"][0];
+        assert_eq!(
+            outpoint["index"].as_u64().expect("index"),
+            0,
+            "the funded output is the only one"
+        );
+        assert_eq!(
+            outpoint["satoshi"].as_i64().expect("satoshi"),
+            max_fundable as i64
         );
     }
 }

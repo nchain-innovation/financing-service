@@ -79,6 +79,12 @@ filename = "./data/dynamic.toml"
 # satoshis_per_kb becomes the fallback used before the first quote and whenever
 # one cannot be had. Set use_mapi_fee_quote = false to always use the number
 # below.
+#
+# Change too small to be worth an output is not paid back -- it stays in the
+# transaction and the miner takes it as fee. The threshold for that is derived
+# from the rate above rather than configured: it is the round-trip cost of a
+# change output, max(1, 2 * ceil(182 * satoshis_per_kb / 1000)), which is 38
+# satoshi at 100 sat/KB.
 # [fees]
 # satoshis_per_kb = 100
 # use_mapi_fee_quote = true
