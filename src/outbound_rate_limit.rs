@@ -14,29 +14,29 @@
 //! around [`BlockchainInterface`] sees every outbound *call* whatever asked for
 //! it, and no future caller has to remember.
 //!
-//! # What this paces, and what it does not (CS-457)
+//! # What this paces, and who uses it now (CS-457)
 //!
 //! **One slot per interface call, not per HTTP request.** Those were the same
 //! thing when this was written against chain-gang 0.11.2. They stopped being
-//! the same in 0.11.3 (CS-456): `get_balance` is now two requests, and
-//! `get_utxo` is one per 1000 UTXOs -- 21 for the mainnet address CS-456
-//! measured. The limiter reserves one slot and chain-gang then issues all of
-//! them inside it.
+//! the same in 0.11.3 (CS-456): `get_balance` is two requests, and `get_utxo`
+//! one per 1000 UTXOs -- 21 for the mainnet address CS-456 measured. This
+//! decorator reserves one slot and chain-gang then issues all of them inside
+//! it, so for `woc` it stopped bounding the request rate at all.
 //!
-//! This cannot be fixed from here. `WocInterface` builds its own client and
-//! calls `reqwest::get` directly, and `WocInterface::new` takes no arguments,
-//! so there is no client, middleware or hook to supply -- the paging requests
-//! are unreachable from this crate by construction. Restoring the guarantee
-//! needs an upstream change; CS-457 carries the analysis and the options.
+//! That could not be fixed from here: `WocInterface` built its own client and
+//! called `reqwest::get` directly, with no hook to supply. chain-gang 0.11.4
+//! added `set_max_requests_per_second`, which paces the requests themselves,
+//! and [`crate::blockchain_factory`] now hands the configured rate to the
+//! interface for `woc` and does **not** wrap it here -- pacing in both places
+//! would pace twice and bound nothing extra.
 //!
-//! So read `max_requests_per_second` as spacing between *calls*. For an address
-//! under 1000 UTXOs that is still one request each and the original guarantee
-//! holds exactly; beyond it, the configured number is a floor on call spacing
-//! rather than a ceiling on request rate.
-//!
-//! Only the interfaces that talk to someone else's server need this. A node
-//! reached over RPC, or a local UaaS, is the operator's own and is left
-//! unthrottled by default.
+//! So this decorator is now for the interfaces that cannot pace themselves: a
+//! node reached over RPC, or a UaaS. Those are the operator's own servers and
+//! are unthrottled by default, so it applies only when
+//! `max_requests_per_second` is set explicitly. For them the caveat above
+//! still stands -- one slot per call, and a call may be more than one
+//! request -- but the published limit that prompted CS-418 is not theirs to
+//! break.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
