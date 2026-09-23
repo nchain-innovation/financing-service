@@ -182,6 +182,71 @@ pub struct IdempotencyConfig {
     pub max_entries: usize,
 }
 
+/// The fee rate the service pays on the funding transactions it builds.
+///
+/// Before CS-451 this was hardcoded as `((tx_bytes / 1000) * 500) + 750`,
+/// which is a step function rather than a rate: it charged 750 satoshi for any
+/// transaction under a kilobyte, and jumped by 500 at each kilobyte after.
+/// A 250-byte funding transaction -- the ordinary shape, one input and two
+/// outputs -- therefore paid 750 satoshi, an effective 3000 sat/KB. The rate
+/// is now stated directly, so what the service pays is a number an operator
+/// can read and change rather than an artefact of an expression.
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+pub struct FeesConfig {
+    /// Satoshis per kilobyte of transaction. The fee for a transaction is
+    /// `ceil(tx_bytes * satoshis_per_kb / 1000)`, rounded up so that rounding
+    /// never underpays and risks a rejection.
+    #[serde(default = "default_satoshis_per_kb")]
+    pub satoshis_per_kb: u64,
+    /// When `[mapi_lite]` is configured, take the rate from its `feeQuote`
+    /// instead of `satoshis_per_kb`, so one server sets the rate for every
+    /// service that broadcasts through it.
+    ///
+    /// `satoshis_per_kb` stays the fallback: it is used before the first quote
+    /// arrives, and whenever a refresh fails. Without `[mapi_lite]` this has
+    /// no effect, because there is nothing to ask.
+    #[serde(default = "default_use_mapi_fee_quote")]
+    pub use_mapi_fee_quote: bool,
+}
+
+impl Default for FeesConfig {
+    fn default() -> Self {
+        FeesConfig {
+            satoshis_per_kb: default_satoshis_per_kb(),
+            use_mapi_fee_quote: default_use_mapi_fee_quote(),
+        }
+    }
+}
+
+impl FeesConfig {
+    /// A rate of zero would build transactions no miner accepts, and the
+    /// service would only find out at broadcast.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.satoshis_per_kb == 0 {
+            return Err("fees.satoshis_per_kb must be greater than 0: a \
+                        transaction paying no fee is not relayed."
+                .to_string());
+        }
+        Ok(())
+    }
+}
+
+/// Satoshis per kilobyte when nothing is configured.
+///
+/// Deliberately far below what the superseded expression charged. See
+/// [`FeesConfig`] and docs/Configuration.md: an upgrade without a `[fees]`
+/// section pays less than it used to, which is the point of CS-451, but it is
+/// a behaviour change and not only a refactor.
+pub const DEFAULT_SATOSHIS_PER_KB: u64 = 100;
+
+fn default_satoshis_per_kb() -> u64 {
+    DEFAULT_SATOSHIS_PER_KB
+}
+
+fn default_use_mapi_fee_quote() -> bool {
+    true
+}
+
 impl Default for IdempotencyConfig {
     fn default() -> Self {
         IdempotencyConfig {
@@ -504,6 +569,8 @@ pub struct Config {
     /// Present => funding transactions are broadcast via mapi-lite.
     #[serde(default)]
     pub mapi_lite: Option<MapiLiteConfig>,
+    #[serde(default)]
+    pub fees: FeesConfig,
 }
 
 impl ClientConfig {
@@ -653,6 +720,7 @@ pub fn load_config(env_var: &str, filename: &str) -> Result<Config, String> {
     config.telemetry.validate()?;
     config.idempotency.validate()?;
     config.blockchain_interface.validate()?;
+    config.fees.validate()?;
     if let Some(mapi_lite) = &config.mapi_lite {
         mapi_lite.validate()?;
     }
@@ -1100,6 +1168,51 @@ utxo_refresh_period = 60
 [dynamic_config]
 filename = "./data/dynamic.toml"
 "#;
+
+    /// A config with no [fees] section is valid and takes the documented
+    /// defaults, so CS-451 does not make the section mandatory.
+    #[test]
+    fn cs_451_the_fees_section_is_optional() {
+        let config: Config = toml::from_str(MINIMAL_TOML).unwrap();
+        assert_eq!(config.fees.satoshis_per_kb, DEFAULT_SATOSHIS_PER_KB);
+        assert_eq!(config.fees.satoshis_per_kb, 100);
+        assert!(
+            config.fees.use_mapi_fee_quote,
+            "the quote is used by default when there is a mapi-lite to ask"
+        );
+        assert!(config.fees.validate().is_ok());
+    }
+
+    /// Either field can be set on its own; the other keeps its default.
+    #[test]
+    fn cs_451_each_fee_field_defaults_independently() {
+        let only_rate: Config =
+            toml::from_str(&format!("{MINIMAL_TOML}\n[fees]\nsatoshis_per_kb = 250\n")).unwrap();
+        assert_eq!(only_rate.fees.satoshis_per_kb, 250);
+        assert!(only_rate.fees.use_mapi_fee_quote);
+
+        let only_flag: Config = toml::from_str(&format!(
+            "{MINIMAL_TOML}\n[fees]\nuse_mapi_fee_quote = false\n"
+        ))
+        .unwrap();
+        assert_eq!(only_flag.fees.satoshis_per_kb, DEFAULT_SATOSHIS_PER_KB);
+        assert!(!only_flag.fees.use_mapi_fee_quote);
+    }
+
+    /// A zero rate builds transactions nothing relays, and the service would
+    /// only find that out at broadcast. It fails at startup instead, naming
+    /// the field.
+    #[test]
+    fn cs_451_a_zero_rate_is_refused_at_startup() {
+        let _env = env_lock();
+        let path = write_temp_config(
+            "fees-zero",
+            &format!("{MINIMAL_TOML}\n[fees]\nsatoshis_per_kb = 0\n"),
+        );
+        unsafe { env::remove_var("FS_CONFIG") };
+        let err = load_config("FS_CONFIG", path.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("fees.satoshis_per_kb"), "{err}");
+    }
 
     fn write_temp_config(label: &str, content: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(

@@ -19,7 +19,7 @@ use chain_gang::{
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use crate::config::ClientConfig;
+use crate::config::{ClientConfig, DEFAULT_SATOSHIS_PER_KB};
 use crate::responses::{CodedError, ErrorCode};
 
 /// How long an outpoint stays reserved after a funding transaction whose
@@ -142,6 +142,12 @@ pub struct Client {
     /// needed: the balance is derived from what is left in `unspent`, so
     /// removing the entry from there is all it takes to withhold its value.
     reserved: HashMap<OutPointKey, Instant>,
+    /// Satoshis per kilobyte used to cost the transactions this client builds.
+    ///
+    /// Held per client rather than read from config at each use because it can
+    /// change while the service runs: when `[mapi_lite]` is configured the
+    /// rate is refreshed from its fee quote (CS-451).
+    fee_satoshis_per_kb: u64,
     /// Change this service created and broadcast, which the chain has not
     /// caught up with. Kept in the cache across refreshes so a client can
     /// spend its own change without waiting for the chain to confirm what the
@@ -171,6 +177,7 @@ impl Client {
             chain_state_at: None,
             reserved: HashMap::new(),
             pending_change: HashMap::new(),
+            fee_satoshis_per_kb: DEFAULT_SATOSHIS_PER_KB,
         })
     }
 
@@ -344,28 +351,54 @@ impl Client {
     /// Taking a total rather than a length and a count means scripts of
     /// differing sizes are costed correctly, instead of assuming they are all
     /// the same size as the first.
-    fn estimate_fee(output_script_bytes: u64, no_of_inputs: u32) -> u64 {
+    fn estimate_fee(&self, output_script_bytes: u64, no_of_inputs: u32) -> u64 {
         const INPUT_BYTES: u64 = 148;
         const CHANGE_OUTPUT_BYTES: u64 = 34;
         const TX_OVERHEAD_BYTES: u64 = 10;
         let output_bytes = output_script_bytes + CHANGE_OUTPUT_BYTES;
         let tx_bytes = TX_OVERHEAD_BYTES + INPUT_BYTES * no_of_inputs.max(1) as u64 + output_bytes;
-        ((tx_bytes / 1000) * 500) + 750
+        // Rounded up: rounding down would underpay, and a transaction a miner
+        // will not relay costs far more to discover than the satoshi saved.
+        tx_bytes
+            .saturating_mul(self.fee_satoshis_per_kb)
+            .div_ceil(1000)
     }
 
-    fn estimate_total_cost(fund_request: &FundRequest, no_of_inputs: u32) -> u64 {
+    /// The rate this client costs its transactions at, in satoshis per KB.
+    #[cfg(test)]
+    pub fn fee_satoshis_per_kb(&self) -> u64 {
+        self.fee_satoshis_per_kb
+    }
+
+    /// Set the rate used to cost future transactions.
+    ///
+    /// Zero is ignored rather than applied: it would build transactions no
+    /// miner relays, and a bad quote should leave the last good rate standing
+    /// rather than stop funding working.
+    pub fn set_fee_satoshis_per_kb(&mut self, satoshis_per_kb: u64) {
+        if satoshis_per_kb == 0 {
+            log::warn!(
+                "ignoring a fee rate of 0 sat/KB; keeping {} sat/KB",
+                self.fee_satoshis_per_kb
+            );
+            return;
+        }
+        self.fee_satoshis_per_kb = satoshis_per_kb;
+    }
+
+    fn estimate_total_cost(&self, fund_request: &FundRequest, no_of_inputs: u32) -> u64 {
         if fund_request.no_of_outpoints > 1 && fund_request.multiple_tx {
             // One transaction per outpoint, each paying its own script, so
             // cost each separately rather than multiplying one estimate.
             (0..fund_request.no_of_outpoints as usize)
                 .map(|index| {
                     let bytes = fund_request.script_at(index).len() as u64;
-                    fund_request.satoshi + Self::estimate_fee(bytes, 1)
+                    fund_request.satoshi + self.estimate_fee(bytes, 1)
                 })
                 .sum()
         } else {
             fund_request.satoshi * fund_request.no_of_outpoints as u64
-                + Self::estimate_fee(fund_request.output_script_bytes(), no_of_inputs)
+                + self.estimate_fee(fund_request.output_script_bytes(), no_of_inputs)
         }
     }
 
@@ -414,7 +447,7 @@ impl Client {
         let mut best = 0i64;
         for (index, value) in values.iter().enumerate() {
             running += value;
-            let fee = Self::estimate_fee(output_script_bytes, index as u32 + 1) as i64;
+            let fee = self.estimate_fee(output_script_bytes, index as u32 + 1) as i64;
             best = best.max(running - fee - 1);
         }
         best.max(0)
@@ -430,7 +463,7 @@ impl Client {
     /// which need different actions -- top up, or consolidate.
     fn max_fundable_if_consolidated(&self, output_script_bytes: u64) -> i64 {
         let total = self.total_unspent();
-        let fee = Self::estimate_fee(output_script_bytes, 1) as i64;
+        let fee = self.estimate_fee(output_script_bytes, 1) as i64;
         (total - fee - 1).max(0)
     }
 
@@ -450,7 +483,7 @@ impl Client {
         for index in sorted {
             selected.push(index);
             let input_sum: i64 = selected.iter().map(|&i| self.unspent[i].value).sum();
-            let total_cost = Self::estimate_total_cost(fund_request, selected.len() as u32) as i64;
+            let total_cost = self.estimate_total_cost(fund_request, selected.len() as u32) as i64;
             // Strictly greater, not `>=`. The builder pays change back to the
             // client and rejects a change output of zero, so a set that covers
             // the cost exactly is one it cannot build -- accepting it here
@@ -614,7 +647,7 @@ impl Client {
         let per_tx_cost = (0..fund_request.no_of_outpoints as usize)
             .map(|index| {
                 fund_request.satoshi
-                    + Self::estimate_fee(fund_request.script_at(index).len() as u64, 1)
+                    + self.estimate_fee(fund_request.script_at(index).len() as u64, 1)
             })
             .max()
             .unwrap_or(fund_request.satoshi);
@@ -702,7 +735,7 @@ impl Client {
             .collect();
         let input_sum: i64 = input_amounts.iter().sum();
         let total_cost =
-            Self::estimate_total_cost(fund_request, selected_indices.len() as u32) as i64;
+            self.estimate_total_cost(fund_request, selected_indices.len() as u32) as i64;
         let change = input_sum - total_cost;
         if change <= 0 {
             return Err("Insufficient UTXO value for funding transaction.".to_string());
@@ -755,7 +788,7 @@ impl Client {
         &self,
         fund_request: &FundRequest,
     ) -> Result<(Tx, FundingSpendPlan), String> {
-        let total_cost_single = Self::estimate_total_cost(fund_request, 1);
+        let total_cost_single = self.estimate_total_cost(fund_request, 1);
         if let Some(unspent) = self.get_smallest_unspent(total_cost_single) {
             let unspent = unspent.clone();
             return self.create_funding_tx_single_input(fund_request, &unspent, total_cost_single);
@@ -877,9 +910,21 @@ mod tests {
         };
         let tx = client.create_funding_tx(&fund_request).unwrap();
 
+        // Stated before the serialised form below, so that a change of fee
+        // rate fails here with a number rather than as a wall of hex.
+        //
+        // At 100 sat/KB a one-input, two-output transaction is 217 bytes and
+        // costs 22 satoshi, so the smallest UTXO that can pay 123 and still
+        // leave change is the 240. (Under the superseded step fee the same
+        // request cost 750 and had to reach for the 9_564_208 one.)
+        assert_eq!(tx.inputs.len(), 1, "one input suffices at this rate");
+        assert_eq!(tx.outputs.len(), 2);
+        assert_eq!(tx.outputs[0].satoshis, 95, "change: 240 - 123 - 22");
+        assert_eq!(tx.outputs[1].satoshis, 123, "the requested amount");
+
         assert_eq!(
             tx_as_hexstr(&tx).unwrap(),
-            "0100000001786563262f7e951eea3d9db3e4997daeba748ffa99219e298401dfe99d1033e5000000006b483045022100c7a22fbf24470b2c96b82ce1bfd5896f515e3f0f509f307e94f699baefe0f8c3022044ddbb29952769c67ba117762ee628d299846039a6d90bc59618c770b226bfc2412103a8ae071ddd8690b94755c7112ca304bcac45c15904cc013f0ad6c2ea0b1019b2ffffffff02c7ec9100000000001976a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac7b000000000000001976a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac00000000"
+            "01000000015e791b771be3af3ed1447d311071a1e15e127c4343a58debcb8e40c1e57272f6000000006a4730440220375ccfd8bac40cbacba5102626d0356fce0c0cccc2ca336825535aea2f4f9d4b02205e2e3bb7997f65eaaa61b64f75bb4d820be301741d312ad7b9c0d10eb42ce83b412103a8ae071ddd8690b94755c7112ca304bcac45c15904cc013f0ad6c2ea0b1019b2ffffffff025f000000000000001976a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac7b000000000000001976a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac00000000"
         );
     }
 
@@ -961,16 +1006,20 @@ mod tests {
     #[test]
     fn test_funding_balance_error_consolidates_multiple_utxos() {
         let client = test_client_with_utxos(&[300, 300, 300]);
+        // More than any one UTXO holds, so it can only be funded by combining
+        // them -- which is what this is here to check.
         assert!(client
-            .funding_balance_error(&sample_fund_request(123))
+            .funding_balance_error(&sample_fund_request(700))
             .is_none());
     }
 
     #[test]
     fn test_create_funding_tx_consolidates_multiple_utxos() {
         let mut client = test_client_with_utxos(&[300, 300, 300]);
+        // 700 exceeds any single UTXO, so all three are needed. (123 would now
+        // be met by one of them: at 100 sat/KB the fee is 22, not 750.)
         let tx = client
-            .create_funding_tx(&sample_fund_request(123))
+            .create_funding_tx(&sample_fund_request(700))
             .expect("expected multi-input funding transaction");
         assert_eq!(tx.inputs.len(), 3);
         assert_eq!(tx.outputs.len(), 2);
@@ -1057,6 +1106,87 @@ mod tests {
         let mut client = Client::try_new(&client_config).unwrap();
         client.apply_chain_state(unspent);
         client
+    }
+
+    /// A wallet holding `unspent`, costing its transactions at `rate`.
+    fn client_holding_at_rate(unspent: Utxo, rate: u64) -> Client {
+        let mut client = client_holding(unspent);
+        client.set_fee_satoshis_per_kb(rate);
+        client
+    }
+
+    /// The whole point of CS-451: the rate is a number an operator sets, and
+    /// changing it changes what the service pays. The superseded expression
+    /// could not express any of these.
+    #[test]
+    fn cs_451_the_fee_follows_the_configured_rate() {
+        let script_bytes = Client::P2PKH_SCRIPT_BYTES;
+        // One input, two outputs: 10 + 148 + 25 + 34 = 217 bytes.
+        for (rate, expected) in [(100u64, 22u64), (500, 109), (1000, 217), (50, 11)] {
+            let client = client_holding_at_rate(Vec::new(), rate);
+            assert_eq!(
+                client.estimate_fee(script_bytes, 1),
+                expected,
+                "at {rate} sat/KB"
+            );
+        }
+    }
+
+    /// Rounding is upwards. Rounding down would shave a satoshi off the fee,
+    /// and a transaction a miner will not relay costs far more to discover
+    /// than the satoshi saved.
+    #[test]
+    fn cs_451_a_partial_satoshi_rounds_up_rather_than_down() {
+        // 217 bytes at 100 sat/KB is 21.7 satoshi
+        let client = client_holding_at_rate(Vec::new(), 100);
+        assert_eq!(client.estimate_fee(Client::P2PKH_SCRIPT_BYTES, 1), 22);
+
+        // and a rate low enough to make the exact fee a fraction of a satoshi
+        // still pays one, not none
+        let client = client_holding_at_rate(Vec::new(), 1);
+        assert_eq!(
+            client.estimate_fee(Client::P2PKH_SCRIPT_BYTES, 1),
+            1,
+            "0.217 satoshi rounds to 1, never to 0"
+        );
+    }
+
+    /// CS-422's insight survives the move to a flat rate, at a different
+    /// threshold: an input is worth adding only if it brings in more than the
+    /// 148 bytes it costs. The step fee made this obvious at a kilobyte
+    /// boundary; a flat rate makes it a question of the input's own value.
+    #[test]
+    fn cs_451_an_input_worth_less_than_its_own_fee_is_left_out() {
+        // At 100 sat/KB an extra input costs ceil(148 * 100 / 1000) = 15, so
+        // the 10 is not worth spending and the ceiling ignores it.
+        let client =
+            client_holding_at_rate(vec![cs_422_utxo(1, 0, 1000), cs_422_utxo(2, 0, 10)], 100);
+        assert_eq!(client.total_unspent(), 1010);
+        assert_eq!(
+            client.max_fundable(Client::P2PKH_SCRIPT_BYTES),
+            977,
+            "1000 - 22 - 1, leaving the 10 alone rather than paying 15 for it"
+        );
+    }
+
+    /// A quote of zero would build transactions nothing relays. Keeping the
+    /// last good rate is better than believing it.
+    #[test]
+    fn cs_451_a_zero_rate_is_refused_and_the_last_good_rate_stands() {
+        let mut client = client_holding_at_rate(Vec::new(), 250);
+        client.set_fee_satoshis_per_kb(0);
+        assert_eq!(client.fee_satoshis_per_kb(), 250);
+    }
+
+    /// Without configuration the service uses the documented default, so the
+    /// constant and the built-in agree.
+    #[test]
+    fn cs_451_a_new_client_starts_at_the_default_rate() {
+        assert_eq!(
+            client_holding(Vec::new()).fee_satoshis_per_kb(),
+            DEFAULT_SATOSHIS_PER_KB
+        );
+        assert_eq!(DEFAULT_SATOSHIS_PER_KB, 100);
     }
 
     /// Reserve the first cached outpoint, as an uncertain broadcast does.
@@ -1384,18 +1514,25 @@ mod tests {
         }
     }
 
-    /// What the wallet can really pay out, and why it is so far under the
-    /// balance. Six of the seven UTXOs are worth spending; the seventh pushes
-    /// the transaction over a kilobyte, which costs 500 satoshi of fee to
-    /// bring in 100 satoshi of value.
+    /// What the wallet can really pay out, and why it is under the balance.
+    ///
+    /// At 100 sat/KB every one of the seven UTXOs is worth spending -- an
+    /// input adds 148 bytes, so it costs 15 satoshi to bring in 100 -- and the
+    /// ceiling is all seven minus the fee for seven. Consolidated, the same
+    /// coins would cost one input's fee instead of seven, which is why the two
+    /// figures differ and why the error codes below split. Under the
+    /// superseded step fee the seventh input crossed a kilobyte and cost 500
+    /// to bring in 100, so it was left out; a flat rate has no such cliff, but
+    /// an input can still cost more than it is worth (see
+    /// `cs_451_an_input_worth_less_than_its_own_fee_is_left_out`).
     #[test]
     fn cs_422_max_fundable_accounts_for_the_fee_each_input_adds() {
         let client = cs_422_wallet();
         let script_bytes = hex::decode(LOCKING_SCRIPT_HEX).unwrap().len() as u64;
 
         assert_eq!(client.total_unspent(), 1230);
-        assert_eq!(client.max_fundable(script_bytes), 379);
-        assert_eq!(client.max_fundable_if_consolidated(script_bytes), 479);
+        assert_eq!(client.max_fundable(script_bytes), 1118);
+        assert_eq!(client.max_fundable_if_consolidated(script_bytes), 1207);
     }
 
     /// The report's first complaint: asking for 480 was refused as
@@ -1406,11 +1543,11 @@ mod tests {
     #[test]
     fn cs_422_insufficient_balance_reports_what_can_actually_be_paid_out() {
         let error = cs_422_wallet()
-            .funding_balance_error(&cs_422_request(480))
-            .expect("480 is beyond this wallet");
+            .funding_balance_error(&cs_422_request(1208))
+            .expect("1208 is beyond this wallet");
         assert_eq!(error.code, ErrorCode::InsufficientBalance);
         assert!(
-            error.description.contains("480 satoshi requested"),
+            error.description.contains("1208 satoshi requested"),
             "{}",
             error.description
         );
@@ -1420,7 +1557,7 @@ mod tests {
             error.description
         );
         assert!(
-            error.description.contains("at most 479"),
+            error.description.contains("at most 1207"),
             "{}",
             error.description
         );
@@ -1433,17 +1570,18 @@ mod tests {
     }
 
     /// The report's second complaint: asking for *less* produced a *larger*
-    /// requirement, 1720, which is more than the balance. That figure was the
-    /// cost of spending every UTXO -- an arrangement the service would never
-    /// choose, because the last input loses money.
+    /// requirement, more than the balance, because the figure quoted was the
+    /// cost of spending every UTXO rather than what the wallet can achieve.
+    /// Here that discredited figure would be 1150 + 111 = 1261, against a
+    /// balance of 1230.
     #[test]
     fn cs_422_no_suitable_utxo_does_not_quote_a_cost_nobody_would_pay() {
         let error = cs_422_wallet()
-            .funding_balance_error(&cs_422_request(470))
-            .expect("470 is beyond this UTXO set");
+            .funding_balance_error(&cs_422_request(1150))
+            .expect("1150 is beyond this UTXO set as it stands");
         assert_eq!(error.code, ErrorCode::NoSuitableUtxo);
         assert!(
-            error.description.contains("at most 379"),
+            error.description.contains("at most 1118"),
             "{}",
             error.description
         );
@@ -1453,35 +1591,37 @@ mod tests {
             error.description
         );
         assert!(
-            !error.description.contains("1720"),
+            !error.description.contains("1261"),
             "the all-inputs cost is not a requirement: {}",
             error.description
         );
     }
 
     /// The two codes now mean different things, and the boundary between them
-    /// is the point where consolidating would stop helping. Below 379 the
-    /// wallet funds as it is; between 380 and 479 it could fund only if it
-    /// were consolidated; above 479 no arrangement is enough.
+    /// is the point where consolidating would stop helping. Up to 1118 the
+    /// wallet funds as it is; between 1119 and 1207 it could fund only if it
+    /// were consolidated; above 1207 no arrangement is enough.
     #[test]
     fn cs_422_the_two_codes_split_at_the_point_consolidating_stops_helping() {
         let client = cs_422_wallet();
 
-        assert!(client.funding_balance_error(&cs_422_request(379)).is_none());
+        assert!(client
+            .funding_balance_error(&cs_422_request(1118))
+            .is_none());
 
         let shape = client
-            .funding_balance_error(&cs_422_request(380))
-            .expect("380 needs consolidating");
+            .funding_balance_error(&cs_422_request(1119))
+            .expect("1119 needs consolidating");
         assert_eq!(shape.code, ErrorCode::NoSuitableUtxo);
 
         let shape = client
-            .funding_balance_error(&cs_422_request(479))
-            .expect("479 needs consolidating");
+            .funding_balance_error(&cs_422_request(1207))
+            .expect("1207 needs consolidating");
         assert_eq!(shape.code, ErrorCode::NoSuitableUtxo);
 
         let balance = client
-            .funding_balance_error(&cs_422_request(480))
-            .expect("480 needs more money");
+            .funding_balance_error(&cs_422_request(1208))
+            .expect("1208 needs more money");
         assert_eq!(balance.code, ErrorCode::InsufficientBalance);
     }
 
@@ -1535,7 +1675,9 @@ mod tests {
     #[test]
     fn cs_422_a_utxo_covering_the_cost_exactly_is_not_offered_as_fundable() {
         let script_bytes = hex::decode(LOCKING_SCRIPT_HEX).unwrap().len() as u64;
-        let exact = 123 + Client::estimate_fee(script_bytes, 1) as i64;
+        // an empty wallet, only to cost the transaction at the same rate the
+        // wallet under test uses
+        let exact = 123 + client_holding(Vec::new()).estimate_fee(script_bytes, 1) as i64;
         let mut client = client_holding(vec![cs_422_utxo(9, 0, exact)]);
 
         let request = cs_422_request(123);
@@ -1634,17 +1776,17 @@ mod tests {
             .create_funding_tx(&cs_422_request(300))
             .expect("funds");
 
-        // Funding 300 spends six of the seven UTXOs (1130 satoshi) against a
-        // cost of 300 + 750 of fee, leaving 80 of change and the seventh
-        // hundred untouched.
+        // At 100 sat/KB a single input covers it: the 480 is the smallest
+        // UTXO above 300 + 22 of fee, so it alone is spent and 158 comes back
+        // as change. The other six are untouched and still confirmed.
         let after = client.get_balance();
         assert_eq!(
-            after.unconfirmed, 80,
+            after.unconfirmed, 158,
             "the change output should be counted as unconfirmed: {after:?}"
         );
         assert_eq!(
-            after.confirmed, 100,
-            "only the UTXO that was not spent stays confirmed: {after:?}"
+            after.confirmed, 750,
+            "the UTXOs that were not spent stay confirmed: {after:?}"
         );
     }
 }

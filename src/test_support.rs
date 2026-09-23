@@ -476,6 +476,10 @@ pub struct StubMapiBroadcaster {
     healthy: bool,
     broadcasts: AtomicU32,
     probes: AtomicU32,
+    /// The rate this stub's fee quote reports, or `None` for a quote that
+    /// cannot be had -- the case that must leave the configured rate alone.
+    quoted_fee: Option<u64>,
+    quotes: AtomicU32,
 }
 
 impl StubMapiBroadcaster {
@@ -484,7 +488,26 @@ impl StubMapiBroadcaster {
             healthy,
             broadcasts: AtomicU32::new(0),
             probes: AtomicU32::new(0),
+            quoted_fee: None,
+            quotes: AtomicU32::new(0),
         })
+    }
+
+    /// A healthy stub whose fee quote answers `quoted_fee` satoshis per
+    /// kilobyte, or answers nothing when that is `None`.
+    pub fn quoting(quoted_fee: Option<u64>) -> Arc<Self> {
+        Arc::new(Self {
+            healthy: true,
+            broadcasts: AtomicU32::new(0),
+            probes: AtomicU32::new(0),
+            quoted_fee,
+            quotes: AtomicU32::new(0),
+        })
+    }
+
+    /// How many times the fee quote was actually asked for.
+    pub fn quote_count(&self) -> u32 {
+        self.quotes.load(Ordering::SeqCst)
     }
 
     pub fn broadcast_count(&self) -> u32 {
@@ -516,5 +539,10 @@ impl TxBroadcaster for StubMapiBroadcaster {
         } else {
             Err(BroadcastError::Upstream("http status 503".to_string()))
         }
+    }
+
+    async fn fee_satoshis_per_kb(&self) -> Option<u64> {
+        self.quotes.fetch_add(1, Ordering::SeqCst);
+        self.quoted_fee
     }
 }
