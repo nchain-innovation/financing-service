@@ -94,7 +94,7 @@ mod tests {
 
     /// The lowest chain-gang this crate is correct against.
     ///
-    /// Two reasons, both about the WhatsOnChain interface.
+    /// Three reasons, all about the WhatsOnChain interface.
     ///
     /// 0.11.2 and earlier read UTXOs from `/unspent`, which stops at 1000
     /// entries and offers no way to ask for the rest, so a busy address came
@@ -110,7 +110,14 @@ mod tests {
     /// records the reason rather than enforcing it; 0.11.3 also fails
     /// `get_utxo` on any address holding an unconfirmed output (CS-462), which
     /// is an ordinary state rather than an edge case.
-    const CHAIN_GANG_FLOOR: (u32, u32, u32) = (0, 11, 4);
+    ///
+    /// 0.11.5 stops reporting outputs a mempool transaction has already spent.
+    /// `/unspent/all` goes on listing them, flagged `isSpentInMempoolTx`, and
+    /// earlier releases ignored the flag. The in-flight state this crate keeps
+    /// holds a spent input back for ten minutes (CS-465); a transaction still
+    /// unconfirmed after that would otherwise have its input offered again, as
+    /// if it were unspent.
+    const CHAIN_GANG_FLOOR: (u32, u32, u32) = (0, 11, 5);
 
     #[test]
     fn chain_gang_is_new_enough_to_read_a_whole_utxo_set() {
@@ -132,7 +139,8 @@ mod tests {
             "chain-gang {version} is below {CHAIN_GANG_FLOOR:?}. Below it a client address \
              with more than 1000 UTXOs reports only the first 1000 and the service refuses \
              funding it could cover, an address holding an unconfirmed output cannot be read \
-             at all, and there is no way to bound the rate of the requests paging makes. \
+             at all, there is no way to bound the rate of the requests paging makes, and \
+             outputs already spent in the mempool are reported as unspent. \
              See docs/Dependencies.md.",
         );
     }
