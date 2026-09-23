@@ -19,7 +19,7 @@ use chain_gang::{
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use crate::config::{ClientConfig, DEFAULT_DUST_THRESHOLD_SATOSHIS, DEFAULT_SATOSHIS_PER_KB};
+use crate::config::{ClientConfig, DEFAULT_SATOSHIS_PER_KB};
 use crate::responses::{CodedError, ErrorCode};
 
 /// How long an outpoint stays reserved after a funding transaction whose
@@ -150,9 +150,6 @@ pub struct Client {
     /// change while the service runs: when `[mapi_lite]` is configured the
     /// rate is refreshed from its fee quote (CS-451).
     fee_satoshis_per_kb: u64,
-    /// Change below this is folded into the fee instead of being paid out as
-    /// an output nobody would spend (CS-452).
-    dust_threshold: i64,
     /// Change this service created and broadcast, which the chain has not
     /// caught up with. Kept in the cache across refreshes so a client can
     /// spend its own change without waiting for the chain to confirm what the
@@ -183,7 +180,6 @@ impl Client {
             reserved: HashMap::new(),
             pending_change: HashMap::new(),
             fee_satoshis_per_kb: DEFAULT_SATOSHIS_PER_KB,
-            dust_threshold: DEFAULT_DUST_THRESHOLD_SATOSHIS as i64,
         })
     }
 
@@ -370,11 +366,10 @@ impl Client {
     /// differing sizes are costed correctly, instead of assuming they are all
     /// the same size as the first.
     fn estimate_fee(&self, output_script_bytes: u64, no_of_inputs: u32) -> u64 {
-        const INPUT_BYTES: u64 = 148;
-        const CHANGE_OUTPUT_BYTES: u64 = 34;
         const TX_OVERHEAD_BYTES: u64 = 10;
-        let output_bytes = output_script_bytes + CHANGE_OUTPUT_BYTES;
-        let tx_bytes = TX_OVERHEAD_BYTES + INPUT_BYTES * no_of_inputs.max(1) as u64 + output_bytes;
+        let output_bytes = output_script_bytes + Self::CHANGE_OUTPUT_BYTES;
+        let tx_bytes =
+            TX_OVERHEAD_BYTES + Self::INPUT_BYTES * no_of_inputs.max(1) as u64 + output_bytes;
         // Rounded up: rounding down would underpay, and a transaction a miner
         // will not relay costs far more to discover than the satoshi saved.
         tx_bytes
@@ -388,15 +383,57 @@ impl Client {
         self.fee_satoshis_per_kb
     }
 
-    /// Change below this many satoshis is folded into the fee.
-    #[cfg(test)]
-    pub fn dust_threshold(&self) -> i64 {
-        self.dust_threshold
-    }
+    /// Bytes a change output adds to the transaction that creates it.
+    const CHANGE_OUTPUT_BYTES: u64 = 34;
 
-    /// Set the amount below which change is folded into the fee.
-    pub fn set_dust_threshold(&mut self, dust_threshold: u64) {
-        self.dust_threshold = dust_threshold as i64;
+    /// Bytes an input adds to the transaction that spends it.
+    const INPUT_BYTES: u64 = 148;
+
+    /// Headroom over break-even on [`Self::dust_threshold`].
+    ///
+    /// An output is created at today's rate but swept at some unknown future
+    /// one. At exactly break-even a rate rise strands it, which is the failure
+    /// CS-452 reported, so one doubling is bought as insurance.
+    ///
+    /// 1 -- true break-even -- is defensible if never donating a satoshi more
+    /// than necessary matters more. 3, which is Bitcoin Core's, triples what
+    /// goes to the miner to insure against a rise that current BSV fee trends
+    /// do not suggest is coming.
+    const DUST_THRESHOLD_MULTIPLIER: u64 = 2;
+
+    /// The value below which change is not worth paying back.
+    ///
+    /// The round-trip cost of a change output: the bytes it adds to the
+    /// transaction that creates it, plus the bytes it will cost to spend
+    /// later, priced at the rate this client is actually paying.
+    ///
+    /// ```text
+    /// max(1, k * ceil((CHANGE_OUTPUT_BYTES + INPUT_BYTES) * sat_per_kb / 1000))
+    /// ```
+    ///
+    /// Below it, creating the output and later sweeping it costs more in fees
+    /// than it returns, so folding it into the fee is strictly better. Above
+    /// it, paying it back is.
+    ///
+    /// Derived rather than configured, so it cannot drift out of step with the
+    /// fee the service is paying -- the same rate either way, whether that came
+    /// from `[fees]` or from mapi-lite's `miningFee` (CS-451).
+    ///
+    /// The shape is the standard one, and the constant was the only thing
+    /// wrong with the familiar figure: at 3000 sat/KB with `k = 1` this gives
+    /// 546, which is where Bitcoin Core's number comes from. That figure is
+    /// not wrong, it is pinned to a fee rate three orders of magnitude above
+    /// what BSV charges.
+    fn dust_threshold(&self) -> i64 {
+        let round_trip_bytes = Self::CHANGE_OUTPUT_BYTES + Self::INPUT_BYTES;
+        let break_even = round_trip_bytes
+            .saturating_mul(self.fee_satoshis_per_kb)
+            .div_ceil(1000);
+        // Never zero: a change output of nothing is not an output, and the
+        // comparison below is `>=`.
+        break_even
+            .saturating_mul(Self::DUST_THRESHOLD_MULTIPLIER)
+            .max(1) as i64
     }
 
     /// Whether a transaction leaving `change` wastes nothing: either it pays
@@ -412,7 +449,7 @@ impl Client {
     /// Zero is not worth an output by definition, and anything under the
     /// threshold costs more to spend later than it carries.
     fn change_is_worth_paying(&self, change: i64) -> bool {
-        change >= self.dust_threshold && change > 0
+        change >= self.dust_threshold() && change > 0
     }
 
     /// Set the rate used to cost future transactions.
@@ -980,21 +1017,17 @@ mod tests {
         // rate fails here with a number rather than as a wall of hex.
         //
         // At 100 sat/KB a one-input, two-output transaction is 217 bytes and
-        // costs 22 satoshi. The 240 UTXO could cover that, but its change
-        // would be 95 -- under the dust threshold, so it would go to the miner
-        // rather than back to the client. Selection therefore prefers the
-        // 9_564_208 one, whose change is worth an output (CS-452).
+        // costs 22 satoshi, so the smallest UTXO that can pay 123 and still
+        // leave change is the 240. Its change of 95 clears the 38 that rate
+        // implies as dust, so it is paid back rather than given away.
         assert_eq!(tx.inputs.len(), 1, "one input suffices at this rate");
         assert_eq!(tx.outputs.len(), 2);
-        assert_eq!(
-            tx.outputs[0].satoshis, 9_564_063,
-            "change: 9564208 - 123 - 22, paid back rather than given away"
-        );
+        assert_eq!(tx.outputs[0].satoshis, 95, "change: 240 - 123 - 22");
         assert_eq!(tx.outputs[1].satoshis, 123, "the requested amount");
 
         assert_eq!(
             tx_as_hexstr(&tx).unwrap(),
-            "0100000001786563262f7e951eea3d9db3e4997daeba748ffa99219e298401dfe99d1033e5000000006a47304402201eb6436cc3c93464e8c9c359285ddd564e3e081c27f5576e63caefd15facaa7802203e8b027e40c0bd506061e7446d1676f91e2e207474ff069c1004b12bb021c061412103a8ae071ddd8690b94755c7112ca304bcac45c15904cc013f0ad6c2ea0b1019b2ffffffff029fef9100000000001976a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac7b000000000000001976a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac00000000"
+            "01000000015e791b771be3af3ed1447d311071a1e15e127c4343a58debcb8e40c1e57272f6000000006a4730440220375ccfd8bac40cbacba5102626d0356fce0c0cccc2ca336825535aea2f4f9d4b02205e2e3bb7997f65eaaa61b64f75bb4d820be301741d312ad7b9c0d10eb42ce83b412103a8ae071ddd8690b94755c7112ca304bcac45c15904cc013f0ad6c2ea0b1019b2ffffffff025f000000000000001976a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac7b000000000000001976a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac00000000"
         );
     }
 
@@ -1287,20 +1320,20 @@ mod tests {
     /// in the transaction, which means the miner takes it as fee.
     #[test]
     fn cs_452_dust_change_goes_to_the_fee_rather_than_an_output() {
-        // 5_100 covers 5_000 plus the 22 fee and leaves 78, under the 135
-        // threshold. It is the only UTXO, so there is nothing better to pick.
-        let mut client = client_holding_at_rate(vec![cs_422_utxo(1, 0, 5_100)], 100);
+        // 5_030 covers 5_000 plus the 22 fee and leaves 8, under the 38 the
+        // rate implies. It is the only UTXO, so there is nothing better.
+        let mut client = client_holding_at_rate(vec![cs_422_utxo(1, 0, 5_030)], 100);
         let tx = client
             .create_funding_tx(&cs_422_request(5_000))
             .expect("still fundable");
 
-        assert_eq!(tx.outputs.len(), 1, "the 78 is not worth an output");
+        assert_eq!(tx.outputs.len(), 1, "the 8 is not worth an output");
         assert_eq!(tx.outputs[0].satoshis, 5_000);
 
         let paid_out: i64 = tx.outputs.iter().map(|out| out.satoshis).sum();
         assert_eq!(
-            5_100 - paid_out,
-            100,
+            5_030 - paid_out,
+            30,
             "the whole remainder, fee plus the dust, goes to the miner"
         );
     }
@@ -1309,10 +1342,10 @@ mod tests {
     /// change to the miner.
     #[test]
     fn cs_452_a_utxo_that_would_leave_dust_is_not_preferred() {
-        // 5_100 leaves 78 of dust; 9_000 leaves 3_978, which is worth an
+        // 5_030 leaves 8 of dust; 9_000 leaves 3_978, which is worth an
         // output. The smaller one would otherwise win, being smallest-first.
         let mut client = client_holding_at_rate(
-            vec![cs_422_utxo(1, 0, 5_100), cs_422_utxo(2, 0, 9_000)],
+            vec![cs_422_utxo(1, 0, 5_030), cs_422_utxo(2, 0, 9_000)],
             100,
         );
         let tx = client
@@ -1342,27 +1375,52 @@ mod tests {
         assert_eq!(tx.outputs.len(), 1);
     }
 
-    /// A threshold of zero turns the behaviour off: every positive change is
-    /// paid back, however small.
+    /// The threshold is the round-trip cost of a change output: the 34 bytes
+    /// it adds now plus the 148 it costs to spend later, at the rate in force,
+    /// doubled for headroom.
     #[test]
-    fn cs_452_a_zero_threshold_pays_back_even_one_satoshi() {
-        let mut client = client_holding_at_rate(vec![cs_422_utxo(1, 0, 5_023)], 100);
-        client.set_dust_threshold(0);
-        let tx = client
-            .create_funding_tx(&cs_422_request(5_000))
-            .expect("fundable");
-        assert_eq!(tx.outputs.len(), 2);
-        assert_eq!(tx.outputs[0].satoshis, 1, "5023 - 5000 - 22");
+    fn cs_452_the_threshold_is_the_round_trip_cost_of_an_output() {
+        // 182 bytes at 100 sat/KB is 18.2, rounded up to 19, doubled
+        assert_eq!(client_holding_at_rate(Vec::new(), 100).dust_threshold(), 38);
+        // and at 500: 91 exactly, doubled
+        assert_eq!(
+            client_holding_at_rate(Vec::new(), 500).dust_threshold(),
+            182
+        );
     }
 
-    /// The default matches what the configuration documents.
+    /// The familiar 546 is this same formula at a fee rate three orders of
+    /// magnitude above BSV's. The shape was never wrong; the constant was.
     #[test]
-    fn cs_452_a_new_client_starts_at_the_default_threshold() {
+    fn cs_452_the_formula_reproduces_bitcoin_cores_number() {
+        let at_core_rate = client_holding_at_rate(Vec::new(), 3_000).dust_threshold();
         assert_eq!(
-            client_holding(Vec::new()).dust_threshold(),
-            DEFAULT_DUST_THRESHOLD_SATOSHIS as i64
+            at_core_rate / Client::DUST_THRESHOLD_MULTIPLIER as i64,
+            546,
+            "182 * 3 is Bitcoin Core's dust limit, at Core's relay fee"
         );
-        assert_eq!(DEFAULT_DUST_THRESHOLD_SATOSHIS, 135);
+    }
+
+    /// Derived, not stored: a client that moves to a new rate -- from a
+    /// mapi-lite quote, say -- moves its threshold with it, so the two cannot
+    /// drift apart.
+    #[test]
+    fn cs_452_the_threshold_follows_the_fee_rate() {
+        let mut client = client_holding(Vec::new());
+        let before = client.dust_threshold();
+        client.set_fee_satoshis_per_kb(1_000);
+        assert!(
+            client.dust_threshold() > before,
+            "a dearer fee makes a small output less worth keeping"
+        );
+        assert_eq!(client.dust_threshold(), 364, "182 at 1000 sat/KB, doubled");
+    }
+
+    /// Never zero, however cheap the fee: a change output of nothing is not
+    /// an output, and the comparison is `>=`.
+    #[test]
+    fn cs_452_the_threshold_is_never_zero() {
+        assert_eq!(client_holding_at_rate(Vec::new(), 1).dust_threshold(), 2);
     }
 
     /// Reserve the first cached outpoint, as an uncertain broadcast does.

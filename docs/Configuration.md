@@ -250,22 +250,32 @@ Optional. Sets the fee the service pays on the funding transactions it builds. B
 [fees]
 satoshis_per_kb = 100
 use_mapi_fee_quote = true
-dust_threshold_satoshis = 135
 ```
 
 * `satoshis_per_kb` — the rate, in satoshis per kilobyte. The fee for a transaction is `ceil(tx_bytes * satoshis_per_kb / 1000)`, rounded **up** so that rounding never underpays. Must be greater than zero; the service refuses to start otherwise, because a transaction paying no fee is not relayed. Default `100`.
 * `use_mapi_fee_quote` — when `[mapi_lite]` is configured, take the rate from its `feeQuote` rather than from `satoshis_per_kb`. Default `true`. Without `[mapi_lite]` it has no effect, because there is nothing to ask.
-* `dust_threshold_satoshis` — change below this is not paid back as an output; it stays in the transaction and the miner takes it as fee. Default `135`. Set `0` to pay every change back however small.
 
 ### Dust change goes to the fee
 
 A change output of a satoshi or two cannot be spent for less than it holds, so paying it back only strands it. Funding the reported `max_fundable` used to do exactly that: it left one satoshi behind, and the client was then holding a balance of 1 with `max_fundable: 0`.
 
-The service now leaves the change out entirely when it falls under `dust_threshold_satoshis`, so **funding the maximum spends the wallet out and produces a transaction with no change output at all**.
+The service now leaves the change out entirely when it falls under the dust threshold, so **funding the maximum spends the wallet out and produces a transaction with no change output at all**.
+
+**The threshold is derived from the fee rate, not configured.** It is the round-trip cost of a change output — the 34 bytes it adds to the transaction that creates it, plus the 148 it will cost to spend later — priced at the rate above and doubled:
+
+```text
+max(1, 2 × ceil(182 × satoshis_per_kb / 1000))
+```
+
+At the default 100 sat/KB that is **38 satoshi**. Below it, creating the output and later sweeping it costs more in fees than it returns, so folding it is strictly better; above it, paying it back is. Deriving it means it cannot drift out of step with what the service is actually paying, including when the rate comes from mapi-lite's `miningFee`.
+
+The doubling is headroom: the output is created at today's rate but swept at some unknown future one, and at exactly break-even a rate rise strands it — which is the failure this fixes.
+
+This is the standard formula, and only the constant was ever wrong. At Bitcoin Core's 3000 sat/KB relay fee it gives 546 undoubled — which is exactly where that familiar number comes from. Core's figure is not wrong; it is pinned to a fee rate three orders of magnitude above BSV's.
 
 Two things follow from that, both worth knowing before you set the threshold:
 
-* **The remainder goes to the miner.** At most `dust_threshold_satoshis - 1` satoshi, and only on a transaction that would otherwise have created an output nobody would spend. Raising the threshold raises that ceiling, which is why the default is not Bitcoin Core's 546.
+* **The remainder goes to the miner.** At most one satoshi under the threshold — 37 at the default rate — and only on a transaction that would otherwise have created an output nobody would spend.
 * **Selection avoids it where it can.** Given a choice, the service picks a UTXO whose change is either nothing or worth an output, so an ordinary spend does not donate. It falls back to folding only when no such UTXO exists — a request stays fundable rather than being refused to save a sum smaller than the threshold.
 
 ### The funded outputs are not always at index 1

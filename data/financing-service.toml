@@ -80,11 +80,11 @@ filename = "./data/dynamic.toml"
 # one cannot be had. Set use_mapi_fee_quote = false to always use the number
 # below.
 #
-# Change worth less than dust_threshold_satoshis is not paid back as an output
-# -- it stays in the transaction and the miner takes it as fee. A one-satoshi
-# change output costs more to spend than it holds, so paying it back only
-# strands it. Set 0 to pay every change back however small.
+# Change too small to be worth an output is not paid back -- it stays in the
+# transaction and the miner takes it as fee. The threshold for that is derived
+# from the rate above rather than configured: it is the round-trip cost of a
+# change output, max(1, 2 * ceil(182 * satoshis_per_kb / 1000)), which is 38
+# satoshi at 100 sat/KB.
 # [fees]
 # satoshis_per_kb = 100
 # use_mapi_fee_quote = true
-# dust_threshold_satoshis = 135
