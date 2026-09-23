@@ -261,6 +261,35 @@ use_mapi_fee_quote = true
 * `satoshis_per_kb` — the rate, in satoshis per kilobyte. The fee for a transaction is `ceil(tx_bytes * satoshis_per_kb / 1000)`, rounded **up** so that rounding never underpays. Must be greater than zero; the service refuses to start otherwise, because a transaction paying no fee is not relayed. Default `100`.
 * `use_mapi_fee_quote` — when `[mapi_lite]` is configured, take the rate from its `feeQuote` rather than from `satoshis_per_kb`. Default `true`. Without `[mapi_lite]` it has no effect, because there is nothing to ask.
 
+### Dust change goes to the fee
+
+A change output of a satoshi or two cannot be spent for less than it holds, so paying it back only strands it. Funding the reported `max_fundable` used to do exactly that: it left one satoshi behind, and the client was then holding a balance of 1 with `max_fundable: 0`.
+
+The service now leaves the change out entirely when it falls under the dust threshold, so **funding the maximum spends the wallet out and produces a transaction with no change output at all**.
+
+**The threshold is derived from the fee rate, not configured.** It is the round-trip cost of a change output — the 34 bytes it adds to the transaction that creates it, plus the 148 it will cost to spend later — priced at the rate above and doubled:
+
+```text
+max(1, 2 × ceil(182 × satoshis_per_kb / 1000))
+```
+
+At the default 100 sat/KB that is **38 satoshi**. Below it, creating the output and later sweeping it costs more in fees than it returns, so folding it is strictly better; above it, paying it back is. Deriving it means it cannot drift out of step with what the service is actually paying, including when the rate comes from mapi-lite's `miningFee`.
+
+The doubling is headroom: the output is created at today's rate but swept at some unknown future one, and at exactly break-even a rate rise strands it — which is the failure this fixes.
+
+This is the standard formula, and only the constant was ever wrong. At Bitcoin Core's 3000 sat/KB relay fee it gives 546 undoubled — which is exactly where that familiar number comes from. Core's figure is not wrong; it is pinned to a fee rate three orders of magnitude above BSV's.
+
+Two things follow from that, both worth knowing before you set the threshold:
+
+* **The remainder goes to the miner.** At most one satoshi under the threshold — 37 at the default rate — and only on a transaction that would otherwise have created an output nobody would spend.
+* **Selection avoids it where it can.** Given a choice, the service picks a UTXO whose change is either nothing or worth an output, so an ordinary spend does not donate. It falls back to folding only when no such UTXO exists — a request stays fundable rather than being refused to save a sum smaller than the threshold.
+
+### The funded outputs are not always at index 1
+
+A funding transaction used to be change-at-0 followed by the funded outputs, so the first funded output was always index 1. A transaction whose change was folded into the fee has no change output, and its funded outputs start at **0**.
+
+The `index` in each `outpoints` entry of the `POST /fund` response is correct either way. **A caller that assumes 1 rather than reading `index` will reference an output that does not exist.**
+
 ### Upgrading from 4.2.0 or earlier pays a lower fee
 
 Before this section existed the fee was hardcoded as `((tx_bytes / 1000) * 500) + 750`. That is a step function rather than a rate: 750 satoshi for any transaction under a kilobyte, jumping by 500 at each kilobyte after.

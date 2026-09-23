@@ -1102,7 +1102,14 @@ impl Service {
             }
         })?;
         let hash = tx.hash();
-        response.outpoints = (1..prepared.no_of_outpoints + 1)
+        // The funded outputs are the last `no_of_outpoints` of the
+        // transaction. They used to be assumed to start at index 1, because a
+        // change output always sat at index 0; since CS-452 a transaction
+        // whose change would have been dust has no change output, and they
+        // start at 0 instead. Derived rather than assumed, so it stays right
+        // either way.
+        let first = tx.outputs.len() as u32 - prepared.no_of_outpoints;
+        response.outpoints = (first..first + prepared.no_of_outpoints)
             .map(|index| OutPoint { hash, index })
             .collect();
         Ok(response)
