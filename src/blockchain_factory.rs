@@ -17,31 +17,50 @@ pub struct Backend {
     pub address_watcher: Option<Arc<dyn AddressWatcher>>,
 }
 
+/// Whether the interface applies the configured limit to its own HTTP
+/// requests, leaving nothing for [`RateLimited`] to do.
+///
+/// Only `woc` can. chain-gang 0.11.4 added
+/// `WocInterface::set_max_requests_per_second`, which paces the requests
+/// themselves; [`RateLimited`] can only pace the calls, and since 0.11.3 one
+/// call has been many requests (CS-457). Where both are possible the inner one
+/// is the one that tells the truth, and wrapping as well would pace twice for
+/// no gain.
+///
+/// The other interfaces talk to a server the operator runs, so the published
+/// limit that prompted this does not apply to them; they keep the decorator,
+/// which is the only thing available.
+fn paces_its_own_requests(interface_type: &str) -> bool {
+    interface_type == "woc"
+}
+
 /// Takes a config and returns the appropriate configured object that implements BlockchainInterface
 pub fn blockchain_factory(config: &Config) -> Result<Backend, String> {
-    let backend = build_backend(config)?;
+    let limit = config.blockchain_interface.outbound_rate_limit();
+    let interface_type = config.blockchain_interface.interface_type.as_str();
+    let backend = build_backend(config, limit)?;
+
+    let Some(rps) = limit else {
+        return Ok(backend);
+    };
+    if paces_its_own_requests(interface_type) {
+        log::info!("limiting {interface_type} to {rps} HTTP request(s) per second");
+        return Ok(backend);
+    }
 
     // Wrapped last, so every outbound call goes through it whatever the
     // interface -- and so the inner interface is fully configured first.
     // The address watcher keeps talking to the node directly: importing an
     // address happens once per client at startup and is not what runs into a
     // rate limit.
-    match config.blockchain_interface.outbound_rate_limit() {
-        Some(rps) => {
-            log::info!(
-                "limiting {} to {rps} request(s) per second",
-                config.blockchain_interface.interface_type
-            );
-            Ok(Backend {
-                interface: Arc::new(RateLimited::new(backend.interface, rps)),
-                address_watcher: backend.address_watcher,
-            })
-        }
-        None => Ok(backend),
-    }
+    log::info!("limiting {interface_type} to {rps} interface call(s) per second");
+    Ok(Backend {
+        interface: Arc::new(RateLimited::new(backend.interface, rps)),
+        address_watcher: backend.address_watcher,
+    })
 }
 
-fn build_backend(config: &Config) -> Result<Backend, String> {
+fn build_backend(config: &Config, limit: Option<u32>) -> Result<Backend, String> {
     let network = config
         .get_network()
         .map_err(|_| "Unable to decode network from config".to_string())?;
@@ -50,6 +69,12 @@ fn build_backend(config: &Config) -> Result<Backend, String> {
         "woc" => {
             let mut interface = WocInterface::new();
             interface.set_network(&network);
+            // Applied here rather than by a decorator, because only the
+            // interface sees the requests a single call turns into: a balance
+            // is two, and a UTXO read one per 1000 entries (CS-457).
+            if let Some(rps) = limit {
+                interface.set_max_requests_per_second(rps);
+            }
             Ok(Backend {
                 interface: Arc::new(interface),
                 address_watcher: None,
@@ -118,6 +143,48 @@ mod tests {
     use super::*;
     use crate::config::BlockchainInterfaceConfig;
     use chain_gang::network::Network;
+
+    // --- CS-457: which limiter applies ---
+
+    /// `woc` paces its own requests from chain-gang 0.11.4, so wrapping it as
+    /// well would pace twice and bound nothing extra. Everything else talks to
+    /// a server the operator runs and keeps the call-level decorator, which is
+    /// all that is available for it.
+    #[test]
+    fn cs_457_only_woc_paces_its_own_requests() {
+        assert!(paces_its_own_requests("woc"));
+        for other in ["uaas", "rpc", "test"] {
+            assert!(
+                !paces_its_own_requests(other),
+                "{other} has no request-level limit of its own"
+            );
+        }
+    }
+
+    /// The limit still reaches `woc` when nothing is configured, because that
+    /// is the interface with a published limit to stay inside.
+    #[test]
+    fn cs_457_woc_is_limited_by_default_and_the_backend_still_builds() {
+        let config = base_config("woc", None);
+        assert_eq!(
+            config.blockchain_interface.outbound_rate_limit(),
+            Some(crate::config::WOC_REQUESTS_PER_SECOND)
+        );
+        // The rate is handed to WocInterface, which keeps it private, so this
+        // can only check that the configured path builds. What the limit
+        // actually does is chain-gang's own tests.
+        assert!(blockchain_factory(&config).is_ok());
+    }
+
+    /// An explicit zero means unlimited, and must not be passed down as a
+    /// limit of zero -- which chain-gang would read as one request per second.
+    #[test]
+    fn cs_457_an_explicit_zero_leaves_the_interface_unlimited() {
+        let mut config = base_config("woc", None);
+        config.blockchain_interface.max_requests_per_second = Some(0);
+        assert_eq!(config.blockchain_interface.outbound_rate_limit(), None);
+        assert!(blockchain_factory(&config).is_ok());
+    }
 
     fn base_config(interface_type: &str, url: Option<&str>) -> Config {
         Config {
