@@ -38,6 +38,12 @@ utxo_refresh_period = 60
 # fetched. Lower it to narrow the window in which the service can build on a
 # view something outside it has moved on from; 0 refreshes on every request.
 # chain_state_max_age_seconds = 60
+# What the service has broadcast but the chain may not have caught up with --
+# the inputs it has spent and the change it has created -- is written here after
+# every funding commit and read back at startup, so a restart does not rebuild
+# transactions it has just sent. Defaults beside dynamic_config.filename, named
+# after it; it must survive a restart just as that file does.
+# inflight_state_file = "./data/dynamic.inflight.json"
 
 [dynamic_config]
 filename = "./data/dynamic.toml"

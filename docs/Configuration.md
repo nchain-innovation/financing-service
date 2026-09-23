@@ -222,10 +222,24 @@ Then enable telemetry in config or set `OTEL_TRACES_EXPORTER=otlp` and `OTEL_EXP
 [service]
 utxo_refresh_period = 60
 # chain_state_max_age_seconds = 60   # defaults to utxo_refresh_period
+# inflight_state_file = "./data/dynamic.inflight.json"   # defaults beside dynamic_config.filename
 ```
 
 * `utxo_refresh_period` — seconds between the periodic refresh of every client's chain state.
 * `chain_state_max_age_seconds` — how old that cached state may be before a request refreshes it again. Defaults to `utxo_refresh_period`.
+* `inflight_state_file` — where the service keeps what it has broadcast but the chain may not have caught up with. Defaults to a file beside `dynamic_config.filename`, named after it: `./data/dynamic.toml` pairs with `./data/dynamic.inflight.json`. See [In-flight state survives a restart](#in-flight-state-survives-a-restart).
+
+### In-flight state survives a restart
+
+When the service funds a transaction it holds back the inputs that transaction spent, and keeps the change it created, until the chain reports both. Without that, a refresh in the seconds before the read interface has seen the transaction would offer the same input to the next request (CS-426).
+
+That state is now **written to disk after every funding commit** and read back at startup (CS-465). Before, it lived only in memory, so a restart forgot it: the chain it came back to had not yet seen the transactions, still reported their inputs as unspent, and the service rebuilt them — byte for byte, because signing is deterministic — handing each outpoint to a second caller.
+
+After a restart the service now picks up where it stopped: inputs it spent stay held back, and it spends the change its last transaction created even though the chain has not reported it yet. Entries older than the ten-minute reservation window are dropped rather than restored, since they would have expired had the service stayed up.
+
+**The file has to survive a restart**, the same as `dynamic.toml` beside it. A deployment that already keeps `dynamic.toml` on a volume keeps this too, with nothing to add. If the file is missing the service starts with no in-flight state, which is normal on first run; if it is unreadable, that is logged as an error and the service starts without it rather than refusing to — in that case outpoints spent shortly before the restart may be handed out again, which is the behaviour this replaced.
+
+One window remains: the moment between a broadcast succeeding and the state reaching disk. A process killed in that moment can still lose it. A clean restart, or a crash at any other time, does not.
 
 ### How often the service reads the chain
 

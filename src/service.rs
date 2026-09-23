@@ -1,5 +1,6 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant, SystemTime},
 };
@@ -16,7 +17,7 @@ use crate::{
     address_watcher::AddressWatcher,
     blockchain_factory::{blockchain_factory, Backend},
     broadcaster::{factory::broadcaster_factory, BroadcastError, TxBroadcaster, MAPI_LITE},
-    client::{Client, FundRequest, FundingSpendPlan},
+    client::{Client, FundRequest, FundingSpendPlan, InflightState},
     config::{ClientConfig, Config},
     dynamic_config::DynamicConfig,
     idempotency::{IdempotencyStore, RecordKey},
@@ -144,6 +145,82 @@ pub struct Service {
     fee_satoshis_per_kb: Mutex<u64>,
     /// Whether to take the rate from mapi-lite's fee quote when there is one.
     use_mapi_fee_quote: bool,
+    /// Where each client's in-flight funding state is kept across a restart
+    /// (CS-465). See [`Config::inflight_state_path`].
+    inflight_state_path: PathBuf,
+    /// Serialises writes to that file, so two commits finishing together
+    /// cannot race and leave the older snapshot on disk.
+    inflight_save: Mutex<()>,
+}
+
+/// Version of the in-flight state file's layout.
+const INFLIGHT_FILE_VERSION: u32 = 1;
+
+/// The on-disk form of every client's in-flight funding state (CS-465).
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct InflightFile {
+    version: u32,
+    #[serde(default)]
+    clients: BTreeMap<String, InflightState>,
+}
+
+/// Read the in-flight state a previous run left, keyed by client id.
+///
+/// A missing file is normal -- first start, or nothing was ever in flight. An
+/// unreadable one is logged as an error and treated as empty rather than
+/// refusing to start: the service then behaves as it did before this file
+/// existed, which is the degraded case CS-465 describes, and the error says
+/// so. Refusing to start would take every read path down over state that only
+/// matters for the next few minutes.
+fn load_inflight_file(path: &Path) -> BTreeMap<String, InflightState> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return BTreeMap::new(),
+        Err(e) => {
+            log::error!(
+                "cannot read in-flight funding state from {}: {e}. Starting without it, so \
+                 outpoints spent shortly before this restart may be handed out again.",
+                path.display()
+            );
+            return BTreeMap::new();
+        }
+    };
+    match serde_json::from_str::<InflightFile>(&text) {
+        Ok(file) if file.version == INFLIGHT_FILE_VERSION => file.clients,
+        Ok(file) => {
+            log::error!(
+                "in-flight funding state in {} is version {}, expected {}. Starting without it.",
+                path.display(),
+                file.version,
+                INFLIGHT_FILE_VERSION
+            );
+            BTreeMap::new()
+        }
+        Err(e) => {
+            log::error!(
+                "in-flight funding state in {} is not readable: {e}. Starting without it, so \
+                 outpoints spent shortly before this restart may be handed out again.",
+                path.display()
+            );
+            BTreeMap::new()
+        }
+    }
+}
+
+/// Write `file` to `path` so that a reader never sees half of it: into a
+/// sibling first, flushed, then renamed over the original.
+fn write_inflight_file(path: &Path, file: &InflightFile) -> std::io::Result<()> {
+    use std::io::Write;
+    let text = serde_json::to_string_pretty(file).map_err(std::io::Error::other)?;
+    let mut temporary = path.as_os_str().to_owned();
+    temporary.push(".tmp");
+    let temporary = PathBuf::from(temporary);
+    {
+        let mut out = std::fs::File::create(&temporary)?;
+        out.write_all(text.as_bytes())?;
+        out.sync_all()?;
+    }
+    std::fs::rename(&temporary, path)
 }
 
 /// A run of failures talking to the blockchain interface.
@@ -177,12 +254,26 @@ impl Service {
             address_watcher,
         } = backend;
         let mut clients = HashMap::new();
+        let inflight_state_path = config.inflight_state_path();
+        let mut inflight = load_inflight_file(&inflight_state_path);
+        let mut restore = |client_id: &str, client: &mut Client| {
+            if let Some(state) = inflight.remove(client_id) {
+                log::info!(
+                    "restoring {} reserved outpoint(s) and {} pending change output(s) for \
+                     {client_id} from before the restart",
+                    state.reserved.len(),
+                    state.pending_change.len()
+                );
+                client.restore_inflight_state(state);
+            }
+        };
 
         if let Some(clients_config) = &config.client {
             for client_config in clients_config {
                 let resolved = client_config.clone().resolve_secrets()?;
                 let mut client = Client::try_new(&resolved)?;
                 client.set_fee_satoshis_per_kb(config.fees.satoshis_per_kb);
+                restore(&client_config.client_id, &mut client);
                 clients.insert(
                     client_config.client_id.clone(),
                     Arc::new(RwLock::new(client)),
@@ -200,6 +291,7 @@ impl Service {
             let resolved = client_config.clone().resolve_secrets()?;
             let mut client = Client::try_new(&resolved)?;
             client.set_fee_satoshis_per_kb(config.fees.satoshis_per_kb);
+            restore(&client_config.client_id, &mut client);
             clients.insert(
                 client_config.client_id.clone(),
                 Arc::new(RwLock::new(client)),
@@ -228,6 +320,8 @@ impl Service {
             chain_state_max_age: config.service.chain_state_max_age(),
             fee_satoshis_per_kb: Mutex::new(config.fees.satoshis_per_kb),
             use_mapi_fee_quote: config.fees.use_mapi_fee_quote,
+            inflight_state_path,
+            inflight_save: Mutex::new(()),
             mapi_health_ttl: config
                 .mapi_lite
                 .as_ref()
@@ -447,6 +541,46 @@ impl Service {
 
     async fn client_handle(&self, client_id: &str) -> Option<Arc<RwLock<Client>>> {
         self.clients.read().await.get(client_id).cloned()
+    }
+
+    /// Write every client's in-flight funding state to disk (CS-465).
+    ///
+    /// Called after each commit, so what is on disk is never behind what has
+    /// been broadcast by more than the moment between the two. A failure is
+    /// logged, not returned: the transaction is already on the network, and
+    /// the caller has nothing it could do with the error.
+    ///
+    /// The snapshot is taken under the save lock, not before it. Two commits
+    /// finishing together would otherwise each snapshot, then write in either
+    /// order -- and whichever snapshot is older could land last.
+    pub async fn save_inflight_state(&self) {
+        let _serialised = self.inflight_save.lock().await;
+        let handles: Vec<(String, Arc<RwLock<Client>>)> = self
+            .clients
+            .read()
+            .await
+            .iter()
+            .map(|(client_id, client)| (client_id.clone(), Arc::clone(client)))
+            .collect();
+
+        let mut clients = BTreeMap::new();
+        for (client_id, client) in handles {
+            let state = client.read().await.inflight_state();
+            if !state.is_empty() {
+                clients.insert(client_id, state);
+            }
+        }
+        let file = InflightFile {
+            version: INFLIGHT_FILE_VERSION,
+            clients,
+        };
+        if let Err(e) = write_inflight_file(&self.inflight_state_path, &file) {
+            log::error!(
+                "cannot save in-flight funding state to {}: {e}. A restart before the chain \
+                 catches up could hand the same outpoints out again.",
+                self.inflight_state_path.display()
+            );
+        }
     }
 
     async fn client_handles(&self) -> Vec<Arc<RwLock<Client>>> {
@@ -900,6 +1034,7 @@ impl Service {
             .write()
             .await
             .commit_funding_spend(prepared.spend_plan.clone());
+        service.save_inflight_state().await;
         Ok(())
     }
 
@@ -951,10 +1086,13 @@ impl Service {
     /// with a second error.
     async fn reserve_uncertain_funding(service: &Arc<Service>, prepared: &PreparedFunding) {
         match service.client_handle(&prepared.client_id).await {
-            Some(client) => client
-                .write()
-                .await
-                .commit_uncertain_funding_spend(prepared.spend_plan.clone()),
+            Some(client) => {
+                client
+                    .write()
+                    .await
+                    .commit_uncertain_funding_spend(prepared.spend_plan.clone());
+                service.save_inflight_state().await;
+            }
             None => log::warn!(
                 "cannot reserve the inputs of an uncertain funding transaction: unknown client_id \
                  {}",
@@ -1932,5 +2070,163 @@ mod tests {
             2,
             "a stale verdict should be refreshed"
         );
+    }
+
+    // ---- CS-465: what was in flight survives a restart ----
+
+    /// The input a funding transaction spent.
+    fn spent_input(response: &FundingResponse) -> (String, u32) {
+        let input = &response.txs[0].inputs[0].prev_output;
+        (input.hash.encode(), input.index)
+    }
+
+    /// A chain holding exactly `utxo` for the test client, that never changes.
+    ///
+    /// Never changing is the point. Straight after a broadcast the read
+    /// interface has usually not seen the transaction yet, so it goes on
+    /// reporting the input as unspent and says nothing of the change -- and
+    /// that is the chain a restart comes back to.
+    async fn chain_holding(
+        config: &Config,
+        utxo: Vec<chain_gang::interface::UtxoEntry>,
+    ) -> Arc<dyn BlockchainInterface + Send + Sync> {
+        let mut interface = chain_gang::interface::TestInterface::new();
+        interface.set_network(&config.get_network().unwrap());
+        interface.set_utxo(TEST_ADDRESS, &utxo).await;
+        interface.set_height(1_517_571).await;
+        Arc::new(interface)
+    }
+
+    fn confirmed_utxo(value: i64) -> chain_gang::interface::UtxoEntry {
+        chain_gang::interface::UtxoEntry {
+            height: 1_514_933,
+            tx_pos: 0,
+            tx_hash: "f67272e5c1408ecbeb8da543437c125ee1a17110317d44d13eafe31b771b795e".to_string(),
+            value,
+        }
+    }
+
+    /// The ticket's scenario. Fund, restart, fund again against a chain that
+    /// has not caught up. Without the state file the second run spends the
+    /// same input, rebuilds the same transaction byte for byte -- signing is
+    /// deterministic -- and hands the same outpoint to a second caller.
+    #[tokio::test]
+    async fn cs_465_a_restart_does_not_hand_out_an_input_already_spent() {
+        let config = test_config(&unique_dynamic_config_path());
+        let request = sample_fund_request(TEST_CLIENT_ID);
+
+        let before = Arc::new(
+            Service::new_for_test(&config, test_blockchain_interface(&config).await).await,
+        );
+        let first = fund_single_transaction(&before, &request)
+            .await
+            .expect("funds");
+        drop(before);
+
+        let after = Arc::new(
+            Service::new_for_test(&config, test_blockchain_interface(&config).await).await,
+        );
+        let second = fund_single_transaction(&after, &request)
+            .await
+            .expect("funds");
+
+        assert_ne!(
+            spent_input(&first),
+            spent_input(&second),
+            "the restarted service spent the input its previous run had already spent"
+        );
+        assert_ne!(first.txs[0].hash(), second.txs[0].hash());
+    }
+
+    /// And it carries on from where it stopped: the change its last
+    /// transaction created is spendable after the restart, though the chain
+    /// has not reported it yet. That is the chain the ticket's first run built,
+    /// continued rather than restarted.
+    #[tokio::test]
+    async fn cs_465_a_restart_carries_on_from_its_own_change() {
+        let config = test_config(&unique_dynamic_config_path());
+        let mut request = sample_fund_request(TEST_CLIENT_ID);
+        request.satoshi = 10;
+
+        let before = Arc::new(
+            Service::new_for_test(
+                &config,
+                chain_holding(&config, vec![confirmed_utxo(5_000)]).await,
+            )
+            .await,
+        );
+        let first = fund_single_transaction(&before, &request)
+            .await
+            .expect("funds");
+        drop(before);
+
+        let after = Arc::new(
+            Service::new_for_test(
+                &config,
+                chain_holding(&config, vec![confirmed_utxo(5_000)]).await,
+            )
+            .await,
+        );
+        let second = fund_single_transaction(&after, &request)
+            .await
+            .expect("the change from before the restart is still spendable");
+
+        assert_eq!(
+            spent_input(&second),
+            (first.txs[0].hash().encode(), 0),
+            "the second transaction spends the first one's change, output 0"
+        );
+    }
+
+    /// A broadcast of unknown outcome reserves its inputs too, and that has to
+    /// survive a restart just as a successful one does -- it is the same risk.
+    #[tokio::test]
+    async fn cs_465_an_uncertain_broadcast_is_remembered_across_a_restart() {
+        use crate::test_support::UncertainBroadcaster;
+
+        let config = test_config(&unique_dynamic_config_path());
+        let request = sample_fund_request(TEST_CLIENT_ID);
+
+        let broadcaster = UncertainBroadcaster::new();
+        let before = service_with(
+            &config,
+            test_blockchain_interface(&config).await,
+            broadcaster.clone(),
+        )
+        .await;
+        let _ = fund_single_transaction(&before, &request).await;
+        drop(before);
+
+        let after = service_with(
+            &config,
+            test_blockchain_interface(&config).await,
+            broadcaster.clone(),
+        )
+        .await;
+        let _ = fund_single_transaction(&after, &request).await;
+
+        let handed = broadcaster.handed();
+        assert_eq!(handed.len(), 2);
+        assert_ne!(
+            handed[0], handed[1],
+            "after the restart the service rebuilt the transaction whose outcome it did not know"
+        );
+    }
+
+    /// A state file that cannot be read is survived: the service starts, as it
+    /// would have with no file at all, rather than refusing to.
+    #[tokio::test]
+    async fn cs_465_an_unreadable_state_file_does_not_stop_startup() {
+        let config = test_config(&unique_dynamic_config_path());
+        std::fs::write(config.inflight_state_path(), "{ not json").unwrap();
+
+        let service = Arc::new(
+            Service::new_for_test(&config, test_blockchain_interface(&config).await).await,
+        );
+        let client = service.client_handle(TEST_CLIENT_ID).await.expect("client");
+        assert_eq!(client.read().await.reserved_outpoint_count(), 0);
+        fund_single_transaction(&service, &sample_fund_request(TEST_CLIENT_ID))
+            .await
+            .expect("and funds as before");
     }
 }

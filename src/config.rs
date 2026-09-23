@@ -155,6 +155,13 @@ pub struct ServiceConfig {
     /// request, which is what the service did before.
     #[serde(default)]
     pub chain_state_max_age_seconds: Option<u64>,
+    /// Where to keep what the service has broadcast but the chain may not have
+    /// caught up with, so a restart does not forget it (CS-465).
+    ///
+    /// Defaults to a file beside `dynamic_config.filename`, which a deployment
+    /// already has to keep across restarts; see [`Config::inflight_state_path`].
+    #[serde(default)]
+    pub inflight_state_file: Option<String>,
 }
 
 impl ServiceConfig {
@@ -571,6 +578,25 @@ pub struct Config {
     pub mapi_lite: Option<MapiLiteConfig>,
     #[serde(default)]
     pub fees: FeesConfig,
+}
+
+impl Config {
+    /// The file that carries in-flight funding state across a restart.
+    ///
+    /// Beside `dynamic_config.filename` unless `service.inflight_state_file`
+    /// says otherwise, and named after it: `./data/dynamic.toml` pairs with
+    /// `./data/dynamic.inflight.json`. Beside it because that file already has
+    /// to survive a restart -- it holds the clients added at runtime -- so a
+    /// deployment that keeps one keeps both, with no new volume to configure.
+    /// Named after it so two services sharing a directory do not share state.
+    pub fn inflight_state_path(&self) -> std::path::PathBuf {
+        match &self.service.inflight_state_file {
+            Some(path) => std::path::PathBuf::from(path),
+            None => {
+                std::path::Path::new(&self.dynamic_config.filename).with_extension("inflight.json")
+            }
+        }
+    }
 }
 
 impl ClientConfig {
@@ -1215,6 +1241,25 @@ filename = "./data/dynamic.toml"
         unsafe { env::remove_var("FS_CONFIG") };
         let err = load_config("FS_CONFIG", path.to_str().unwrap()).unwrap_err();
         assert!(err.contains("fees.satoshis_per_kb"), "{err}");
+    }
+
+    /// The state file sits beside the file of runtime-added clients, which a
+    /// deployment already keeps across restarts, and is named after it so two
+    /// services sharing a directory keep separate state (CS-465).
+    #[test]
+    fn cs_465_the_state_file_sits_beside_the_dynamic_config() {
+        let mut config: Config = toml::from_str(MINIMAL_TOML).unwrap();
+        assert_eq!(
+            config.inflight_state_path(),
+            std::path::PathBuf::from("./data/dynamic.inflight.json")
+        );
+
+        config.service.inflight_state_file = Some("/var/lib/fs/inflight.json".to_string());
+        assert_eq!(
+            config.inflight_state_path(),
+            std::path::PathBuf::from("/var/lib/fs/inflight.json"),
+            "an explicit path wins"
+        );
     }
 
     fn write_temp_config(label: &str, content: &str) -> std::path::PathBuf {

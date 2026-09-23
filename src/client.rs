@@ -16,8 +16,9 @@ use chain_gang::{
     wallet::{create_sighash, Wallet},
 };
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::{ClientConfig, DEFAULT_SATOSHIS_PER_KB};
 use crate::responses::{CodedError, ErrorCode};
@@ -73,6 +74,79 @@ pub fn balance_from_unspent(unspent: &Utxo) -> Balance {
 struct PendingChange {
     entry: UtxoEntry,
     since: Instant,
+}
+
+/// A reservation, in a form that survives a restart (CS-465).
+///
+/// `Instant` means nothing to another process, so the moment is stored as
+/// wall-clock seconds and turned back into an age when read.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedReservation {
+    pub tx_hash: String,
+    pub tx_pos: u32,
+    pub since_unix: u64,
+}
+
+/// A pending change output, in a form that survives a restart (CS-465).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedPendingChange {
+    pub tx_hash: String,
+    pub tx_pos: u32,
+    pub value: i64,
+    pub height: i32,
+    pub since_unix: u64,
+}
+
+/// What a client has broadcast that the chain may not have caught up with:
+/// the inputs its transactions spent and the change they created.
+///
+/// This is the state CS-426 holds in memory so a refresh cannot hand an
+/// input out twice. It has to outlive the process, because the chain is not a
+/// substitute for it: straight after a broadcast, the read interface may not
+/// yet show the transaction at all, and after a restart the service would
+/// otherwise rebuild -- byte for byte, since signing is deterministic -- the
+/// transactions it had just sent (CS-465).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InflightState {
+    #[serde(default)]
+    pub reserved: Vec<PersistedReservation>,
+    #[serde(default)]
+    pub pending_change: Vec<PersistedPendingChange>,
+}
+
+impl InflightState {
+    pub fn is_empty(&self) -> bool {
+        self.reserved.is_empty() && self.pending_change.is_empty()
+    }
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
+
+/// `since`, as wall-clock seconds.
+fn to_unix(since: Instant, now: Instant, now_unix: u64) -> u64 {
+    now_unix.saturating_sub(now.saturating_duration_since(since).as_secs())
+}
+
+/// A persisted moment, as an `Instant` in this process -- or `None` if it is
+/// already older than the reservation window.
+///
+/// Expired entries are dropped here rather than restored for the next refresh
+/// to drop, because an age this process's clock cannot represent falls back to
+/// "now", and that fallback must never resurrect something long expired. A
+/// moment in the future -- the wall clock stepped back -- reads as age zero,
+/// which holds the entry longer rather than shorter: idle funds heal, a double
+/// spend does not.
+fn from_unix(since_unix: u64, now: Instant, now_unix: u64) -> Option<Instant> {
+    let age = Duration::from_secs(now_unix.saturating_sub(since_unix));
+    if age >= UNCERTAIN_SPEND_RESERVATION {
+        return None;
+    }
+    Some(now.checked_sub(age).unwrap_or(now))
 }
 
 #[derive(Clone, Debug)]
@@ -282,6 +356,73 @@ impl Client {
             }
             held
         });
+    }
+
+    /// What this client has in flight, for writing to disk (CS-465).
+    ///
+    /// Sorted, so the file a given state produces does not depend on hash map
+    /// iteration order.
+    pub fn inflight_state(&self) -> InflightState {
+        let now = Instant::now();
+        let now_unix = unix_now();
+        let mut reserved: Vec<PersistedReservation> = self
+            .reserved
+            .iter()
+            .map(|((tx_hash, tx_pos), since)| PersistedReservation {
+                tx_hash: tx_hash.clone(),
+                tx_pos: *tx_pos,
+                since_unix: to_unix(*since, now, now_unix),
+            })
+            .collect();
+        reserved.sort_by(|a, b| (&a.tx_hash, a.tx_pos).cmp(&(&b.tx_hash, b.tx_pos)));
+
+        let mut pending_change: Vec<PersistedPendingChange> = self
+            .pending_change
+            .values()
+            .map(|pending| PersistedPendingChange {
+                tx_hash: pending.entry.tx_hash.clone(),
+                tx_pos: pending.entry.tx_pos,
+                value: pending.entry.value,
+                height: pending.entry.height,
+                since_unix: to_unix(pending.since, now, now_unix),
+            })
+            .collect();
+        pending_change.sort_by(|a, b| (&a.tx_hash, a.tx_pos).cmp(&(&b.tx_hash, b.tx_pos)));
+
+        InflightState {
+            reserved,
+            pending_change,
+        }
+    }
+
+    /// Put back what a previous run of the service had in flight (CS-465).
+    ///
+    /// Only the bookkeeping is restored, not the cache: the next refresh
+    /// applies it exactly as it would have in the process that wrote it --
+    /// withholding the reserved inputs from what the chain reports, putting
+    /// back pending change the chain has not reported yet, and letting go of
+    /// whatever the chain has since caught up with.
+    pub fn restore_inflight_state(&mut self, state: InflightState) {
+        let now = Instant::now();
+        let now_unix = unix_now();
+        for reservation in state.reserved {
+            if let Some(since) = from_unix(reservation.since_unix, now, now_unix) {
+                self.reserved
+                    .insert((reservation.tx_hash, reservation.tx_pos), since);
+            }
+        }
+        for pending in state.pending_change {
+            if let Some(since) = from_unix(pending.since_unix, now, now_unix) {
+                let entry = UtxoEntry {
+                    height: pending.height,
+                    tx_pos: pending.tx_pos,
+                    tx_hash: pending.tx_hash,
+                    value: pending.value,
+                };
+                self.pending_change
+                    .insert(outpoint_key(&entry), PendingChange { entry, since });
+            }
+        }
     }
 
     /// Number of outpoints currently withheld from funding.
@@ -1421,6 +1562,82 @@ mod tests {
     #[test]
     fn cs_452_the_threshold_is_never_zero() {
         assert_eq!(client_holding_at_rate(Vec::new(), 1).dust_threshold(), 2);
+    }
+
+    // ---- CS-465: in-flight state across a restart ----
+
+    /// What a client writes out is what a fresh one reads back: the input its
+    /// transaction spent, and the change that transaction created.
+    #[test]
+    fn cs_465_in_flight_state_survives_a_round_trip() {
+        let mut client = client_holding_at_rate(vec![cs_422_utxo(1, 0, 5_000)], 100);
+        client
+            .create_funding_tx(&cs_422_request(10))
+            .expect("funds");
+        let written = client.inflight_state();
+        assert_eq!(written.reserved.len(), 1, "the input it spent");
+        assert_eq!(written.pending_change.len(), 1, "the change it created");
+
+        let mut restarted = client_holding_at_rate(Vec::new(), 100);
+        restarted.restore_inflight_state(written.clone());
+        let read_back = restarted.inflight_state();
+
+        // The moment is stored in whole seconds and recomputed as an age on
+        // each side, so it may move by one; everything else must be exact.
+        let same = |a: &PersistedReservation, b: &PersistedReservation| {
+            a.tx_hash == b.tx_hash
+                && a.tx_pos == b.tx_pos
+                && a.since_unix.abs_diff(b.since_unix) <= 1
+        };
+        assert!(same(&written.reserved[0], &read_back.reserved[0]));
+        let (w, r) = (&written.pending_change[0], &read_back.pending_change[0]);
+        assert_eq!(
+            (&w.tx_hash, w.tx_pos, w.value, w.height),
+            (&r.tx_hash, r.tx_pos, r.value, r.height)
+        );
+        assert!(w.since_unix.abs_diff(r.since_unix) <= 1);
+    }
+
+    /// Something that expired while the service was down stays expired.
+    /// Restoring it would at best be dropped again by the next refresh -- and
+    /// at worst, where the clock cannot express an age that long, come back
+    /// looking fresh.
+    #[test]
+    fn cs_465_an_entry_older_than_the_window_is_not_restored() {
+        let long_ago = unix_now() - UNCERTAIN_SPEND_RESERVATION.as_secs() - 1;
+        let mut client = client_holding(Vec::new());
+        client.restore_inflight_state(InflightState {
+            reserved: vec![PersistedReservation {
+                tx_hash: "aa".to_string(),
+                tx_pos: 0,
+                since_unix: long_ago,
+            }],
+            pending_change: vec![PersistedPendingChange {
+                tx_hash: "bb".to_string(),
+                tx_pos: 0,
+                value: 1_000,
+                height: UNCONFIRMED_HEIGHT,
+                since_unix: long_ago,
+            }],
+        });
+        assert!(client.inflight_state().is_empty(), "expired while down");
+    }
+
+    /// A moment in the future -- the wall clock stepped back between runs --
+    /// is held rather than dropped. Holding too long idles funds; dropping too
+    /// early risks the double spend this exists to prevent.
+    #[test]
+    fn cs_465_a_moment_in_the_future_is_held_rather_than_dropped() {
+        let mut client = client_holding(Vec::new());
+        client.restore_inflight_state(InflightState {
+            reserved: vec![PersistedReservation {
+                tx_hash: "aa".to_string(),
+                tx_pos: 0,
+                since_unix: unix_now() + 3_600,
+            }],
+            pending_change: Vec::new(),
+        });
+        assert_eq!(client.reserved_outpoint_count(), 1);
     }
 
     /// Reserve the first cached outpoint, as an uncertain broadcast does.
