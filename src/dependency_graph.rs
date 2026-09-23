@@ -94,14 +94,23 @@ mod tests {
 
     /// The lowest chain-gang this crate is correct against.
     ///
-    /// 0.11.2 and earlier read WhatsOnChain UTXOs from `/unspent`, which stops
-    /// at 1000 entries and offers no way to ask for the rest, so a busy
-    /// address came back silently truncated. Measured against mainnet
+    /// Two reasons, both about the WhatsOnChain interface.
+    ///
+    /// 0.11.2 and earlier read UTXOs from `/unspent`, which stops at 1000
+    /// entries and offers no way to ask for the rest, so a busy address came
+    /// back silently truncated. Measured against mainnet
     /// 1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa: 1000 of 20960 entries, 241612089
     /// of 2296358944 satoshis. For a funding service that is not a cosmetic
     /// difference -- the missing UTXOs are spendable, so the service would
     /// refuse amounts the client can afford. 0.11.3 pages `/unspent/all`.
-    const CHAIN_GANG_FLOOR: (u32, u32, u32) = (0, 11, 3);
+    ///
+    /// 0.11.4 adds `set_max_requests_per_second`, which is what
+    /// `blockchain_factory` uses to bound the rate of the requests that paging
+    /// turns one call into. Below it the code does not compile, so this floor
+    /// records the reason rather than enforcing it; 0.11.3 also fails
+    /// `get_utxo` on any address holding an unconfirmed output (CS-462), which
+    /// is an ordinary state rather than an edge case.
+    const CHAIN_GANG_FLOOR: (u32, u32, u32) = (0, 11, 4);
 
     #[test]
     fn chain_gang_is_new_enough_to_read_a_whole_utxo_set() {
@@ -120,10 +129,11 @@ mod tests {
 
         assert!(
             (*major, *minor, *patch) >= CHAIN_GANG_FLOOR,
-            "chain-gang {version} is below {CHAIN_GANG_FLOOR:?}, whose paginated \
-             /unspent/all read this crate relies on. Below it a client address with more \
-             than 1000 UTXOs reports only the first 1000, and the service refuses funding \
-             it could cover. See docs/Dependencies.md.",
+            "chain-gang {version} is below {CHAIN_GANG_FLOOR:?}. Below it a client address \
+             with more than 1000 UTXOs reports only the first 1000 and the service refuses \
+             funding it could cover, an address holding an unconfirmed output cannot be read \
+             at all, and there is no way to bound the rate of the requests paging makes. \
+             See docs/Dependencies.md.",
         );
     }
 

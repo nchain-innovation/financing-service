@@ -86,9 +86,13 @@ Set it explicitly to override either way — raise it if you have a paid WhatsOn
 
 The limit applies to the whole service, not per client: concurrent refreshes share one allowance, which is what a per-IP limit at the far end actually measures. At startup the chosen limit is logged at INFO.
 
-**What it paces: calls, not HTTP requests (CS-457).** The limiter decorates the blockchain interface, so it takes one slot per `get_balance` or `get_utxo`, and chain-gang then issues however many requests that call needs inside it. For an address under 1000 UTXOs that is still one request per call and the guarantee holds exactly. Beyond it, this number is a floor on the spacing between calls rather than a ceiling on requests per second.
+**What it paces (CS-457).** For `woc` it is **HTTP requests**. The rate is handed to chain-gang's WhatsOnChain interface, which applies it to every request it makes — including the pages a single `get_utxo` turns into, and the retries. So the configured number is a genuine ceiling on the rate reaching the API.
 
-It cannot currently be enforced at the request level: chain-gang's WhatsOnChain client builds its own HTTP client internally and exposes no way to supply one, so those requests are unreachable from this service. CS-457 tracks it. If you point this at a busy address on a free WhatsOnChain plan, lower `max_requests_per_second` to leave headroom rather than assuming the configured number is what reaches the API.
+For `rpc` and `uaas` it is **interface calls**. Those interfaces have no request-level limit of their own, so the service falls back to a decorator that takes one slot per call, and a call may be more than one request. They are unthrottled by default, because the server is the operator's own.
+
+This was not always so. Until chain-gang 0.11.4 the WhatsOnChain client built its own HTTP client with no way to supply one, so its requests were unreachable from this service and the limit could only pace calls — which stopped bounding anything once 0.11.3 made one call many requests. `set_max_requests_per_second` was added upstream for this, and the service requires 0.11.4 or later.
+
+Setting `max_requests_per_second = 0` means unlimited, and is passed down as no limit rather than as a limit of zero.
 
 #### When the interface is unreachable
 
