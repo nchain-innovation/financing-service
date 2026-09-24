@@ -1,4 +1,4 @@
-# apigun
+# API Gun
 
 Load-test scripts for the Financing Service HTTP API, written for
 [k6](https://k6.io/).
