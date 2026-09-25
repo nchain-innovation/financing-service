@@ -1199,7 +1199,7 @@ mod tests {
         // rate fails here with a number rather than as a wall of hex.
         //
         // At 100 sat/KB a one-input, two-output transaction is 226 bytes and
-        // costs 22 satoshi, so the smallest UTXO that can pay 123 and still
+        // costs 23 satoshi, so the smallest UTXO that can pay 123 and still
         // leave change is the 240. Its change of 94 clears the 38 that rate
         // implies as dust, so it is paid back rather than given away.
         assert_eq!(tx.inputs.len(), 1, "one input suffices at this rate");
@@ -1302,7 +1302,7 @@ mod tests {
     fn test_create_funding_tx_consolidates_multiple_utxos() {
         let mut client = test_client_with_utxos(&[300, 300, 300]);
         // 700 exceeds any single UTXO, so all three are needed. (123 would now
-        // be met by one of them: at 100 sat/KB the fee is 22, not 750.)
+        // be met by one of them: at 100 sat/KB the fee is 23, not 750.)
         let tx = client
             .create_funding_tx(&sample_fund_request(700))
             .expect("expected multi-input funding transaction");
@@ -1502,7 +1502,7 @@ mod tests {
     /// in the transaction, which means the miner takes it as fee.
     #[test]
     fn cs_452_dust_change_goes_to_the_fee_rather_than_an_output() {
-        // 5_030 covers 5_000 plus the 22 fee and leaves 8, under the 38 the
+        // 5_030 covers 5_000 plus the 23 fee and leaves 7, under the 38 the
         // rate implies. It is the only UTXO, so there is nothing better.
         let mut client = client_holding_at_rate(vec![cs_422_utxo(1, 0, 5_030)], 100);
         let tx = client
