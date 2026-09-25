@@ -40,6 +40,11 @@ export const config = {
   idempotency: __ENV.IDEMPOTENCY || 'off',
   replayKey: `apigun-replay-${__ENV.RUN_ID || Date.now()}`,
 
+  // Print every outpoint returned, for the duplicate check in the README.
+  // Off by default: it is a console write per outpoint, which costs enough to
+  // distort a run you take a TPS number from.
+  logOutpoints: bool('LOG_OUTPOINTS', false),
+
   // Generous by default: funding waits on a broadcast, and a timeout here
   // would be recorded as a service failure when it is really the test giving
   // up early.
