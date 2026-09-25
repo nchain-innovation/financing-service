@@ -120,6 +120,17 @@ impl InflightState {
     }
 }
 
+/// Bytes Bitcoin's variable-length integer takes to encode `n`, as used for a
+/// transaction's input and output counts and each script's length.
+fn varint_bytes(n: u64) -> u64 {
+    match n {
+        0..=0xfc => 1,
+        0xfd..=0xffff => 3,
+        0x1_0000..=0xffff_ffff => 5,
+        _ => 9,
+    }
+}
+
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -184,11 +195,11 @@ pub struct FundRequest {
 
 impl FundRequest {
     /// Total bytes of all output locking scripts, for fee estimation.
-    fn output_script_bytes(&self) -> u64 {
+    fn script_lengths(&self) -> Vec<u64> {
         self.locking_scripts
             .iter()
             .map(|script| script.len() as u64)
-            .sum()
+            .collect()
     }
 
     /// Script for the `index`-th outpoint, falling back to the last one if the
@@ -538,17 +549,17 @@ impl Client {
         self.unspent.iter().map(|utxo| utxo.value).sum()
     }
 
-    /// Estimate the fee for a transaction whose output locking scripts total
-    /// `output_script_bytes`.
+    /// Estimate the fee for a transaction paying one output to each of
+    /// `funded_scripts` -- given as their lengths -- plus change.
     ///
-    /// Taking a total rather than a length and a count means scripts of
-    /// differing sizes are costed correctly, instead of assuming they are all
-    /// the same size as the first.
-    fn estimate_fee(&self, output_script_bytes: u64, no_of_inputs: u32) -> u64 {
-        const TX_OVERHEAD_BYTES: u64 = 10;
-        let output_bytes = output_script_bytes + Self::CHANGE_OUTPUT_BYTES;
-        let tx_bytes =
-            TX_OVERHEAD_BYTES + Self::INPUT_BYTES * no_of_inputs.max(1) as u64 + output_bytes;
+    /// Takes the scripts rather than a byte total so the caller cannot get
+    /// the serialisation wrong: every output is an 8-byte value, a length
+    /// prefix and the script, and counting only the script is what left each
+    /// funded output 9 bytes short and the service paying under the rate it
+    /// was configured with (CS-471). Scripts of differing sizes are costed
+    /// individually rather than assumed to match the first.
+    fn estimate_fee(&self, funded_scripts: &[u64], no_of_inputs: u32) -> u64 {
+        let tx_bytes = Self::funding_tx_bytes(funded_scripts, no_of_inputs);
         // Rounded up: rounding down would underpay, and a transaction a miner
         // will not relay costs far more to discover than the satoshi saved.
         tx_bytes
@@ -562,7 +573,37 @@ impl Client {
         self.fee_satoshis_per_kb
     }
 
-    /// Bytes a change output adds to the transaction that creates it.
+    /// Serialised size of a funding transaction: `no_of_inputs` P2PKH inputs,
+    /// one output per script in `funded_scripts`, and a change output.
+    ///
+    /// An upper bound, not an average. Every input is costed at the most a
+    /// low-S signature can take, and change is always counted though dust
+    /// change is left out -- so a real transaction is never larger than this,
+    /// and the fee on it never falls below the rate.
+    fn funding_tx_bytes(funded_scripts: &[u64], no_of_inputs: u32) -> u64 {
+        const VERSION_AND_LOCKTIME_BYTES: u64 = 8;
+        let inputs = no_of_inputs.max(1) as u64;
+        let outputs = funded_scripts.len() as u64 + 1;
+        let funded_output_bytes: u64 = funded_scripts
+            .iter()
+            .map(|&script| Self::output_bytes(script))
+            .sum();
+        VERSION_AND_LOCKTIME_BYTES
+            + varint_bytes(inputs)
+            + Self::INPUT_BYTES * inputs
+            + varint_bytes(outputs)
+            + funded_output_bytes
+            + Self::CHANGE_OUTPUT_BYTES
+    }
+
+    /// Serialised size of an output paying to a script of `script_bytes`: an
+    /// 8-byte value, the script's length prefix, then the script.
+    fn output_bytes(script_bytes: u64) -> u64 {
+        8 + varint_bytes(script_bytes) + script_bytes
+    }
+
+    /// Bytes a change output adds to the transaction that creates it: a P2PKH
+    /// output, which is [`Self::output_bytes`] of a 25-byte script.
     const CHANGE_OUTPUT_BYTES: u64 = 34;
 
     /// Bytes an input adds to the transaction that spends it.
@@ -653,13 +694,13 @@ impl Client {
             // cost each separately rather than multiplying one estimate.
             (0..fund_request.no_of_outpoints as usize)
                 .map(|index| {
-                    let bytes = fund_request.script_at(index).len() as u64;
-                    fund_request.satoshi + self.estimate_fee(bytes, 1)
+                    let script = fund_request.script_at(index).len() as u64;
+                    fund_request.satoshi + self.estimate_fee(&[script], 1)
                 })
                 .sum()
         } else {
             fund_request.satoshi * fund_request.no_of_outpoints as u64
-                + self.estimate_fee(fund_request.output_script_bytes(), no_of_inputs)
+                + self.estimate_fee(&fund_request.script_lengths(), no_of_inputs)
         }
     }
 
@@ -677,7 +718,7 @@ impl Client {
     /// usually well under `confirmed + unconfirmed`, and a caller that
     /// subtracts a guessed fee will guess wrong.
     pub fn max_fundable_p2pkh(&self) -> i64 {
-        self.max_fundable(Self::P2PKH_SCRIPT_BYTES)
+        self.max_fundable(&[Self::P2PKH_SCRIPT_BYTES])
     }
 
     /// The largest amount a single funding transaction can pay out, given the
@@ -702,7 +743,7 @@ impl Client {
     /// reported: the wallet was drained to a balance it could not spend.
     ///
     /// Returns 0 rather than a negative number when nothing can be funded.
-    fn max_fundable(&self, output_script_bytes: u64) -> i64 {
+    fn max_fundable(&self, funded_scripts: &[u64]) -> i64 {
         let mut values: Vec<i64> = self.unspent.iter().map(|utxo| utxo.value).collect();
         values.sort_unstable_by(|a, b| b.cmp(a));
 
@@ -710,7 +751,7 @@ impl Client {
         let mut best = 0i64;
         for (index, value) in values.iter().enumerate() {
             running += value;
-            let fee = self.estimate_fee(output_script_bytes, index as u32 + 1) as i64;
+            let fee = self.estimate_fee(funded_scripts, index as u32 + 1) as i64;
             best = best.max(running - fee);
         }
         best.max(0)
@@ -724,9 +765,9 @@ impl Client {
     /// wallet does not hold enough" from "it holds enough but not in a shape
     /// that can be spent", which are the two things a caller can act on and
     /// which need different actions -- top up, or consolidate.
-    fn max_fundable_if_consolidated(&self, output_script_bytes: u64) -> i64 {
+    fn max_fundable_if_consolidated(&self, funded_scripts: &[u64]) -> i64 {
         let total = self.total_unspent();
-        let fee = self.estimate_fee(output_script_bytes, 1) as i64;
+        let fee = self.estimate_fee(funded_scripts, 1) as i64;
         (total - fee).max(0)
     }
 
@@ -915,7 +956,7 @@ impl Client {
     fn single_tx_funding_error(&self, fund_request: &FundRequest) -> Option<CodedError> {
         // What the caller is asking the transaction to pay out, change aside.
         let requested = (fund_request.satoshi * fund_request.no_of_outpoints as u64) as i64;
-        let script_bytes = fund_request.output_script_bytes();
+        let scripts = fund_request.script_lengths();
         let total_available = self.total_unspent();
 
         // Two ceilings, and the gap between them is the diagnosis. The first
@@ -924,8 +965,8 @@ impl Client {
         // first needs more money. Asking between them needs the same money in
         // fewer pieces. The caller can act on either, and they are different
         // actions.
-        let consolidated_max = self.max_fundable_if_consolidated(script_bytes);
-        let actual_max = self.max_fundable(script_bytes);
+        let consolidated_max = self.max_fundable_if_consolidated(&scripts);
+        let actual_max = self.max_fundable(&scripts);
 
         if requested > consolidated_max {
             return Some(CodedError::new(
@@ -967,7 +1008,7 @@ impl Client {
         let per_tx_cost = (0..fund_request.no_of_outpoints as usize)
             .map(|index| {
                 fund_request.satoshi
-                    + self.estimate_fee(fund_request.script_at(index).len() as u64, 1)
+                    + self.estimate_fee(&[fund_request.script_at(index).len() as u64], 1)
             })
             .max()
             .unwrap_or(fund_request.satoshi);
@@ -1328,18 +1369,18 @@ mod tests {
         // Stated before the serialised form below, so that a change of fee
         // rate fails here with a number rather than as a wall of hex.
         //
-        // At 100 sat/KB a one-input, two-output transaction is 217 bytes and
+        // At 100 sat/KB a one-input, two-output transaction is 226 bytes and
         // costs 22 satoshi, so the smallest UTXO that can pay 123 and still
-        // leave change is the 240. Its change of 95 clears the 38 that rate
+        // leave change is the 240. Its change of 94 clears the 38 that rate
         // implies as dust, so it is paid back rather than given away.
         assert_eq!(tx.inputs.len(), 1, "one input suffices at this rate");
         assert_eq!(tx.outputs.len(), 2);
-        assert_eq!(tx.outputs[0].satoshis, 95, "change: 240 - 123 - 22");
+        assert_eq!(tx.outputs[0].satoshis, 94, "change: 240 - 123 - 23");
         assert_eq!(tx.outputs[1].satoshis, 123, "the requested amount");
 
         assert_eq!(
             tx_as_hexstr(&tx).unwrap(),
-            "01000000015e791b771be3af3ed1447d311071a1e15e127c4343a58debcb8e40c1e57272f6000000006a4730440220375ccfd8bac40cbacba5102626d0356fce0c0cccc2ca336825535aea2f4f9d4b02205e2e3bb7997f65eaaa61b64f75bb4d820be301741d312ad7b9c0d10eb42ce83b412103a8ae071ddd8690b94755c7112ca304bcac45c15904cc013f0ad6c2ea0b1019b2ffffffff025f000000000000001976a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac7b000000000000001976a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac00000000"
+            "01000000015e791b771be3af3ed1447d311071a1e15e127c4343a58debcb8e40c1e57272f6000000006a473044022026bc38b2a528e18e009ad4cc30673c9b0ac9a101c4d034342caca6b34d1db84e022053c9aa99d88d47050df5828498c1101d1ece941276c71427850209091bc9bed9412103a8ae071ddd8690b94755c7112ca304bcac45c15904cc013f0ad6c2ea0b1019b2ffffffff025e000000000000001976a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac7b000000000000001976a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac00000000"
         );
     }
 
@@ -1547,11 +1588,11 @@ mod tests {
     #[test]
     fn cs_451_the_fee_follows_the_configured_rate() {
         let script_bytes = Client::P2PKH_SCRIPT_BYTES;
-        // One input, two outputs: 10 + 148 + 25 + 34 = 217 bytes.
-        for (rate, expected) in [(100u64, 22u64), (500, 109), (1000, 217), (50, 11)] {
+        // One input, two outputs: 8 + 1 + 148 + 1 + 34 + 34 = 226 bytes.
+        for (rate, expected) in [(100u64, 23u64), (500, 113), (1000, 226), (50, 12)] {
             let client = client_holding_at_rate(Vec::new(), rate);
             assert_eq!(
-                client.estimate_fee(script_bytes, 1),
+                client.estimate_fee(&[script_bytes], 1),
                 expected,
                 "at {rate} sat/KB"
             );
@@ -1563,17 +1604,17 @@ mod tests {
     /// than the satoshi saved.
     #[test]
     fn cs_451_a_partial_satoshi_rounds_up_rather_than_down() {
-        // 217 bytes at 100 sat/KB is 21.7 satoshi
+        // 226 bytes at 100 sat/KB is 22.6 satoshi
         let client = client_holding_at_rate(Vec::new(), 100);
-        assert_eq!(client.estimate_fee(Client::P2PKH_SCRIPT_BYTES, 1), 22);
+        assert_eq!(client.estimate_fee(&[Client::P2PKH_SCRIPT_BYTES], 1), 23);
 
         // and a rate low enough to make the exact fee a fraction of a satoshi
         // still pays one, not none
         let client = client_holding_at_rate(Vec::new(), 1);
         assert_eq!(
-            client.estimate_fee(Client::P2PKH_SCRIPT_BYTES, 1),
+            client.estimate_fee(&[Client::P2PKH_SCRIPT_BYTES], 1),
             1,
-            "0.217 satoshi rounds to 1, never to 0"
+            "0.226 satoshi rounds to 1, never to 0"
         );
     }
 
@@ -1589,9 +1630,9 @@ mod tests {
             client_holding_at_rate(vec![cs_422_utxo(1, 0, 1000), cs_422_utxo(2, 0, 10)], 100);
         assert_eq!(client.total_unspent(), 1010);
         assert_eq!(
-            client.max_fundable(Client::P2PKH_SCRIPT_BYTES),
-            978,
-            "1000 - 22, leaving the 10 alone rather than paying 15 for it"
+            client.max_fundable(&[Client::P2PKH_SCRIPT_BYTES]),
+            977,
+            "1000 - 23, leaving the 10 alone rather than paying 15 for it"
         );
     }
 
@@ -1622,15 +1663,15 @@ mod tests {
     fn cs_452_funding_the_maximum_leaves_no_dust_output() {
         let mut client = client_holding_at_rate(vec![cs_422_utxo(1, 0, 5_000)], 100);
         let script_bytes = Client::P2PKH_SCRIPT_BYTES;
-        let max = client.max_fundable(script_bytes) as u64;
-        assert_eq!(max, 4_978, "5000 - 22, with nothing held back for change");
+        let max = client.max_fundable(&[script_bytes]) as u64;
+        assert_eq!(max, 4_977, "5000 - 23, with nothing held back for change");
 
         let tx = client
             .create_funding_tx(&cs_422_request(max))
             .expect("the advertised maximum must build");
 
         assert_eq!(tx.outputs.len(), 1, "no change output at all");
-        assert_eq!(tx.outputs[0].satoshis, 4_978);
+        assert_eq!(tx.outputs[0].satoshis, 4_977);
         let after = client.get_balance();
         assert_eq!(
             after.confirmed + after.unconfirmed,
@@ -1665,7 +1706,7 @@ mod tests {
     /// change to the miner.
     #[test]
     fn cs_452_a_utxo_that_would_leave_dust_is_not_preferred() {
-        // 5_030 leaves 8 of dust; 9_000 leaves 3_978, which is worth an
+        // 5_030 leaves 8 of dust; 9_000 leaves 3_977, which is worth an
         // output. The smaller one would otherwise win, being smallest-first.
         let mut client = client_holding_at_rate(
             vec![cs_422_utxo(1, 0, 5_030), cs_422_utxo(2, 0, 9_000)],
@@ -1676,8 +1717,8 @@ mod tests {
             .expect("fundable");
 
         assert_eq!(tx.outputs.len(), 2, "change is paid back, not given away");
-        assert_eq!(tx.outputs[0].satoshis, 3_978, "9000 - 5000 - 22");
-        assert_eq!(client.get_balance().unconfirmed, 3_978);
+        assert_eq!(tx.outputs[0].satoshis, 3_977, "9000 - 5000 - 23");
+        assert_eq!(client.get_balance().unconfirmed, 3_977);
     }
 
     /// A UTXO covering the cost exactly is fundable again. CS-422 had to
@@ -1685,8 +1726,8 @@ mod tests {
     /// builds one with no change output instead.
     #[test]
     fn cs_452_a_utxo_covering_the_cost_exactly_is_fundable() {
-        let exact =
-            5_000 + client_holding(Vec::new()).estimate_fee(Client::P2PKH_SCRIPT_BYTES, 1) as i64;
+        let exact = 5_000
+            + client_holding(Vec::new()).estimate_fee(&[Client::P2PKH_SCRIPT_BYTES], 1) as i64;
         let mut client = client_holding_at_rate(vec![cs_422_utxo(1, 0, exact)], 100);
 
         let request = cs_422_request(5_000);
@@ -1925,6 +1966,182 @@ mod tests {
         client.backdate_handed_out(UNCERTAIN_SPEND_RESERVATION + Duration::from_secs(1));
         client.forget_expired_handed_out();
         assert!(client.handed_out.is_empty());
+    }
+
+    // ---- CS-471: the fee is priced on the transaction actually built ----
+
+    /// Serialised size of `tx`, in bytes: what a miner prices.
+    fn serialised_size(tx: &Tx) -> u64 {
+        crate::util::tx_as_hexstr(tx).unwrap().len() as u64 / 2
+    }
+
+    /// Satoshis `tx` pays in fee, given the value of the inputs it spends.
+    fn fee_paid(tx: &Tx, inputs_value: i64) -> i64 {
+        inputs_value - tx.outputs.iter().map(|out| out.satoshis).sum::<i64>()
+    }
+
+    /// The property that matters: a transaction pays at least the configured
+    /// rate on its real serialised size. Checked against the bytes, not
+    /// against the estimate, because the bug was in the estimate.
+    fn assert_pays_the_rate(tx: &Tx, inputs_value: i64, rate: u64) {
+        let size = serialised_size(tx);
+        let floor = (size * rate).div_ceil(1000) as i64;
+        let paid = fee_paid(tx, inputs_value);
+        assert!(
+            paid >= floor,
+            "a {size}-byte transaction pays {paid} satoshi; at {rate} sat/KB it needs {floor} \
+             ({:.1} sat/KB paid)",
+            paid as f64 * 1000.0 / size as f64
+        );
+    }
+
+    /// The ticket's transaction: one P2PKH input, a 100-satoshi output and
+    /// change. 226 bytes, which at 100 sat/KB needs 23 satoshi; the estimate
+    /// counted each funded output as its bare script, came to 217, and paid 22.
+    #[test]
+    fn cs_471_a_standard_funding_transaction_pays_the_rate_on_its_real_size() {
+        let mut client = client_holding_at_rate(vec![cs_422_utxo(1, 0, 9_792_234)], 100);
+        let tx = client
+            .create_funding_tx(&cs_422_request(100))
+            .expect("funds");
+        // The ticket's shape. Its size is 225 or 226: a signature is a byte
+        // longer or shorter depending on what it signs, and the estimate
+        // assumes the longer, so it is an upper bound on either.
+        assert_eq!((tx.inputs.len(), tx.outputs.len()), (1, 2));
+        assert!((225..=226).contains(&serialised_size(&tx)));
+        assert_eq!(
+            Client::funding_tx_bytes(&[Client::P2PKH_SCRIPT_BYTES], 1),
+            226
+        );
+        assert_pays_the_rate(&tx, 9_792_234, 100);
+    }
+
+    /// Every funded output carries its own value and length prefix, so the
+    /// shortfall grew with the number of outpoints.
+    #[test]
+    fn cs_471_several_outpoints_in_one_transaction_pay_the_rate() {
+        let mut client = client_holding_at_rate(vec![cs_422_utxo(1, 0, 1_000_000)], 100);
+        let mut request = cs_422_request(100);
+        request.no_of_outpoints = 5;
+        request.locking_scripts = vec![hex::decode(LOCKING_SCRIPT_HEX).unwrap(); 5];
+        let tx = client.create_funding_tx(&request).expect("funds");
+        assert_eq!(tx.outputs.len(), 6, "five funded outputs and change");
+        assert_pays_the_rate(&tx, 1_000_000, 100);
+    }
+
+    /// And a transaction that has to combine inputs, at a rate high enough
+    /// that a few bytes' error is several satoshi.
+    #[test]
+    fn cs_471_a_consolidating_transaction_pays_the_rate() {
+        let utxos = vec![
+            cs_422_utxo(1, 0, 3_000),
+            cs_422_utxo(2, 0, 3_000),
+            cs_422_utxo(3, 0, 3_000),
+        ];
+        let mut client = client_holding_at_rate(utxos, 1_000);
+        let tx = client
+            .create_funding_tx(&cs_422_request(7_000))
+            .expect("funds");
+        assert_eq!(tx.inputs.len(), 3);
+        assert_pays_the_rate(&tx, 9_000, 1_000);
+    }
+
+    /// Every shape, not one. Outpoint counts, rates and wallet sizes are swept
+    /// so the number of inputs, the number of outputs and the rounding all
+    /// vary, and every transaction built must pay the rate on its real size.
+    #[test]
+    fn cs_471_every_shape_pays_the_rate_on_its_real_size() {
+        for rate in [1u64, 50, 100, 500, 1_000, 5_000] {
+            for outpoints in 1..=4u32 {
+                for utxo_count in 1..=5u8 {
+                    // Equal UTXOs small enough that larger requests need
+                    // several of them, large enough that the request fits.
+                    let each = 40_000i64;
+                    let utxos: Vec<UtxoEntry> = (0..utxo_count)
+                        .map(|seed| cs_422_utxo(seed + 1, 0, each))
+                        .collect();
+                    let total = each * utxo_count as i64;
+                    let mut client = client_holding_at_rate(utxos, rate);
+
+                    let mut request = cs_422_request(((total / 2) / outpoints as i64) as u64);
+                    request.no_of_outpoints = outpoints;
+                    request.locking_scripts =
+                        vec![hex::decode(LOCKING_SCRIPT_HEX).unwrap(); outpoints as usize];
+
+                    let Ok(tx) = client.create_funding_tx(&request) else {
+                        continue;
+                    };
+                    let spent = each * tx.inputs.len() as i64;
+                    assert_pays_the_rate(&tx, spent, rate);
+                    assert!(
+                        serialised_size(&tx)
+                            <= Client::funding_tx_bytes(
+                                &request.script_lengths(),
+                                tx.inputs.len() as u32
+                            ),
+                        "the estimate is an upper bound on the size"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A script of 253 bytes or more needs a three-byte length prefix, not
+    /// one. Rare for a funding output, but a caller chooses the script.
+    #[test]
+    fn cs_471_a_long_locking_script_is_sized_with_its_longer_prefix() {
+        let mut client = client_holding_at_rate(vec![cs_422_utxo(1, 0, 100_000)], 1_000);
+        let mut request = cs_422_request(1_000);
+        // OP_RETURN and 299 bytes of data: a 300-byte script
+        let mut script = vec![0x6a];
+        script.extend(std::iter::repeat_n(0u8, 299));
+        request.locking_scripts = vec![script];
+        let tx = client.create_funding_tx(&request).expect("funds");
+        assert_eq!(Client::output_bytes(300), 8 + 3 + 300);
+        assert_pays_the_rate(&tx, 100_000, 1_000);
+    }
+
+    /// The size arithmetic, prefix by prefix. Tested directly rather than
+    /// through a built transaction: a signature is a byte shorter about half
+    /// the time and the estimate assumes the longer, so across hundreds of
+    /// inputs the estimate is over by more than a hundred bytes -- enough to
+    /// hide a two-byte prefix it forgot entirely.
+    #[test]
+    fn cs_471_the_size_counts_every_length_prefix() {
+        let p2pkh = Client::P2PKH_SCRIPT_BYTES;
+        // one input, one P2PKH output and change: the ticket's 226
+        assert_eq!(Client::funding_tx_bytes(&[p2pkh], 1), 226);
+        // a funded output is its script plus a value and a prefix
+        assert_eq!(Client::output_bytes(p2pkh), 34);
+        // 253 inputs: the count takes three bytes, not one
+        assert_eq!(
+            Client::funding_tx_bytes(&[p2pkh], 253) - Client::funding_tx_bytes(&[p2pkh], 252),
+            Client::INPUT_BYTES + 2
+        );
+        // 253 outputs, change included: likewise
+        assert_eq!(
+            Client::funding_tx_bytes(&[p2pkh; 252], 1) - Client::funding_tx_bytes(&[p2pkh; 251], 1),
+            Client::output_bytes(p2pkh) + 2
+        );
+        // a 253-byte script: its length takes three bytes, not one
+        assert_eq!(Client::output_bytes(253) - Client::output_bytes(252), 1 + 2);
+    }
+
+    /// And a transaction that genuinely has hundreds of inputs still pays the
+    /// rate -- the sanity check, not the discriminating one (see above).
+    #[test]
+    fn cs_471_a_transaction_with_hundreds_of_inputs_pays_the_rate() {
+        let utxos: Vec<UtxoEntry> = (0..260u32)
+            .map(|pos| utxo(&format!("{:064x}", 7), pos, 100, 1_758_719))
+            .collect();
+        let mut client = client_holding_at_rate(utxos, 100);
+        // 85 satoshi of each 100-satoshi input is left after its own fee, so
+        // this needs about 254 of them
+        let tx = client
+            .create_funding_tx(&cs_422_request(21_600))
+            .expect("funds");
+        assert!(tx.inputs.len() > 252, "{} inputs", tx.inputs.len());
+        assert_pays_the_rate(&tx, 100 * tx.inputs.len() as i64, 100);
     }
 
     /// Reserve the first cached outpoint, as an uncertain broadcast does.
@@ -2417,8 +2634,8 @@ mod tests {
         let script_bytes = hex::decode(LOCKING_SCRIPT_HEX).unwrap().len() as u64;
 
         assert_eq!(client.total_unspent(), 1230);
-        assert_eq!(client.max_fundable(script_bytes), 1119);
-        assert_eq!(client.max_fundable_if_consolidated(script_bytes), 1208);
+        assert_eq!(client.max_fundable(&[script_bytes]), 1118);
+        assert_eq!(client.max_fundable_if_consolidated(&[script_bytes]), 1207);
     }
 
     /// The report's first complaint: asking for 480 was refused as
@@ -2429,11 +2646,11 @@ mod tests {
     #[test]
     fn cs_422_insufficient_balance_reports_what_can_actually_be_paid_out() {
         let error = cs_422_wallet()
-            .funding_balance_error(&cs_422_request(1209))
-            .expect("1209 is beyond this wallet");
+            .funding_balance_error(&cs_422_request(1208))
+            .expect("1208 is beyond this wallet");
         assert_eq!(error.code, ErrorCode::InsufficientBalance);
         assert!(
-            error.description.contains("1209 satoshi requested"),
+            error.description.contains("1208 satoshi requested"),
             "{}",
             error.description
         );
@@ -2443,7 +2660,7 @@ mod tests {
             error.description
         );
         assert!(
-            error.description.contains("at most 1208"),
+            error.description.contains("at most 1207"),
             "{}",
             error.description
         );
@@ -2458,7 +2675,7 @@ mod tests {
     /// The report's second complaint: asking for *less* produced a *larger*
     /// requirement, more than the balance, because the figure quoted was the
     /// cost of spending every UTXO rather than what the wallet can achieve.
-    /// Here that discredited figure would be 1150 + 111 = 1261, against a
+    /// Here that discredited figure would be 1150 + 112 = 1262, against a
     /// balance of 1230.
     #[test]
     fn cs_422_no_suitable_utxo_does_not_quote_a_cost_nobody_would_pay() {
@@ -2467,7 +2684,7 @@ mod tests {
             .expect("1150 is beyond this UTXO set as it stands");
         assert_eq!(error.code, ErrorCode::NoSuitableUtxo);
         assert!(
-            error.description.contains("at most 1119"),
+            error.description.contains("at most 1118"),
             "{}",
             error.description
         );
@@ -2477,37 +2694,37 @@ mod tests {
             error.description
         );
         assert!(
-            !error.description.contains("1261"),
+            !error.description.contains("1262"),
             "the all-inputs cost is not a requirement: {}",
             error.description
         );
     }
 
     /// The two codes now mean different things, and the boundary between them
-    /// is the point where consolidating would stop helping. Up to 1119 the
-    /// wallet funds as it is; between 1120 and 1208 it could fund only if it
-    /// were consolidated; above 1208 no arrangement is enough.
+    /// is the point where consolidating would stop helping. Up to 1118 the
+    /// wallet funds as it is; between 1119 and 1207 it could fund only if it
+    /// were consolidated; above 1207 no arrangement is enough.
     #[test]
     fn cs_422_the_two_codes_split_at_the_point_consolidating_stops_helping() {
         let client = cs_422_wallet();
 
         assert!(client
-            .funding_balance_error(&cs_422_request(1119))
+            .funding_balance_error(&cs_422_request(1118))
             .is_none());
 
         let shape = client
-            .funding_balance_error(&cs_422_request(1120))
-            .expect("1120 needs consolidating");
+            .funding_balance_error(&cs_422_request(1119))
+            .expect("1119 needs consolidating");
         assert_eq!(shape.code, ErrorCode::NoSuitableUtxo);
 
         let shape = client
-            .funding_balance_error(&cs_422_request(1208))
-            .expect("1208 needs consolidating");
+            .funding_balance_error(&cs_422_request(1207))
+            .expect("1207 needs consolidating");
         assert_eq!(shape.code, ErrorCode::NoSuitableUtxo);
 
         let balance = client
-            .funding_balance_error(&cs_422_request(1209))
-            .expect("1209 needs more money");
+            .funding_balance_error(&cs_422_request(1208))
+            .expect("1208 needs more money");
         assert_eq!(balance.code, ErrorCode::InsufficientBalance);
     }
 
@@ -2518,7 +2735,7 @@ mod tests {
     fn cs_422_the_reported_maximum_can_actually_be_funded() {
         let mut client = cs_422_wallet();
         let script_bytes = hex::decode(LOCKING_SCRIPT_HEX).unwrap().len() as u64;
-        let max = client.max_fundable(script_bytes) as u64;
+        let max = client.max_fundable(&[script_bytes]) as u64;
 
         let request = cs_422_request(max);
         assert!(
@@ -2575,7 +2792,7 @@ mod tests {
         let script_bytes = hex::decode(LOCKING_SCRIPT_HEX).unwrap().len() as u64;
         // an empty wallet, only to cost the transaction at the same rate the
         // wallet under test uses
-        let exact = 123 + client_holding(Vec::new()).estimate_fee(script_bytes, 1) as i64;
+        let exact = 123 + client_holding(Vec::new()).estimate_fee(&[script_bytes], 1) as i64;
         let mut client = client_holding(vec![cs_422_utxo(9, 0, exact)]);
 
         let request = cs_422_request(123);
@@ -2609,7 +2826,7 @@ mod tests {
         let script_bytes = hex::decode(LOCKING_SCRIPT_HEX).unwrap().len() as u64;
 
         assert!(
-            client.max_fundable(script_bytes) > 400,
+            client.max_fundable(&[script_bytes]) > 400,
             "the unconfirmed 900 is counted towards what can be funded"
         );
         let request = cs_422_request(500);
@@ -2675,11 +2892,11 @@ mod tests {
             .expect("funds");
 
         // At 100 sat/KB a single input covers it: the 480 is the smallest
-        // UTXO above 300 + 22 of fee, so it alone is spent and 158 comes back
+        // UTXO above 300 + 23 of fee, so it alone is spent and 157 comes back
         // as change. The other six are untouched and still confirmed.
         let after = client.get_balance();
         assert_eq!(
-            after.unconfirmed, 158,
+            after.unconfirmed, 157,
             "the change output should be counted as unconfirmed: {after:?}"
         );
         assert_eq!(
