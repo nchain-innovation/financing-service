@@ -120,6 +120,17 @@ impl InflightState {
     }
 }
 
+/// Bytes Bitcoin's variable-length integer takes to encode `n`, as used for a
+/// transaction's input and output counts and each script's length.
+fn varint_bytes(n: u64) -> u64 {
+    match n {
+        0..=0xfc => 1,
+        0xfd..=0xffff => 3,
+        0x1_0000..=0xffff_ffff => 5,
+        _ => 9,
+    }
+}
+
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -151,13 +162,19 @@ fn from_unix(since_unix: u64, now: Instant, now_unix: u64) -> Option<Instant> {
 
 #[derive(Clone, Debug)]
 pub struct FundingSpendPlan {
-    spent_indices: Vec<usize>,
+    /// The transaction this plan built, which is what its funded outpoints
+    /// are named after.
+    txid: String,
     /// `None` when the change was dust and went to the fee instead, so
     /// there is no change output to track (CS-452).
     change_entry: Option<UtxoEntry>,
-    /// The inputs this plan spends, by outpoint, so they can be reserved when
-    /// the broadcast outcome is unknown. Indices address the UTXO list this
-    /// plan was built against and do not survive a refresh; outpoints do.
+    /// The inputs this plan spends, by outpoint.
+    ///
+    /// By outpoint and never by position. Positions address the cache as it
+    /// was when the plan was made, and a concurrent request's commit
+    /// reshuffles it -- removing its inputs, adding its change, re-sorting --
+    /// so a position taken before that points at a different UTXO after it
+    /// (CS-473).
     spent_outpoints: Vec<UtxoEntry>,
 }
 
@@ -178,11 +195,11 @@ pub struct FundRequest {
 
 impl FundRequest {
     /// Total bytes of all output locking scripts, for fee estimation.
-    fn output_script_bytes(&self) -> u64 {
+    fn script_lengths(&self) -> Vec<u64> {
         self.locking_scripts
             .iter()
             .map(|script| script.len() as u64)
-            .sum()
+            .collect()
     }
 
     /// Script for the `index`-th outpoint, falling back to the last one if the
@@ -229,6 +246,27 @@ pub struct Client {
     /// spend its own change without waiting for the chain to confirm what the
     /// service already knows it sent.
     pending_change: HashMap<OutPointKey, PendingChange>,
+    /// Transactions whose outpoints have been handed to a caller within the
+    /// reservation window, by txid (CS-474).
+    ///
+    /// Two callers given the same transaction are given the same outpoints,
+    /// and only one of them owns them. That happened silently: concurrent
+    /// requests with identical parameters built byte-identical transactions,
+    /// and the upstream answers a transaction it already holds with success.
+    /// Claiming inputs at planning (CS-473) removed the cause; this makes any
+    /// recurrence an error rather than a second 200.
+    handed_out: HashMap<String, Instant>,
+    /// The change each claimed but uncommitted plan will return, by txid
+    /// (CS-475).
+    ///
+    /// What separates "every UTXO is in flight" from "the wallet is short":
+    /// a request refused now, which this change would let through, only has
+    /// to wait for the requests ahead of it. It is a lower bound on what comes
+    /// back whichever way their broadcasts go -- a success returns this
+    /// change, a refusal returns the whole input, which is more -- so a
+    /// request judged fundable on it will be. A plan whose change went to the
+    /// fee returns nothing if it succeeds, so it is not recorded.
+    in_flight_change: HashMap<String, PendingChange>,
 }
 
 impl Client {
@@ -253,6 +291,8 @@ impl Client {
             chain_state_at: None,
             reserved: HashMap::new(),
             pending_change: HashMap::new(),
+            handed_out: HashMap::new(),
+            in_flight_change: HashMap::new(),
             fee_satoshis_per_kb: DEFAULT_SATOSHIS_PER_KB,
         })
     }
@@ -431,6 +471,15 @@ impl Client {
         self.reserved.len()
     }
 
+    /// Age every handed-out transaction by `by`, so a test can reach the end
+    /// of its window without waiting for it.
+    #[cfg(test)]
+    fn backdate_handed_out(&mut self, by: Duration) {
+        for since in self.handed_out.values_mut() {
+            *since -= by;
+        }
+    }
+
     /// Age every reservation by `by`, so a test can reach the expiry without
     /// waiting for it.
     #[cfg(test)]
@@ -500,17 +549,17 @@ impl Client {
         self.unspent.iter().map(|utxo| utxo.value).sum()
     }
 
-    /// Estimate the fee for a transaction whose output locking scripts total
-    /// `output_script_bytes`.
+    /// Estimate the fee for a transaction paying one output to each of
+    /// `funded_scripts` -- given as their lengths -- plus change.
     ///
-    /// Taking a total rather than a length and a count means scripts of
-    /// differing sizes are costed correctly, instead of assuming they are all
-    /// the same size as the first.
-    fn estimate_fee(&self, output_script_bytes: u64, no_of_inputs: u32) -> u64 {
-        const TX_OVERHEAD_BYTES: u64 = 10;
-        let output_bytes = output_script_bytes + Self::CHANGE_OUTPUT_BYTES;
-        let tx_bytes =
-            TX_OVERHEAD_BYTES + Self::INPUT_BYTES * no_of_inputs.max(1) as u64 + output_bytes;
+    /// Takes the scripts rather than a byte total so the caller cannot get
+    /// the serialisation wrong: every output is an 8-byte value, a length
+    /// prefix and the script, and counting only the script is what left each
+    /// funded output 9 bytes short and the service paying under the rate it
+    /// was configured with (CS-471). Scripts of differing sizes are costed
+    /// individually rather than assumed to match the first.
+    fn estimate_fee(&self, funded_scripts: &[u64], no_of_inputs: u32) -> u64 {
+        let tx_bytes = Self::funding_tx_bytes(funded_scripts, no_of_inputs);
         // Rounded up: rounding down would underpay, and a transaction a miner
         // will not relay costs far more to discover than the satoshi saved.
         tx_bytes
@@ -524,7 +573,37 @@ impl Client {
         self.fee_satoshis_per_kb
     }
 
-    /// Bytes a change output adds to the transaction that creates it.
+    /// Serialised size of a funding transaction: `no_of_inputs` P2PKH inputs,
+    /// one output per script in `funded_scripts`, and a change output.
+    ///
+    /// An upper bound, not an average. Every input is costed at the most a
+    /// low-S signature can take, and change is always counted though dust
+    /// change is left out -- so a real transaction is never larger than this,
+    /// and the fee on it never falls below the rate.
+    fn funding_tx_bytes(funded_scripts: &[u64], no_of_inputs: u32) -> u64 {
+        const VERSION_AND_LOCKTIME_BYTES: u64 = 8;
+        let inputs = no_of_inputs.max(1) as u64;
+        let outputs = funded_scripts.len() as u64 + 1;
+        let funded_output_bytes: u64 = funded_scripts
+            .iter()
+            .map(|&script| Self::output_bytes(script))
+            .sum();
+        VERSION_AND_LOCKTIME_BYTES
+            + varint_bytes(inputs)
+            + Self::INPUT_BYTES * inputs
+            + varint_bytes(outputs)
+            + funded_output_bytes
+            + Self::CHANGE_OUTPUT_BYTES
+    }
+
+    /// Serialised size of an output paying to a script of `script_bytes`: an
+    /// 8-byte value, the script's length prefix, then the script.
+    fn output_bytes(script_bytes: u64) -> u64 {
+        8 + varint_bytes(script_bytes) + script_bytes
+    }
+
+    /// Bytes a change output adds to the transaction that creates it: a P2PKH
+    /// output, which is [`Self::output_bytes`] of a 25-byte script.
     const CHANGE_OUTPUT_BYTES: u64 = 34;
 
     /// Bytes an input adds to the transaction that spends it.
@@ -615,13 +694,13 @@ impl Client {
             // cost each separately rather than multiplying one estimate.
             (0..fund_request.no_of_outpoints as usize)
                 .map(|index| {
-                    let bytes = fund_request.script_at(index).len() as u64;
-                    fund_request.satoshi + self.estimate_fee(bytes, 1)
+                    let script = fund_request.script_at(index).len() as u64;
+                    fund_request.satoshi + self.estimate_fee(&[script], 1)
                 })
                 .sum()
         } else {
             fund_request.satoshi * fund_request.no_of_outpoints as u64
-                + self.estimate_fee(fund_request.output_script_bytes(), no_of_inputs)
+                + self.estimate_fee(&fund_request.script_lengths(), no_of_inputs)
         }
     }
 
@@ -639,7 +718,7 @@ impl Client {
     /// usually well under `confirmed + unconfirmed`, and a caller that
     /// subtracts a guessed fee will guess wrong.
     pub fn max_fundable_p2pkh(&self) -> i64 {
-        self.max_fundable(Self::P2PKH_SCRIPT_BYTES)
+        self.max_fundable(&[Self::P2PKH_SCRIPT_BYTES])
     }
 
     /// The largest amount a single funding transaction can pay out, given the
@@ -664,7 +743,7 @@ impl Client {
     /// reported: the wallet was drained to a balance it could not spend.
     ///
     /// Returns 0 rather than a negative number when nothing can be funded.
-    fn max_fundable(&self, output_script_bytes: u64) -> i64 {
+    fn max_fundable(&self, funded_scripts: &[u64]) -> i64 {
         let mut values: Vec<i64> = self.unspent.iter().map(|utxo| utxo.value).collect();
         values.sort_unstable_by(|a, b| b.cmp(a));
 
@@ -672,7 +751,7 @@ impl Client {
         let mut best = 0i64;
         for (index, value) in values.iter().enumerate() {
             running += value;
-            let fee = self.estimate_fee(output_script_bytes, index as u32 + 1) as i64;
+            let fee = self.estimate_fee(funded_scripts, index as u32 + 1) as i64;
             best = best.max(running - fee);
         }
         best.max(0)
@@ -686,9 +765,9 @@ impl Client {
     /// wallet does not hold enough" from "it holds enough but not in a shape
     /// that can be spent", which are the two things a caller can act on and
     /// which need different actions -- top up, or consolidate.
-    fn max_fundable_if_consolidated(&self, output_script_bytes: u64) -> i64 {
+    fn max_fundable_if_consolidated(&self, funded_scripts: &[u64]) -> i64 {
         let total = self.total_unspent();
-        let fee = self.estimate_fee(output_script_bytes, 1) as i64;
+        let fee = self.estimate_fee(funded_scripts, 1) as i64;
         (total - fee).max(0)
     }
 
@@ -784,20 +863,16 @@ impl Client {
         Ok(())
     }
 
-    fn spend_utxos(&mut self, spent_indices: &[usize], change_entry: Option<UtxoEntry>) {
-        let spent: std::collections::HashSet<usize> = spent_indices.iter().copied().collect();
-        self.unspent = self
-            .unspent
-            .iter()
-            .enumerate()
-            .filter_map(|(index, utxo)| {
-                if spent.contains(&index) {
-                    None
-                } else {
-                    Some(utxo.clone())
-                }
-            })
-            .collect();
+    /// Take `spent` out of the cache, by outpoint, and add `change_entry`.
+    ///
+    /// Idempotent in `spent`: removing an outpoint already gone is a no-op,
+    /// which is what lets a commit follow a claim that has already taken the
+    /// inputs out.
+    fn remove_spent(&mut self, spent: &[UtxoEntry], change_entry: Option<UtxoEntry>) {
+        let spent: std::collections::HashSet<OutPointKey> =
+            spent.iter().map(outpoint_key).collect();
+        self.unspent
+            .retain(|utxo| !spent.contains(&outpoint_key(utxo)));
         // No entry when the change was dust and went to the fee (CS-452).
         if let Some(change_entry) = change_entry {
             self.unspent.push(change_entry);
@@ -811,7 +886,53 @@ impl Client {
     /// many inputs as it needs, or one transaction per outpoint each spending
     /// a single input -- so they are judged separately rather than through one
     /// estimate that suits neither.
+    ///
+    /// A refusal that the change of requests still broadcasting would lift is
+    /// reported as [`ErrorCode::FundsInFlight`] instead (CS-475): the caller
+    /// only has to wait, where the other codes need an operator to act. One it
+    /// would not lift is judged as the wallet will stand once they settle.
     pub fn funding_balance_error(&self, fund_request: &FundRequest) -> Option<CodedError> {
+        let error = self.funding_balance_error_now(fund_request)?;
+
+        let now = Instant::now();
+        let returning: Vec<UtxoEntry> = self
+            .in_flight_change
+            .values()
+            .filter(|claim| now.duration_since(claim.since) < UNCERTAIN_SPEND_RESERVATION)
+            .map(|claim| claim.entry.clone())
+            .collect();
+        if returning.is_empty() {
+            return Some(error);
+        }
+
+        // Judged by the same rules as the refusal, against the cache as it
+        // will be once the claims ahead of this request are settled. A clone
+        // rather than a second set of checks over a borrowed UTXO list, so the
+        // two verdicts cannot drift apart; it is taken only on this path.
+        let returning_satoshi: i64 = returning.iter().map(|entry| entry.value).sum();
+        let requests = returning.len();
+        let mut settled = self.clone();
+        settled.unspent.extend(returning);
+        // Still refused once everything in flight has settled: the wallet
+        // really is short, and the settled verdict is the one to act on. The
+        // unsettled one can be "no UTXOs available" for a wallet whose UTXOs
+        // are merely all claimed, which is the confusion CS-475 is about.
+        if let Some(settled_error) = settled.funding_balance_error_now(fund_request) {
+            return Some(settled_error);
+        }
+        Some(CodedError::new(
+            ErrorCode::FundsInFlight,
+            format!(
+                "This client's funds are held by {requests} funding request(s) still being \
+                 broadcast. The {returning_satoshi} satoshi of change they return when they \
+                 complete covers this request, so retry shortly; nothing needs topping up."
+            ),
+        ))
+    }
+
+    /// Whether the cache as it stands, with nothing in flight counted, can
+    /// fund the request.
+    fn funding_balance_error_now(&self, fund_request: &FundRequest) -> Option<CodedError> {
         if self.unspent.is_empty() {
             return Some(CodedError::new(
                 ErrorCode::NoSuitableUtxo,
@@ -835,7 +956,7 @@ impl Client {
     fn single_tx_funding_error(&self, fund_request: &FundRequest) -> Option<CodedError> {
         // What the caller is asking the transaction to pay out, change aside.
         let requested = (fund_request.satoshi * fund_request.no_of_outpoints as u64) as i64;
-        let script_bytes = fund_request.output_script_bytes();
+        let scripts = fund_request.script_lengths();
         let total_available = self.total_unspent();
 
         // Two ceilings, and the gap between them is the diagnosis. The first
@@ -844,8 +965,8 @@ impl Client {
         // first needs more money. Asking between them needs the same money in
         // fewer pieces. The caller can act on either, and they are different
         // actions.
-        let consolidated_max = self.max_fundable_if_consolidated(script_bytes);
-        let actual_max = self.max_fundable(script_bytes);
+        let consolidated_max = self.max_fundable_if_consolidated(&scripts);
+        let actual_max = self.max_fundable(&scripts);
 
         if requested > consolidated_max {
             return Some(CodedError::new(
@@ -887,7 +1008,7 @@ impl Client {
         let per_tx_cost = (0..fund_request.no_of_outpoints as usize)
             .map(|index| {
                 fund_request.satoshi
-                    + self.estimate_fee(fund_request.script_at(index).len() as u64, 1)
+                    + self.estimate_fee(&[fund_request.script_at(index).len() as u64], 1)
             })
             .max()
             .unwrap_or(fund_request.satoshi);
@@ -937,11 +1058,6 @@ impl Client {
         let sighash_flags = SIGHASH_ALL | SIGHASH_FORKID;
         self.sign_funding_tx_inputs(&mut tx, &[unspent.value], &change_script, sighash_flags)?;
 
-        let index = self
-            .unspent
-            .iter()
-            .position(|x| x == unspent)
-            .ok_or_else(|| "UTXO not found in local cache.".to_string())?;
         let change_entry = self.change_is_worth_paying(change).then(|| UtxoEntry {
             // Just built and not yet broadcast, let alone mined. Recording it
             // as height 0 said "confirmed in block 0" under chain-gang's
@@ -953,10 +1069,11 @@ impl Client {
             value: change,
         });
 
+        let txid = tx.hash().encode();
         Ok((
             tx,
             FundingSpendPlan {
-                spent_indices: vec![index],
+                txid,
                 change_entry,
                 spent_outpoints: vec![unspent.clone()],
             },
@@ -1010,10 +1127,11 @@ impl Client {
             value: change,
         });
 
+        let txid = tx.hash().encode();
         Ok((
             tx,
             FundingSpendPlan {
-                spent_indices: selected_indices.to_vec(),
+                txid,
                 change_entry,
                 spent_outpoints: selected_indices
                     .iter()
@@ -1054,10 +1172,36 @@ impl Client {
     /// -- the transaction carrying it was broadcast -- but it is not on chain
     /// yet either, so a refresh would drop it and leave the client unable to
     /// spend its own change until the chain caught up.
-    pub fn commit_funding_spend(&mut self, plan: FundingSpendPlan) {
+    ///
+    /// Refuses a transaction whose outpoints have already been handed to a
+    /// caller (CS-474). Nothing a correct service does builds the same
+    /// transaction twice -- claiming inputs at planning keeps concurrent
+    /// requests off each other's -- so this is an invariant check. But the
+    /// failure it guards against is silent everywhere else: the upstream
+    /// answers a transaction it already holds with success, so without it a
+    /// second caller would be told it owns outpoints someone else was already
+    /// given, and would find out only when its own transaction failed.
+    pub fn commit_funding_spend(&mut self, plan: FundingSpendPlan) -> Result<(), String> {
+        // Settled either way: committed, its change is in the cache below; if
+        // refused, there is no longer a request in flight to wait for.
+        self.in_flight_change.remove(&plan.txid);
+        self.forget_expired_handed_out();
+        if self.handed_out.contains_key(&plan.txid) {
+            log::error!(
+                "refusing to hand out the outpoints of {} a second time: they already belong to \
+                 another caller. Two funding requests built the same transaction, which should \
+                 be impossible (CS-474).",
+                plan.txid
+            );
+            return Err(format!(
+                "transaction {} was already handed to another caller",
+                plan.txid
+            ));
+        }
         let change_entry = plan.change_entry.clone();
-        self.spend_utxos(&plan.spent_indices, plan.change_entry);
+        self.remove_spent(&plan.spent_outpoints, plan.change_entry);
         let now = Instant::now();
+        self.handed_out.insert(plan.txid, now);
         for entry in plan.spent_outpoints {
             self.reserved.insert(outpoint_key(&entry), now);
         }
@@ -1072,6 +1216,73 @@ impl Client {
                 },
             );
         }
+        Ok(())
+    }
+
+    /// Drop transactions handed out longer ago than the reservation window.
+    ///
+    /// Past it the inputs have been released too, so a transaction built from
+    /// them would be a new one, not a duplicate.
+    fn forget_expired_handed_out(&mut self) {
+        let now = Instant::now();
+        self.handed_out
+            .retain(|_, since| now.duration_since(*since) < UNCERTAIN_SPEND_RESERVATION);
+    }
+
+    /// Take a plan's inputs out of what any other request can select, before
+    /// its transaction is broadcast (CS-473).
+    ///
+    /// A broadcast takes as long as the network does, and a plan used to hold
+    /// nothing while it ran: every request for the client planned against the
+    /// same cache, picked the same smallest suitable UTXO, and all but one of
+    /// the transactions they built were refused as conflicts. Claiming at
+    /// planning time, under the same exclusive section that planned, means a
+    /// concurrent request never sees an input another is spending.
+    ///
+    /// The inputs are reserved as well as removed, so that a refresh while the
+    /// broadcast is in flight does not put them back. A claim is then
+    /// committed ([`Self::commit_funding_spend`]), kept as a reservation when
+    /// the outcome is unknown ([`Self::commit_uncertain_funding_spend`]), or
+    /// given back ([`Self::release_claim`]).
+    pub fn claim_inputs(&mut self, plan: &FundingSpendPlan) {
+        self.remove_spent(&plan.spent_outpoints, None);
+        let now = Instant::now();
+        for entry in &plan.spent_outpoints {
+            self.reserved.insert(outpoint_key(entry), now);
+        }
+        // A claim is normally settled within a broadcast. One never settled --
+        // its request dropped mid-flight -- is forgotten at the same age its
+        // reservation is.
+        self.in_flight_change
+            .retain(|_, claim| now.duration_since(claim.since) < UNCERTAIN_SPEND_RESERVATION);
+        if let Some(change) = &plan.change_entry {
+            self.in_flight_change.insert(
+                plan.txid.clone(),
+                PendingChange {
+                    entry: change.clone(),
+                    since: now,
+                },
+            );
+        }
+    }
+
+    /// Give back a plan's inputs after a broadcast the upstream definitely did
+    /// not take: nothing was spent, so they are spendable again at once.
+    ///
+    /// Put back in the cache now rather than left for the next refresh, which
+    /// may be a whole freshness window away. If the refusal was a conflict --
+    /// the input spent by something outside this service -- the caller marks
+    /// the chain state stale, and the next refresh drops it again.
+    pub fn release_claim(&mut self, plan: &FundingSpendPlan) {
+        self.in_flight_change.remove(&plan.txid);
+        for entry in &plan.spent_outpoints {
+            let key = outpoint_key(entry);
+            self.reserved.remove(&key);
+            if !self.unspent.iter().any(|utxo| outpoint_key(utxo) == key) {
+                self.unspent.push(entry.clone());
+            }
+        }
+        self.unspent.sort_by_key(|utxo| utxo.value);
     }
 
     /// Commit a spend whose transaction may or may not have reached the
@@ -1089,16 +1300,17 @@ impl Client {
     /// only if the transaction landed, and unlike the inputs, wrongly counting
     /// it would have the service try to spend an output that may not exist.
     pub fn commit_uncertain_funding_spend(&mut self, plan: FundingSpendPlan) {
-        let spent: std::collections::HashSet<usize> = plan.spent_indices.iter().copied().collect();
-        self.unspent = self
-            .unspent
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| !spent.contains(index))
-            .map(|(_, utxo)| utxo.clone())
-            .collect();
+        // No longer a request that will settle shortly: its change may never
+        // exist, and its inputs are held for the whole reservation window, so
+        // a request refused behind it is not told to retry in a second.
+        self.in_flight_change.remove(&plan.txid);
+        self.remove_spent(&plan.spent_outpoints, None);
 
         let now = Instant::now();
+        // It may be on the network, so another request building the same
+        // transaction would be a duplicate of it just the same.
+        self.forget_expired_handed_out();
+        self.handed_out.insert(plan.txid.clone(), now);
         for entry in plan.spent_outpoints {
             log::warn!(
                 "reserving outpoint {}:{} for up to {}s: its funding transaction was handed to \
@@ -1115,7 +1327,7 @@ impl Client {
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn create_funding_tx(&mut self, fund_request: &FundRequest) -> Result<Tx, String> {
         let (tx, plan) = self.plan_funding_tx(fund_request)?;
-        self.commit_funding_spend(plan);
+        self.commit_funding_spend(plan)?;
         Ok(tx)
     }
 }
@@ -1157,18 +1369,18 @@ mod tests {
         // Stated before the serialised form below, so that a change of fee
         // rate fails here with a number rather than as a wall of hex.
         //
-        // At 100 sat/KB a one-input, two-output transaction is 217 bytes and
-        // costs 22 satoshi, so the smallest UTXO that can pay 123 and still
-        // leave change is the 240. Its change of 95 clears the 38 that rate
+        // At 100 sat/KB a one-input, two-output transaction is 226 bytes and
+        // costs 23 satoshi, so the smallest UTXO that can pay 123 and still
+        // leave change is the 240. Its change of 94 clears the 38 that rate
         // implies as dust, so it is paid back rather than given away.
         assert_eq!(tx.inputs.len(), 1, "one input suffices at this rate");
         assert_eq!(tx.outputs.len(), 2);
-        assert_eq!(tx.outputs[0].satoshis, 95, "change: 240 - 123 - 22");
+        assert_eq!(tx.outputs[0].satoshis, 94, "change: 240 - 123 - 23");
         assert_eq!(tx.outputs[1].satoshis, 123, "the requested amount");
 
         assert_eq!(
             tx_as_hexstr(&tx).unwrap(),
-            "01000000015e791b771be3af3ed1447d311071a1e15e127c4343a58debcb8e40c1e57272f6000000006a4730440220375ccfd8bac40cbacba5102626d0356fce0c0cccc2ca336825535aea2f4f9d4b02205e2e3bb7997f65eaaa61b64f75bb4d820be301741d312ad7b9c0d10eb42ce83b412103a8ae071ddd8690b94755c7112ca304bcac45c15904cc013f0ad6c2ea0b1019b2ffffffff025f000000000000001976a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac7b000000000000001976a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac00000000"
+            "01000000015e791b771be3af3ed1447d311071a1e15e127c4343a58debcb8e40c1e57272f6000000006a473044022026bc38b2a528e18e009ad4cc30673c9b0ac9a101c4d034342caca6b34d1db84e022053c9aa99d88d47050df5828498c1101d1ece941276c71427850209091bc9bed9412103a8ae071ddd8690b94755c7112ca304bcac45c15904cc013f0ad6c2ea0b1019b2ffffffff025e000000000000001976a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac7b000000000000001976a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac00000000"
         );
     }
 
@@ -1261,7 +1473,7 @@ mod tests {
     fn test_create_funding_tx_consolidates_multiple_utxos() {
         let mut client = test_client_with_utxos(&[300, 300, 300]);
         // 700 exceeds any single UTXO, so all three are needed. (123 would now
-        // be met by one of them: at 100 sat/KB the fee is 22, not 750.)
+        // be met by one of them: at 100 sat/KB the fee is 23, not 750.)
         let tx = client
             .create_funding_tx(&sample_fund_request(700))
             .expect("expected multi-input funding transaction");
@@ -1319,13 +1531,24 @@ mod tests {
     }
 
     #[test]
-    fn sr_fund_010_plan_funding_tx_leaves_utxo_cache_unchanged_until_commit() {
+    fn sr_fund_010_planning_is_pure_and_a_claim_keeps_the_next_plan_off_its_inputs() {
         let mut client = test_client_with_utxos(&[50_000, 40_000]);
         let fund_request = sample_fund_request(1_000);
-        let (_, plan_a) = client.plan_funding_tx(&fund_request).unwrap();
-        let (_, plan_b) = client.plan_funding_tx(&fund_request).unwrap();
-        assert_eq!(plan_a.spent_indices, plan_b.spent_indices);
-        client.commit_funding_spend(plan_a);
+        // Planning alone changes nothing: two plans against the same cache
+        // choose the same input. That is why a plan on its own is not enough
+        // to fund concurrently -- this used to be asserted as the goal.
+        let (_, first) = client.plan_funding_tx(&fund_request).unwrap();
+        let (_, again) = client.plan_funding_tx(&fund_request).unwrap();
+        assert_eq!(first.spent_outpoints, again.spent_outpoints);
+
+        // The claim is what keeps a concurrent plan off them (CS-473).
+        client.claim_inputs(&first);
+        let (_, next) = client.plan_funding_tx(&fund_request).unwrap();
+        assert_ne!(
+            first.spent_outpoints, next.spent_outpoints,
+            "a plan made after a claim picked the claimed input"
+        );
+        client.commit_funding_spend(first).expect("commits");
         assert!(client.plan_funding_tx(&fund_request).is_ok());
     }
 
@@ -1365,11 +1588,11 @@ mod tests {
     #[test]
     fn cs_451_the_fee_follows_the_configured_rate() {
         let script_bytes = Client::P2PKH_SCRIPT_BYTES;
-        // One input, two outputs: 10 + 148 + 25 + 34 = 217 bytes.
-        for (rate, expected) in [(100u64, 22u64), (500, 109), (1000, 217), (50, 11)] {
+        // One input, two outputs: 8 + 1 + 148 + 1 + 34 + 34 = 226 bytes.
+        for (rate, expected) in [(100u64, 23u64), (500, 113), (1000, 226), (50, 12)] {
             let client = client_holding_at_rate(Vec::new(), rate);
             assert_eq!(
-                client.estimate_fee(script_bytes, 1),
+                client.estimate_fee(&[script_bytes], 1),
                 expected,
                 "at {rate} sat/KB"
             );
@@ -1381,17 +1604,17 @@ mod tests {
     /// than the satoshi saved.
     #[test]
     fn cs_451_a_partial_satoshi_rounds_up_rather_than_down() {
-        // 217 bytes at 100 sat/KB is 21.7 satoshi
+        // 226 bytes at 100 sat/KB is 22.6 satoshi
         let client = client_holding_at_rate(Vec::new(), 100);
-        assert_eq!(client.estimate_fee(Client::P2PKH_SCRIPT_BYTES, 1), 22);
+        assert_eq!(client.estimate_fee(&[Client::P2PKH_SCRIPT_BYTES], 1), 23);
 
         // and a rate low enough to make the exact fee a fraction of a satoshi
         // still pays one, not none
         let client = client_holding_at_rate(Vec::new(), 1);
         assert_eq!(
-            client.estimate_fee(Client::P2PKH_SCRIPT_BYTES, 1),
+            client.estimate_fee(&[Client::P2PKH_SCRIPT_BYTES], 1),
             1,
-            "0.217 satoshi rounds to 1, never to 0"
+            "0.226 satoshi rounds to 1, never to 0"
         );
     }
 
@@ -1407,9 +1630,9 @@ mod tests {
             client_holding_at_rate(vec![cs_422_utxo(1, 0, 1000), cs_422_utxo(2, 0, 10)], 100);
         assert_eq!(client.total_unspent(), 1010);
         assert_eq!(
-            client.max_fundable(Client::P2PKH_SCRIPT_BYTES),
-            978,
-            "1000 - 22, leaving the 10 alone rather than paying 15 for it"
+            client.max_fundable(&[Client::P2PKH_SCRIPT_BYTES]),
+            977,
+            "1000 - 23, leaving the 10 alone rather than paying 15 for it"
         );
     }
 
@@ -1440,15 +1663,15 @@ mod tests {
     fn cs_452_funding_the_maximum_leaves_no_dust_output() {
         let mut client = client_holding_at_rate(vec![cs_422_utxo(1, 0, 5_000)], 100);
         let script_bytes = Client::P2PKH_SCRIPT_BYTES;
-        let max = client.max_fundable(script_bytes) as u64;
-        assert_eq!(max, 4_978, "5000 - 22, with nothing held back for change");
+        let max = client.max_fundable(&[script_bytes]) as u64;
+        assert_eq!(max, 4_977, "5000 - 23, with nothing held back for change");
 
         let tx = client
             .create_funding_tx(&cs_422_request(max))
             .expect("the advertised maximum must build");
 
         assert_eq!(tx.outputs.len(), 1, "no change output at all");
-        assert_eq!(tx.outputs[0].satoshis, 4_978);
+        assert_eq!(tx.outputs[0].satoshis, 4_977);
         let after = client.get_balance();
         assert_eq!(
             after.confirmed + after.unconfirmed,
@@ -1461,7 +1684,7 @@ mod tests {
     /// in the transaction, which means the miner takes it as fee.
     #[test]
     fn cs_452_dust_change_goes_to_the_fee_rather_than_an_output() {
-        // 5_030 covers 5_000 plus the 22 fee and leaves 8, under the 38 the
+        // 5_030 covers 5_000 plus the 23 fee and leaves 7, under the 38 the
         // rate implies. It is the only UTXO, so there is nothing better.
         let mut client = client_holding_at_rate(vec![cs_422_utxo(1, 0, 5_030)], 100);
         let tx = client
@@ -1483,7 +1706,7 @@ mod tests {
     /// change to the miner.
     #[test]
     fn cs_452_a_utxo_that_would_leave_dust_is_not_preferred() {
-        // 5_030 leaves 8 of dust; 9_000 leaves 3_978, which is worth an
+        // 5_030 leaves 8 of dust; 9_000 leaves 3_977, which is worth an
         // output. The smaller one would otherwise win, being smallest-first.
         let mut client = client_holding_at_rate(
             vec![cs_422_utxo(1, 0, 5_030), cs_422_utxo(2, 0, 9_000)],
@@ -1494,8 +1717,8 @@ mod tests {
             .expect("fundable");
 
         assert_eq!(tx.outputs.len(), 2, "change is paid back, not given away");
-        assert_eq!(tx.outputs[0].satoshis, 3_978, "9000 - 5000 - 22");
-        assert_eq!(client.get_balance().unconfirmed, 3_978);
+        assert_eq!(tx.outputs[0].satoshis, 3_977, "9000 - 5000 - 23");
+        assert_eq!(client.get_balance().unconfirmed, 3_977);
     }
 
     /// A UTXO covering the cost exactly is fundable again. CS-422 had to
@@ -1503,8 +1726,8 @@ mod tests {
     /// builds one with no change output instead.
     #[test]
     fn cs_452_a_utxo_covering_the_cost_exactly_is_fundable() {
-        let exact =
-            5_000 + client_holding(Vec::new()).estimate_fee(Client::P2PKH_SCRIPT_BYTES, 1) as i64;
+        let exact = 5_000
+            + client_holding(Vec::new()).estimate_fee(&[Client::P2PKH_SCRIPT_BYTES], 1) as i64;
         let mut client = client_holding_at_rate(vec![cs_422_utxo(1, 0, exact)], 100);
 
         let request = cs_422_request(5_000);
@@ -1640,11 +1863,292 @@ mod tests {
         assert_eq!(client.reserved_outpoint_count(), 1);
     }
 
+    // ---- CS-473: concurrent requests must not share an input ----
+
+    /// Two requests planned against the same cache, as concurrent requests
+    /// are, picking different inputs. Committing them in turn must remove the
+    /// input each actually spent. Removing by the position an input held when
+    /// it was planned goes wrong as soon as the first commit reshuffles the
+    /// cache: the second removes whatever now sits there, and the input it
+    /// really spent stays offered to the next request.
+    #[test]
+    fn cs_473_committing_one_plan_after_another_removes_the_inputs_each_spent() {
+        let mut client = client_holding_at_rate(
+            vec![
+                cs_422_utxo(1, 0, 1_000),
+                cs_422_utxo(2, 0, 2_000),
+                cs_422_utxo(3, 0, 3_000),
+            ],
+            100,
+        );
+        // the 2000 is the smallest that covers 1500; the 1000 covers 500
+        let (_, a) = client
+            .plan_funding_tx(&cs_422_request(1_500))
+            .expect("plans");
+        let (_, b) = client.plan_funding_tx(&cs_422_request(500)).expect("plans");
+        client.commit_funding_spend(a).expect("commits");
+        client.commit_funding_spend(b).expect("commits");
+
+        let held: Vec<i64> = client.unspent.iter().map(|u| u.value).collect();
+        assert!(
+            !held.contains(&2_000),
+            "the first plan's input is still offered: {held:?}"
+        );
+        assert!(
+            !held.contains(&1_000),
+            "the second plan's input is still offered: {held:?}"
+        );
+        assert!(
+            held.contains(&3_000),
+            "an input nobody spent was removed: {held:?}"
+        );
+    }
+
+    /// A refresh while a claimed input's broadcast is still in flight: the
+    /// chain has not seen the transaction, so it still reports the input as
+    /// unspent. The claim has to survive that, or the refresh hands the input
+    /// to the next request just as if it had never been claimed.
+    #[test]
+    fn cs_473_a_refresh_during_the_broadcast_does_not_hand_a_claimed_input_back() {
+        let chain = vec![cs_422_utxo(1, 0, 1_000), cs_422_utxo(2, 0, 2_000)];
+        let mut client = client_holding_at_rate(chain.clone(), 100);
+        let (_, claimed) = client.plan_funding_tx(&cs_422_request(500)).expect("plans");
+        client.claim_inputs(&claimed);
+
+        client.apply_chain_state(chain);
+
+        let (_, next) = client.plan_funding_tx(&cs_422_request(500)).expect("plans");
+        assert_ne!(
+            claimed.spent_outpoints, next.spent_outpoints,
+            "the refresh put the claimed input back and the next plan took it"
+        );
+    }
+
+    // ---- CS-474: an outpoint is handed to one caller ----
+
+    /// The same transaction committed twice is refused the second time: its
+    /// outpoints already belong to whoever it was first handed to. Nothing
+    /// correct builds it twice, but the upstream answers a resubmission with
+    /// success, so this is the only place a duplicate could be caught.
+    #[test]
+    fn cs_474_the_same_transaction_is_never_handed_out_twice() {
+        let mut client = client_holding_at_rate(vec![cs_422_utxo(1, 0, 5_000)], 100);
+        let (_, plan) = client.plan_funding_tx(&cs_422_request(10)).expect("plans");
+        client
+            .commit_funding_spend(plan.clone())
+            .expect("handed out once");
+        let refused = client.commit_funding_spend(plan).expect_err("not twice");
+        assert!(
+            refused.contains("already handed to another caller"),
+            "{refused}"
+        );
+    }
+
+    /// A transaction whose outcome was unknown may be on the network, so it
+    /// counts as handed out too.
+    #[test]
+    fn cs_474_an_uncertain_transaction_counts_as_handed_out() {
+        let mut client = client_holding_at_rate(vec![cs_422_utxo(1, 0, 5_000)], 100);
+        let (_, plan) = client.plan_funding_tx(&cs_422_request(10)).expect("plans");
+        client.commit_uncertain_funding_spend(plan.clone());
+        assert!(client.commit_funding_spend(plan).is_err());
+    }
+
+    /// Past the reservation window the inputs have been released as well, so
+    /// the record goes with them rather than growing without bound.
+    #[test]
+    fn cs_474_the_record_of_handed_out_transactions_expires() {
+        let mut client = client_holding_at_rate(vec![cs_422_utxo(1, 0, 5_000)], 100);
+        let (_, plan) = client.plan_funding_tx(&cs_422_request(10)).expect("plans");
+        client
+            .commit_funding_spend(plan.clone())
+            .expect("handed out");
+        client.backdate_handed_out(UNCERTAIN_SPEND_RESERVATION + Duration::from_secs(1));
+        client.forget_expired_handed_out();
+        assert!(client.handed_out.is_empty());
+    }
+
+    // ---- CS-471: the fee is priced on the transaction actually built ----
+
+    /// Serialised size of `tx`, in bytes: what a miner prices.
+    fn serialised_size(tx: &Tx) -> u64 {
+        crate::util::tx_as_hexstr(tx).unwrap().len() as u64 / 2
+    }
+
+    /// Satoshis `tx` pays in fee, given the value of the inputs it spends.
+    fn fee_paid(tx: &Tx, inputs_value: i64) -> i64 {
+        inputs_value - tx.outputs.iter().map(|out| out.satoshis).sum::<i64>()
+    }
+
+    /// The property that matters: a transaction pays at least the configured
+    /// rate on its real serialised size. Checked against the bytes, not
+    /// against the estimate, because the bug was in the estimate.
+    fn assert_pays_the_rate(tx: &Tx, inputs_value: i64, rate: u64) {
+        let size = serialised_size(tx);
+        let floor = (size * rate).div_ceil(1000) as i64;
+        let paid = fee_paid(tx, inputs_value);
+        assert!(
+            paid >= floor,
+            "a {size}-byte transaction pays {paid} satoshi; at {rate} sat/KB it needs {floor} \
+             ({:.1} sat/KB paid)",
+            paid as f64 * 1000.0 / size as f64
+        );
+    }
+
+    /// The ticket's transaction: one P2PKH input, a 100-satoshi output and
+    /// change. 226 bytes, which at 100 sat/KB needs 23 satoshi; the estimate
+    /// counted each funded output as its bare script, came to 217, and paid 22.
+    #[test]
+    fn cs_471_a_standard_funding_transaction_pays_the_rate_on_its_real_size() {
+        let mut client = client_holding_at_rate(vec![cs_422_utxo(1, 0, 9_792_234)], 100);
+        let tx = client
+            .create_funding_tx(&cs_422_request(100))
+            .expect("funds");
+        // The ticket's shape. Its size is 225 or 226: a signature is a byte
+        // longer or shorter depending on what it signs, and the estimate
+        // assumes the longer, so it is an upper bound on either.
+        assert_eq!((tx.inputs.len(), tx.outputs.len()), (1, 2));
+        assert!((225..=226).contains(&serialised_size(&tx)));
+        assert_eq!(
+            Client::funding_tx_bytes(&[Client::P2PKH_SCRIPT_BYTES], 1),
+            226
+        );
+        assert_pays_the_rate(&tx, 9_792_234, 100);
+    }
+
+    /// Every funded output carries its own value and length prefix, so the
+    /// shortfall grew with the number of outpoints.
+    #[test]
+    fn cs_471_several_outpoints_in_one_transaction_pay_the_rate() {
+        let mut client = client_holding_at_rate(vec![cs_422_utxo(1, 0, 1_000_000)], 100);
+        let mut request = cs_422_request(100);
+        request.no_of_outpoints = 5;
+        request.locking_scripts = vec![hex::decode(LOCKING_SCRIPT_HEX).unwrap(); 5];
+        let tx = client.create_funding_tx(&request).expect("funds");
+        assert_eq!(tx.outputs.len(), 6, "five funded outputs and change");
+        assert_pays_the_rate(&tx, 1_000_000, 100);
+    }
+
+    /// And a transaction that has to combine inputs, at a rate high enough
+    /// that a few bytes' error is several satoshi.
+    #[test]
+    fn cs_471_a_consolidating_transaction_pays_the_rate() {
+        let utxos = vec![
+            cs_422_utxo(1, 0, 3_000),
+            cs_422_utxo(2, 0, 3_000),
+            cs_422_utxo(3, 0, 3_000),
+        ];
+        let mut client = client_holding_at_rate(utxos, 1_000);
+        let tx = client
+            .create_funding_tx(&cs_422_request(7_000))
+            .expect("funds");
+        assert_eq!(tx.inputs.len(), 3);
+        assert_pays_the_rate(&tx, 9_000, 1_000);
+    }
+
+    /// Every shape, not one. Outpoint counts, rates and wallet sizes are swept
+    /// so the number of inputs, the number of outputs and the rounding all
+    /// vary, and every transaction built must pay the rate on its real size.
+    #[test]
+    fn cs_471_every_shape_pays_the_rate_on_its_real_size() {
+        for rate in [1u64, 50, 100, 500, 1_000, 5_000] {
+            for outpoints in 1..=4u32 {
+                for utxo_count in 1..=5u8 {
+                    // Equal UTXOs small enough that larger requests need
+                    // several of them, large enough that the request fits.
+                    let each = 40_000i64;
+                    let utxos: Vec<UtxoEntry> = (0..utxo_count)
+                        .map(|seed| cs_422_utxo(seed + 1, 0, each))
+                        .collect();
+                    let total = each * utxo_count as i64;
+                    let mut client = client_holding_at_rate(utxos, rate);
+
+                    let mut request = cs_422_request(((total / 2) / outpoints as i64) as u64);
+                    request.no_of_outpoints = outpoints;
+                    request.locking_scripts =
+                        vec![hex::decode(LOCKING_SCRIPT_HEX).unwrap(); outpoints as usize];
+
+                    let Ok(tx) = client.create_funding_tx(&request) else {
+                        continue;
+                    };
+                    let spent = each * tx.inputs.len() as i64;
+                    assert_pays_the_rate(&tx, spent, rate);
+                    assert!(
+                        serialised_size(&tx)
+                            <= Client::funding_tx_bytes(
+                                &request.script_lengths(),
+                                tx.inputs.len() as u32
+                            ),
+                        "the estimate is an upper bound on the size"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A script of 253 bytes or more needs a three-byte length prefix, not
+    /// one. Rare for a funding output, but a caller chooses the script.
+    #[test]
+    fn cs_471_a_long_locking_script_is_sized_with_its_longer_prefix() {
+        let mut client = client_holding_at_rate(vec![cs_422_utxo(1, 0, 100_000)], 1_000);
+        let mut request = cs_422_request(1_000);
+        // OP_RETURN and 299 bytes of data: a 300-byte script
+        let mut script = vec![0x6a];
+        script.extend(std::iter::repeat_n(0u8, 299));
+        request.locking_scripts = vec![script];
+        let tx = client.create_funding_tx(&request).expect("funds");
+        assert_eq!(Client::output_bytes(300), 8 + 3 + 300);
+        assert_pays_the_rate(&tx, 100_000, 1_000);
+    }
+
+    /// The size arithmetic, prefix by prefix. Tested directly rather than
+    /// through a built transaction: a signature is a byte shorter about half
+    /// the time and the estimate assumes the longer, so across hundreds of
+    /// inputs the estimate is over by more than a hundred bytes -- enough to
+    /// hide a two-byte prefix it forgot entirely.
+    #[test]
+    fn cs_471_the_size_counts_every_length_prefix() {
+        let p2pkh = Client::P2PKH_SCRIPT_BYTES;
+        // one input, one P2PKH output and change: the ticket's 226
+        assert_eq!(Client::funding_tx_bytes(&[p2pkh], 1), 226);
+        // a funded output is its script plus a value and a prefix
+        assert_eq!(Client::output_bytes(p2pkh), 34);
+        // 253 inputs: the count takes three bytes, not one
+        assert_eq!(
+            Client::funding_tx_bytes(&[p2pkh], 253) - Client::funding_tx_bytes(&[p2pkh], 252),
+            Client::INPUT_BYTES + 2
+        );
+        // 253 outputs, change included: likewise
+        assert_eq!(
+            Client::funding_tx_bytes(&[p2pkh; 252], 1) - Client::funding_tx_bytes(&[p2pkh; 251], 1),
+            Client::output_bytes(p2pkh) + 2
+        );
+        // a 253-byte script: its length takes three bytes, not one
+        assert_eq!(Client::output_bytes(253) - Client::output_bytes(252), 1 + 2);
+    }
+
+    /// And a transaction that genuinely has hundreds of inputs still pays the
+    /// rate -- the sanity check, not the discriminating one (see above).
+    #[test]
+    fn cs_471_a_transaction_with_hundreds_of_inputs_pays_the_rate() {
+        let utxos: Vec<UtxoEntry> = (0..260u32)
+            .map(|pos| utxo(&format!("{:064x}", 7), pos, 100, 1_758_719))
+            .collect();
+        let mut client = client_holding_at_rate(utxos, 100);
+        // 85 satoshi of each 100-satoshi input is left after its own fee, so
+        // this needs about 254 of them
+        let tx = client
+            .create_funding_tx(&cs_422_request(21_600))
+            .expect("funds");
+        assert!(tx.inputs.len() > 252, "{} inputs", tx.inputs.len());
+        assert_pays_the_rate(&tx, 100 * tx.inputs.len() as i64, 100);
+    }
+
     /// Reserve the first cached outpoint, as an uncertain broadcast does.
     fn reserve_first(client: &mut Client) -> UtxoEntry {
         let entry = client.unspent[0].clone();
         client.commit_uncertain_funding_spend(FundingSpendPlan {
-            spent_indices: vec![0],
+            txid: "test".to_string(),
             change_entry: Some(utxo("change", 0, 1, 0)),
             spent_outpoints: vec![entry.clone()],
         });
@@ -1732,7 +2236,7 @@ mod tests {
     fn sr_fund_012_an_uncertain_commit_does_not_add_the_change_output() {
         let mut client = client_holding(vec![utxo("aa", 0, 5_000, 100)]);
         client.commit_uncertain_funding_spend(FundingSpendPlan {
-            spent_indices: vec![0],
+            txid: "test".to_string(),
             change_entry: Some(utxo("change", 0, 4_800, 0)),
             spent_outpoints: vec![utxo("aa", 0, 5_000, 100)],
         });
@@ -1750,11 +2254,13 @@ mod tests {
     #[test]
     fn sr_fund_012_a_successful_broadcast_reserves_its_inputs() {
         let mut client = client_holding(vec![utxo("aa", 0, 5_000, 100)]);
-        client.commit_funding_spend(FundingSpendPlan {
-            spent_indices: vec![0],
-            change_entry: Some(utxo("change", 0, 4_800, 0)),
-            spent_outpoints: vec![utxo("aa", 0, 5_000, 100)],
-        });
+        client
+            .commit_funding_spend(FundingSpendPlan {
+                txid: "test".to_string(),
+                change_entry: Some(utxo("change", 0, 4_800, 0)),
+                spent_outpoints: vec![utxo("aa", 0, 5_000, 100)],
+            })
+            .expect("commits");
         assert_eq!(
             client.reserved_outpoint_count(),
             1,
@@ -1762,6 +2268,150 @@ mod tests {
         );
         assert_eq!(client.unspent.len(), 1);
         assert_eq!(client.unspent[0].value, 4_800, "change is spendable");
+    }
+
+    // ---- CS-475: "all in flight" is not "the wallet is short" ----
+
+    /// Claim a plan for `satoshi` against the client, as a request that has
+    /// planned and is now broadcasting holds it.
+    fn claim_one(client: &mut Client, satoshi: u64) -> FundingSpendPlan {
+        let (_, plan) = client
+            .plan_funding_tx(&cs_422_request(satoshi))
+            .expect("plans");
+        client.claim_inputs(&plan);
+        plan
+    }
+
+    /// The ticket's case. The only UTXO is claimed by a request still
+    /// broadcasting, and its change would cover the next one: that request is
+    /// told to wait, not to top up -- and once the first settles, it funds.
+    #[test]
+    fn cs_475_a_request_behind_a_claim_is_told_its_funds_are_in_flight() {
+        let mut client = client_holding_at_rate(vec![cs_422_utxo(1, 0, 5_000)], 100);
+        let first = claim_one(&mut client, 10);
+
+        let refused = client
+            .funding_balance_error(&cs_422_request(10))
+            .expect("nothing is spendable now");
+        assert_eq!(refused.code, ErrorCode::FundsInFlight, "{refused:?}");
+        assert!(
+            refused.description.contains("1 funding request"),
+            "{}",
+            refused.description
+        );
+
+        client.commit_funding_spend(first).expect("commits");
+        assert!(
+            client.funding_balance_error(&cs_422_request(10)).is_none(),
+            "the change has come back"
+        );
+    }
+
+    /// A wallet that could not cover the request even with every claim
+    /// settled is short, and says so. Only a refusal the returning change
+    /// would lift is reported as in flight -- and this one is not reported as
+    /// "no UTXOs available" either, which is all the cache can say while its
+    /// only UTXO is claimed.
+    #[test]
+    fn cs_475_a_wallet_short_even_after_its_claims_settle_is_still_short() {
+        let mut client = client_holding_at_rate(vec![cs_422_utxo(1, 0, 5_000)], 100);
+        claim_one(&mut client, 10);
+        let refused = client
+            .funding_balance_error(&cs_422_request(10_000))
+            .expect("refused");
+        assert_eq!(refused.code, ErrorCode::InsufficientBalance, "{refused:?}");
+    }
+
+    /// A committed claim is settled: its change is in the cache now, and
+    /// counting it as still to come would count it twice. Here the change is
+    /// then spent in turn, and a request the wallet cannot cover must be told
+    /// so rather than told to wait for change it already has.
+    #[test]
+    fn cs_475_a_committed_claim_is_no_longer_in_flight() {
+        let mut client = client_holding_at_rate(vec![cs_422_utxo(1, 0, 5_000)], 100);
+        let first = claim_one(&mut client, 10);
+        client.commit_funding_spend(first).expect("commits");
+        let second = claim_one(&mut client, 4_900);
+        client.commit_funding_spend(second).expect("commits");
+
+        let refused = client
+            .funding_balance_error(&cs_422_request(4_000))
+            .expect("a few dozen satoshi of change is all that is left");
+        assert_eq!(refused.code, ErrorCode::InsufficientBalance, "{refused:?}");
+    }
+
+    /// A claim given back after a refused broadcast has nothing left in
+    /// flight: its input is spendable at once, so the next request funds.
+    #[test]
+    fn cs_475_a_released_claim_is_no_longer_in_flight() {
+        let mut client = client_holding_at_rate(vec![cs_422_utxo(1, 0, 5_000)], 100);
+        let first = claim_one(&mut client, 10);
+        client.release_claim(&first);
+        assert!(client.in_flight_change.is_empty());
+        assert!(client.funding_balance_error(&cs_422_request(10)).is_none());
+    }
+
+    /// An uncertain outcome holds its inputs for the whole reservation window,
+    /// and its change may never exist. A request refused behind it will not
+    /// succeed in a second, so it is not told it will.
+    #[test]
+    fn cs_475_an_uncertain_outcome_is_not_reported_as_in_flight() {
+        let mut client = client_holding_at_rate(vec![cs_422_utxo(1, 0, 5_000)], 100);
+        let first = claim_one(&mut client, 10);
+        client.commit_uncertain_funding_spend(first);
+        let refused = client
+            .funding_balance_error(&cs_422_request(10))
+            .expect("refused");
+        assert_ne!(refused.code, ErrorCode::FundsInFlight, "{refused:?}");
+    }
+
+    /// A claim whose change went to the fee returns nothing if its broadcast
+    /// succeeds, so it cannot promise the next request anything.
+    #[test]
+    fn cs_475_a_claim_with_no_change_promises_nothing() {
+        // 10 and the fee leave less of 60 than the 38 dust threshold
+        let mut client = client_holding_at_rate(vec![cs_422_utxo(1, 0, 60)], 100);
+        let first = claim_one(&mut client, 10);
+        assert!(first.change_entry.is_none(), "the change went to the fee");
+        let refused = client
+            .funding_balance_error(&cs_422_request(10))
+            .expect("refused");
+        assert_eq!(refused.code, ErrorCode::NoSuitableUtxo, "{refused:?}");
+    }
+
+    /// A claim never settled -- its request dropped mid-broadcast -- stops
+    /// counting when its reservation would have expired, rather than telling
+    /// callers to retry for ever.
+    #[test]
+    fn cs_475_a_claim_never_settled_stops_counting() {
+        let mut client = client_holding_at_rate(vec![cs_422_utxo(1, 0, 5_000)], 100);
+        claim_one(&mut client, 10);
+        for claim in client.in_flight_change.values_mut() {
+            claim.since -= UNCERTAIN_SPEND_RESERVATION + Duration::from_secs(1);
+        }
+        let refused = client
+            .funding_balance_error(&cs_422_request(10))
+            .expect("refused");
+        assert_ne!(refused.code, ErrorCode::FundsInFlight, "{refused:?}");
+    }
+
+    /// One transaction per outpoint is judged the same way: each needs a UTXO
+    /// of its own, and the change coming back provides them.
+    #[test]
+    fn cs_475_multiple_transactions_wait_for_funds_in_flight_too() {
+        let mut client = client_holding_at_rate(
+            vec![cs_422_utxo(1, 0, 5_000), cs_422_utxo(2, 0, 5_000)],
+            100,
+        );
+        claim_one(&mut client, 10);
+        claim_one(&mut client, 10);
+        let request = FundRequest {
+            no_of_outpoints: 2,
+            multiple_tx: true,
+            ..cs_422_request(10)
+        };
+        let refused = client.funding_balance_error(&request).expect("refused");
+        assert_eq!(refused.code, ErrorCode::FundsInFlight, "{refused:?}");
     }
 
     // ---- CS-426: the same outpoint handed out more than once ----
@@ -1984,8 +2634,8 @@ mod tests {
         let script_bytes = hex::decode(LOCKING_SCRIPT_HEX).unwrap().len() as u64;
 
         assert_eq!(client.total_unspent(), 1230);
-        assert_eq!(client.max_fundable(script_bytes), 1119);
-        assert_eq!(client.max_fundable_if_consolidated(script_bytes), 1208);
+        assert_eq!(client.max_fundable(&[script_bytes]), 1118);
+        assert_eq!(client.max_fundable_if_consolidated(&[script_bytes]), 1207);
     }
 
     /// The report's first complaint: asking for 480 was refused as
@@ -1996,11 +2646,11 @@ mod tests {
     #[test]
     fn cs_422_insufficient_balance_reports_what_can_actually_be_paid_out() {
         let error = cs_422_wallet()
-            .funding_balance_error(&cs_422_request(1209))
-            .expect("1209 is beyond this wallet");
+            .funding_balance_error(&cs_422_request(1208))
+            .expect("1208 is beyond this wallet");
         assert_eq!(error.code, ErrorCode::InsufficientBalance);
         assert!(
-            error.description.contains("1209 satoshi requested"),
+            error.description.contains("1208 satoshi requested"),
             "{}",
             error.description
         );
@@ -2010,7 +2660,7 @@ mod tests {
             error.description
         );
         assert!(
-            error.description.contains("at most 1208"),
+            error.description.contains("at most 1207"),
             "{}",
             error.description
         );
@@ -2025,7 +2675,7 @@ mod tests {
     /// The report's second complaint: asking for *less* produced a *larger*
     /// requirement, more than the balance, because the figure quoted was the
     /// cost of spending every UTXO rather than what the wallet can achieve.
-    /// Here that discredited figure would be 1150 + 111 = 1261, against a
+    /// Here that discredited figure would be 1150 + 112 = 1262, against a
     /// balance of 1230.
     #[test]
     fn cs_422_no_suitable_utxo_does_not_quote_a_cost_nobody_would_pay() {
@@ -2034,7 +2684,7 @@ mod tests {
             .expect("1150 is beyond this UTXO set as it stands");
         assert_eq!(error.code, ErrorCode::NoSuitableUtxo);
         assert!(
-            error.description.contains("at most 1119"),
+            error.description.contains("at most 1118"),
             "{}",
             error.description
         );
@@ -2044,37 +2694,37 @@ mod tests {
             error.description
         );
         assert!(
-            !error.description.contains("1261"),
+            !error.description.contains("1262"),
             "the all-inputs cost is not a requirement: {}",
             error.description
         );
     }
 
     /// The two codes now mean different things, and the boundary between them
-    /// is the point where consolidating would stop helping. Up to 1119 the
-    /// wallet funds as it is; between 1120 and 1208 it could fund only if it
-    /// were consolidated; above 1208 no arrangement is enough.
+    /// is the point where consolidating would stop helping. Up to 1118 the
+    /// wallet funds as it is; between 1119 and 1207 it could fund only if it
+    /// were consolidated; above 1207 no arrangement is enough.
     #[test]
     fn cs_422_the_two_codes_split_at_the_point_consolidating_stops_helping() {
         let client = cs_422_wallet();
 
         assert!(client
-            .funding_balance_error(&cs_422_request(1119))
+            .funding_balance_error(&cs_422_request(1118))
             .is_none());
 
         let shape = client
-            .funding_balance_error(&cs_422_request(1120))
-            .expect("1120 needs consolidating");
+            .funding_balance_error(&cs_422_request(1119))
+            .expect("1119 needs consolidating");
         assert_eq!(shape.code, ErrorCode::NoSuitableUtxo);
 
         let shape = client
-            .funding_balance_error(&cs_422_request(1208))
-            .expect("1208 needs consolidating");
+            .funding_balance_error(&cs_422_request(1207))
+            .expect("1207 needs consolidating");
         assert_eq!(shape.code, ErrorCode::NoSuitableUtxo);
 
         let balance = client
-            .funding_balance_error(&cs_422_request(1209))
-            .expect("1209 needs more money");
+            .funding_balance_error(&cs_422_request(1208))
+            .expect("1208 needs more money");
         assert_eq!(balance.code, ErrorCode::InsufficientBalance);
     }
 
@@ -2085,7 +2735,7 @@ mod tests {
     fn cs_422_the_reported_maximum_can_actually_be_funded() {
         let mut client = cs_422_wallet();
         let script_bytes = hex::decode(LOCKING_SCRIPT_HEX).unwrap().len() as u64;
-        let max = client.max_fundable(script_bytes) as u64;
+        let max = client.max_fundable(&[script_bytes]) as u64;
 
         let request = cs_422_request(max);
         assert!(
@@ -2142,7 +2792,7 @@ mod tests {
         let script_bytes = hex::decode(LOCKING_SCRIPT_HEX).unwrap().len() as u64;
         // an empty wallet, only to cost the transaction at the same rate the
         // wallet under test uses
-        let exact = 123 + client_holding(Vec::new()).estimate_fee(script_bytes, 1) as i64;
+        let exact = 123 + client_holding(Vec::new()).estimate_fee(&[script_bytes], 1) as i64;
         let mut client = client_holding(vec![cs_422_utxo(9, 0, exact)]);
 
         let request = cs_422_request(123);
@@ -2176,7 +2826,7 @@ mod tests {
         let script_bytes = hex::decode(LOCKING_SCRIPT_HEX).unwrap().len() as u64;
 
         assert!(
-            client.max_fundable(script_bytes) > 400,
+            client.max_fundable(&[script_bytes]) > 400,
             "the unconfirmed 900 is counted towards what can be funded"
         );
         let request = cs_422_request(500);
@@ -2242,11 +2892,11 @@ mod tests {
             .expect("funds");
 
         // At 100 sat/KB a single input covers it: the 480 is the smallest
-        // UTXO above 300 + 22 of fee, so it alone is spent and 158 comes back
+        // UTXO above 300 + 23 of fee, so it alone is spent and 157 comes back
         // as change. The other six are untouched and still confirmed.
         let after = client.get_balance();
         assert_eq!(
-            after.unconfirmed, 158,
+            after.unconfirmed, 157,
             "the change output should be counted as unconfirmed: {after:?}"
         );
         assert_eq!(

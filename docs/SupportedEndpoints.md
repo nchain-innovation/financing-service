@@ -105,7 +105,7 @@ curl http://127.0.0.1:8080/status
 
 ```json
 {
-    "version": "4.3.1",
+    "version": "4.4.0",
     "blockchain_status": "Connected",
     "blockchain_update_time": "2024-11-05 14:42:29",
     "broadcaster": "woc"
@@ -210,7 +210,7 @@ The first call reserves the key and, once the transaction is broadcast, retains 
 | Same key, same request, already funded | Replays the first response with `"replayed": true`; nothing is broadcast |
 | Same key, still being processed | `422` `key_in_progress` — retry shortly |
 | Same key, materially different request | `422` `idempotency_key_reused` — use a fresh `idempotency_key` |
-| Refused before anything was built (`insufficient_balance`, `no_suitable_utxo`) | The key is freed, so it can be retried |
+| Refused before anything was built (`insufficient_balance`, `no_suitable_utxo`, `funds_in_flight`) | The key is freed, so it can be retried |
 
 **A replayed response is marked.** It carries `"replayed": true`; an ordinary funding response omits the field entirely, so read its absence as false.
 
@@ -248,6 +248,7 @@ The status is derived from the code, so a caller that cannot read the body — a
 |---|---|---|---|
 | `insufficient_balance` | 409 | The balance cannot cover the request once fees are paid, however the UTXOs were arranged | Top the wallet up; the description gives the ceiling |
 | `no_suitable_utxo` | 409 | The balance would cover it, but not split the way it is — spending the extra UTXOs costs more in fees than they add | Consolidate the wallet's UTXOs; the description gives both limits |
+| `funds_in_flight` | 503 | Every UTXO that could fund the request is claimed by funding requests still being broadcast, and the change they return will cover it | **Retry unchanged** after `Retry-After` (1 second) — see below |
 | `unknown_client` | 404 / 400 | No such `client_id`. 404 where the id is a path segment, 400 where it is a body field | Fix configuration; never retryable as-is |
 | `client_exists` | 409 | `client_id` is already configured | `POST /client` only |
 | `invalid_request` | 400 | The request is malformed | Fix the request; never retryable unchanged |
@@ -261,6 +262,16 @@ The status is derived from the code, so a caller that cannot read the body — a
 | `rate_limited` | 429 | Request rate exceeded | Retry after the interval in `description` |
 | `key_in_progress` | 409 | A request with this `idempotency_key` is still being processed | Retry shortly |
 | `idempotency_key_reused` | 409 | This `idempotency_key` was used with a different request | Use a fresh `idempotency_key` |
+
+### When the funds are in flight
+
+Under concurrent load for one client, each request claims the UTXOs it spends while it plans, so no two in-flight requests can spend the same input. A request that arrives while every UTXO it could use is claimed by requests still broadcasting has nothing to spend *now* — but nothing is wrong with the wallet. It is refused with `funds_in_flight`, before anything reaches the network, with HTTP 503 and `Retry-After: 1`.
+
+The service answers it only when the request **will** fund once the claims ahead of it settle. It counts, for each claim, the change it returns: a broadcast that succeeds returns that change, and one that is refused returns its whole input, which is more. So a retry succeeds unless new requests take the funds first. A client funded from a single UTXO, chaining through its own change, funds one request at a time and sees this code for the rest.
+
+A request the wallet could not cover even then gets `insufficient_balance` or `no_suitable_utxo`, judged as the wallet will stand once the claims settle — those still mean an operator has to act. A funding transaction whose outcome is unknown does not count as in flight: it holds its inputs for the whole reservation window, so a retry a second later would not succeed.
+
+The `idempotency_key` is released, so the retry can reuse it.
 
 ### When the transaction is refused
 

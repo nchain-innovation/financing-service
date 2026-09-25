@@ -466,6 +466,51 @@ impl TxBroadcaster for UncertainBroadcaster {
     }
 }
 
+/// Accepts every transaction, but only after a pause, recording the inputs
+/// each one spends.
+///
+/// The pause is the point: it is how long a real broadcast keeps a request
+/// between planning and committing, which is the window in which concurrent
+/// requests for one client could pick the same input (CS-473).
+pub struct SlowRecordingBroadcaster {
+    delay: std::time::Duration,
+    spent: std::sync::Mutex<Vec<(String, u32)>>,
+}
+
+impl SlowRecordingBroadcaster {
+    pub fn new(delay: std::time::Duration) -> Arc<Self> {
+        Arc::new(Self {
+            delay,
+            spent: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Every input of every transaction broadcast, as `(txid, vout)`.
+    pub fn spent_inputs(&self) -> Vec<(String, u32)> {
+        self.spent.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl TxBroadcaster for SlowRecordingBroadcaster {
+    fn name(&self) -> &str {
+        "slow"
+    }
+
+    async fn broadcast_tx(&self, tx: &Tx) -> Result<String, BroadcastError> {
+        tokio::time::sleep(self.delay).await;
+        let mut spent = self.spent.lock().unwrap();
+        for input in &tx.inputs {
+            spent.push((input.prev_output.hash.encode(), input.prev_output.index));
+        }
+        Ok(tx.hash().encode())
+    }
+
+    async fn health_check(&self) -> Result<(), BroadcastError> {
+        Ok(())
+    }
+}
+
 /// Stands in for the mapi-lite broadcaster above the HTTP layer.
 ///
 /// It carries the mapi-lite name, so the service treats it as mapi-lite --

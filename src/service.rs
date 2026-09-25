@@ -1001,16 +1001,42 @@ impl Service {
         guard.funding_balance_error(fund_request)
     }
 
-    /// Build and sign a funding transaction without updating the local UTXO cache.
+    /// Build and sign a funding transaction, and claim its inputs so that no
+    /// concurrent request for the same client can spend them (CS-473).
+    ///
+    /// The balance check, the plan and the claim happen under one write lock,
+    /// held only while they run -- selection, building and signing, no network
+    /// -- and released before the broadcast. Requests for one client therefore
+    /// still overlap on the part that takes time, but no two of them can pick
+    /// the same input: planning used to take a shared lock, so every request
+    /// in flight planned against the same cache and chose the same smallest
+    /// suitable UTXO.
+    ///
+    /// The check is made inside the lock rather than before it, so a request
+    /// cannot pass it, lose its UTXO to a concurrent claim, and then fail to
+    /// plan. It gets the coded error the check gives -- the wallet's funds are
+    /// all in flight -- rather than an internal one.
     pub async fn prepare_funding_outpoints(
         service: &Arc<Service>,
         fund_request: &FundRequest,
-    ) -> Result<(Arc<dyn TxBroadcaster>, PreparedFunding), String> {
+    ) -> Result<(Arc<dyn TxBroadcaster>, PreparedFunding), CodedError> {
         let client = service
             .client_handle(&fund_request.client_id)
             .await
-            .ok_or_else(|| format!("Unknown client_id {}", fund_request.client_id))?;
-        let (tx, spend_plan) = client.read().await.plan_funding_tx(fund_request)?;
+            .ok_or_else(|| {
+                CodedError::internal(format!("Unknown client_id {}", fund_request.client_id))
+            })?;
+        let (tx, spend_plan) = {
+            let mut client = client.write().await;
+            if let Some(error) = client.funding_balance_error(fund_request) {
+                return Err(error);
+            }
+            let (tx, plan) = client
+                .plan_funding_tx(fund_request)
+                .map_err(CodedError::internal)?;
+            client.claim_inputs(&plan);
+            (tx, plan)
+        };
         Ok((
             service.broadcaster(),
             PreparedFunding {
@@ -1033,7 +1059,7 @@ impl Service {
         client
             .write()
             .await
-            .commit_funding_spend(prepared.spend_plan.clone());
+            .commit_funding_spend(prepared.spend_plan.clone())?;
         service.save_inflight_state().await;
         Ok(())
     }
@@ -1042,13 +1068,8 @@ impl Service {
         service: &Arc<Service>,
         fund_request: &FundRequest,
     ) -> Result<FundingResponse, CodedError> {
-        if let Some(error) = service.funding_balance_error(fund_request).await {
-            return Err(error);
-        }
-
-        let (broadcaster, prepared) = Self::prepare_funding_outpoints(service, fund_request)
-            .await
-            .map_err(CodedError::internal)?;
+        let (broadcaster, prepared) =
+            Self::prepare_funding_outpoints(service, fund_request).await?;
         match Self::broadcast_prepared_funding(broadcaster, &prepared).await {
             Ok(response) => {
                 if let Err(description) = Self::commit_prepared_funding(service, &prepared).await {
@@ -1062,6 +1083,8 @@ impl Service {
             Err(error) => {
                 if error.code == ErrorCode::BroadcastOutcomeUnknown {
                     Self::reserve_uncertain_funding(service, &prepared).await;
+                } else {
+                    Self::release_prepared_funding(service, &prepared).await;
                 }
                 // Marked stale rather than refetched. The cache is already
                 // right -- nothing was spent on a refusal, and an uncertain
@@ -1084,6 +1107,15 @@ impl Service {
     /// apply it is logged rather than returned: the caller is already being
     /// told its funding did not complete, and there is nothing it could do
     /// with a second error.
+    /// Give back the inputs a prepared funding claimed, after a broadcast the
+    /// upstream definitely did not take (CS-473). Nothing was spent, so they
+    /// return to the cache at once rather than sitting reserved.
+    async fn release_prepared_funding(service: &Arc<Service>, prepared: &PreparedFunding) {
+        if let Some(client) = service.client_handle(&prepared.client_id).await {
+            client.write().await.release_claim(&prepared.spend_plan);
+        }
+    }
+
     async fn reserve_uncertain_funding(service: &Arc<Service>, prepared: &PreparedFunding) {
         match service.client_handle(&prepared.client_id).await {
             Some(client) => {
@@ -1147,6 +1179,8 @@ impl Service {
                         Err(cause) => {
                             if cause.code == ErrorCode::BroadcastOutcomeUnknown {
                                 Self::reserve_uncertain_funding(service, &prepared).await;
+                            } else {
+                                Self::release_prepared_funding(service, &prepared).await;
                             }
                             if tx_index == 0 {
                                 resync_after_multiple_tx_failure(service, fund_request).await;
@@ -1167,14 +1201,14 @@ impl Service {
                 }
                 Err(cause) => {
                     if tx_index == 0 {
-                        return Err(MultipleTxFundError::complete(ErrorCode::Internal, cause));
+                        return Err(MultipleTxFundError::complete(cause.code, cause.description));
                     }
                     resync_after_multiple_tx_failure(service, fund_request).await;
                     return Err(partial_broadcast_error(
                         tx_index + 1,
                         total,
                         &combined,
-                        cause,
+                        cause.description,
                     ));
                 }
             }
@@ -2228,5 +2262,222 @@ mod tests {
         fund_single_transaction(&service, &sample_fund_request(TEST_CLIENT_ID))
             .await
             .expect("and funds as before");
+    }
+
+    // ---- CS-473: concurrent requests for one client ----
+
+    /// The ticket's load. Requests for one client overlap -- each spends as
+    /// long between planning and committing as its broadcast takes -- and no
+    /// two of the transactions they broadcast may spend the same input. One
+    /// of them would be refused by the network as a conflict.
+    #[tokio::test]
+    async fn cs_473_concurrent_requests_for_one_client_never_share_an_input() {
+        use crate::test_support::SlowRecordingBroadcaster;
+
+        let config = test_config(&unique_dynamic_config_path());
+        let broadcaster = SlowRecordingBroadcaster::new(Duration::from_millis(50));
+        let service = service_with(
+            &config,
+            test_blockchain_interface(&config).await,
+            broadcaster.clone(),
+        )
+        .await;
+        let mut request = sample_fund_request(TEST_CLIENT_ID);
+        request.satoshi = 10;
+
+        let calls: Vec<_> = (0..8)
+            .map(|_| {
+                let service = Arc::clone(&service);
+                let request = request.clone();
+                tokio::spawn(async move { Service::execute_funding(&service, &request).await })
+            })
+            .collect();
+        for call in calls {
+            let _ = call.await.expect("task");
+        }
+
+        let spent = broadcaster.spent_inputs();
+        let mut seen = std::collections::HashSet::new();
+        let reused: Vec<_> = spent.iter().filter(|input| !seen.insert(*input)).collect();
+        assert!(
+            reused.is_empty(),
+            "{} of {} inputs were spent by more than one transaction: {reused:?}",
+            reused.len(),
+            spent.len()
+        );
+    }
+
+    /// A broadcast the upstream definitely refused spent nothing, so the input
+    /// it claimed goes straight back: not reserved, and spendable by the next
+    /// request without waiting for a refresh.
+    #[tokio::test]
+    async fn cs_473_a_refused_broadcast_gives_its_input_back() {
+        use crate::test_support::RejectingBroadcaster;
+
+        let config = test_config(&unique_dynamic_config_path());
+        let service = service_with(
+            &config,
+            test_blockchain_interface(&config).await,
+            RejectingBroadcaster::new(false),
+        )
+        .await;
+        let client = service.client_handle(TEST_CLIENT_ID).await.expect("client");
+        let held_before = client.read().await.inflight_state();
+
+        let refused = Service::execute_funding(&service, &sample_fund_request(TEST_CLIENT_ID))
+            .await
+            .expect_err("the upstream refuses");
+        assert_eq!(refused.code, ErrorCode::BroadcastRejected);
+
+        assert_eq!(
+            client.read().await.reserved_outpoint_count(),
+            0,
+            "nothing left claimed"
+        );
+        assert_eq!(client.read().await.inflight_state(), held_before);
+    }
+
+    /// When one UTXO is all the client has, a second request arriving while
+    /// the first is broadcasting finds nothing to spend. It is told so, with
+    /// a coded error, instead of building a conflicting transaction -- and
+    /// only one transaction ever reaches the network.
+    #[tokio::test]
+    async fn cs_473_contention_for_one_utxo_is_refused_rather_than_conflicted() {
+        use crate::test_support::SlowRecordingBroadcaster;
+
+        let config = test_config(&unique_dynamic_config_path());
+        let broadcaster = SlowRecordingBroadcaster::new(Duration::from_millis(100));
+        let service = service_with(
+            &config,
+            chain_holding(&config, vec![confirmed_utxo(50_000)]).await,
+            broadcaster.clone(),
+        )
+        .await;
+        let mut request = sample_fund_request(TEST_CLIENT_ID);
+        request.satoshi = 10;
+
+        let first = {
+            let (service, request) = (Arc::clone(&service), request.clone());
+            tokio::spawn(async move { Service::execute_funding(&service, &request).await })
+        };
+        // The first has claimed the only UTXO and is still broadcasting
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let second = Service::execute_funding(&service, &request).await;
+
+        assert!(first.await.expect("task").is_ok(), "the first funds");
+        let refused = second.expect_err("the second has nothing to spend");
+        assert_ne!(
+            refused.code,
+            ErrorCode::Internal,
+            "an honest code, not a 500: {refused:?}"
+        );
+        assert_ne!(
+            refused.code,
+            ErrorCode::BroadcastRejected,
+            "refused before the network, not by it"
+        );
+        assert_eq!(
+            broadcaster.spent_inputs().len(),
+            1,
+            "one transaction reached the network"
+        );
+    }
+
+    // ---- CS-474: the service's contract, stated from the caller's side ----
+
+    /// Concurrent identical requests -- the ticket's load -- and no outpoint
+    /// in any successful response may appear in another. Checked on what the
+    /// callers were told, not on what was broadcast: a duplicate used to be a
+    /// 200 to every one of them, with nothing logged.
+    #[tokio::test]
+    async fn cs_474_concurrent_identical_requests_are_never_given_the_same_outpoint() {
+        use crate::test_support::SlowRecordingBroadcaster;
+
+        let config = test_config(&unique_dynamic_config_path());
+        let broadcaster = SlowRecordingBroadcaster::new(Duration::from_millis(50));
+        let service = service_with(
+            &config,
+            test_blockchain_interface(&config).await,
+            broadcaster.clone(),
+        )
+        .await;
+        let mut request = sample_fund_request(TEST_CLIENT_ID);
+        request.satoshi = 10;
+
+        let calls: Vec<_> = (0..10)
+            .map(|_| {
+                let (service, request) = (Arc::clone(&service), request.clone());
+                tokio::spawn(async move { Service::execute_funding(&service, &request).await })
+            })
+            .collect();
+        let mut handed = std::collections::HashMap::new();
+        for call in calls {
+            if let Ok(response) = call.await.expect("task") {
+                for outpoint in &response.outpoints {
+                    *handed
+                        .entry((outpoint.hash.encode(), outpoint.index))
+                        .or_insert(0) += 1;
+                }
+            }
+        }
+        let shared: Vec<_> = handed.iter().filter(|(_, n)| **n > 1).collect();
+        assert!(!handed.is_empty(), "something was funded");
+        assert!(
+            shared.is_empty(),
+            "outpoints given to more than one caller: {shared:?}"
+        );
+    }
+
+    // ---- CS-475: a refusal under load says the funds are in flight ----
+
+    /// The ticket's load against a wallet of three UTXOs. Every request that
+    /// finds them all claimed is refused with `funds_in_flight` -- not with
+    /// the codes that tell an operator to top up or consolidate -- and none
+    /// of the refusals is anything else.
+    #[tokio::test]
+    async fn cs_475_contention_is_reported_as_funds_in_flight() {
+        use crate::test_support::SlowRecordingBroadcaster;
+
+        let config = test_config(&unique_dynamic_config_path());
+        let broadcaster = SlowRecordingBroadcaster::new(Duration::from_millis(100));
+        let chain = vec![
+            confirmed_utxo(50_000),
+            chain_gang::interface::UtxoEntry {
+                tx_pos: 1,
+                ..confirmed_utxo(50_000)
+            },
+            chain_gang::interface::UtxoEntry {
+                tx_pos: 2,
+                ..confirmed_utxo(50_000)
+            },
+        ];
+        let service = service_with(
+            &config,
+            chain_holding(&config, chain).await,
+            broadcaster.clone(),
+        )
+        .await;
+        let mut request = sample_fund_request(TEST_CLIENT_ID);
+        request.satoshi = 10;
+
+        let calls: Vec<_> = (0..8)
+            .map(|_| {
+                let (service, request) = (Arc::clone(&service), request.clone());
+                tokio::spawn(async move { Service::execute_funding(&service, &request).await })
+            })
+            .collect();
+        let mut refusals = Vec::new();
+        for call in calls {
+            if let Err(error) = call.await.expect("task") {
+                refusals.push(error.code);
+            }
+        }
+        assert!(!refusals.is_empty(), "the load outran the wallet");
+        assert!(
+            refusals
+                .iter()
+                .all(|code| *code == ErrorCode::FundsInFlight),
+            "{refusals:?}"
+        );
     }
 }

@@ -50,6 +50,12 @@ export function buildBody() {
 export function classify(res) {
   if (res.status === 200) return 'ok';
   if (res.status === 409) return 'refused';
+  // A 503 that is the wallet, not the service: every UTXO is claimed by
+  // requests still broadcasting (CS-475). It is a 503 so that retry policies
+  // retry it, but for a breakpoint test it is the wallet's shape limiting the
+  // rate -- what no_suitable_utxo meant under load before -- and counting it
+  // as a failure would report the wallet's limit as the service's.
+  if (res.status === 503 && errorCode(res) === 'funds_in_flight') return 'refused';
   if (res.status === 429) return 'throttled';
   if (res.status === 422) return 'partial';
   // 0 is k6's own "no response" -- a timeout or a refused connection. It is a
