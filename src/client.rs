@@ -2336,7 +2336,7 @@ mod tests {
 
         let refused = client
             .funding_balance_error(&cs_422_request(4_000))
-            .expect("46 satoshi of change is all that is left");
+            .expect("a few dozen satoshi of change is all that is left");
         assert_eq!(refused.code, ErrorCode::InsufficientBalance, "{refused:?}");
     }
 
@@ -2369,7 +2369,7 @@ mod tests {
     /// succeeds, so it cannot promise the next request anything.
     #[test]
     fn cs_475_a_claim_with_no_change_promises_nothing() {
-        // 10 + 22 of fee leaves 28 of 60, under the 38 dust threshold
+        // 10 and the fee leave less of 60 than the 38 dust threshold
         let mut client = client_holding_at_rate(vec![cs_422_utxo(1, 0, 60)], 100);
         let first = claim_one(&mut client, 10);
         assert!(first.change_entry.is_none(), "the change went to the fee");
