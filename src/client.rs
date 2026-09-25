@@ -151,13 +151,16 @@ fn from_unix(since_unix: u64, now: Instant, now_unix: u64) -> Option<Instant> {
 
 #[derive(Clone, Debug)]
 pub struct FundingSpendPlan {
-    spent_indices: Vec<usize>,
     /// `None` when the change was dust and went to the fee instead, so
     /// there is no change output to track (CS-452).
     change_entry: Option<UtxoEntry>,
-    /// The inputs this plan spends, by outpoint, so they can be reserved when
-    /// the broadcast outcome is unknown. Indices address the UTXO list this
-    /// plan was built against and do not survive a refresh; outpoints do.
+    /// The inputs this plan spends, by outpoint.
+    ///
+    /// By outpoint and never by position. Positions address the cache as it
+    /// was when the plan was made, and a concurrent request's commit
+    /// reshuffles it -- removing its inputs, adding its change, re-sorting --
+    /// so a position taken before that points at a different UTXO after it
+    /// (CS-473).
     spent_outpoints: Vec<UtxoEntry>,
 }
 
@@ -784,20 +787,16 @@ impl Client {
         Ok(())
     }
 
-    fn spend_utxos(&mut self, spent_indices: &[usize], change_entry: Option<UtxoEntry>) {
-        let spent: std::collections::HashSet<usize> = spent_indices.iter().copied().collect();
-        self.unspent = self
-            .unspent
-            .iter()
-            .enumerate()
-            .filter_map(|(index, utxo)| {
-                if spent.contains(&index) {
-                    None
-                } else {
-                    Some(utxo.clone())
-                }
-            })
-            .collect();
+    /// Take `spent` out of the cache, by outpoint, and add `change_entry`.
+    ///
+    /// Idempotent in `spent`: removing an outpoint already gone is a no-op,
+    /// which is what lets a commit follow a claim that has already taken the
+    /// inputs out.
+    fn remove_spent(&mut self, spent: &[UtxoEntry], change_entry: Option<UtxoEntry>) {
+        let spent: std::collections::HashSet<OutPointKey> =
+            spent.iter().map(outpoint_key).collect();
+        self.unspent
+            .retain(|utxo| !spent.contains(&outpoint_key(utxo)));
         // No entry when the change was dust and went to the fee (CS-452).
         if let Some(change_entry) = change_entry {
             self.unspent.push(change_entry);
@@ -937,11 +936,6 @@ impl Client {
         let sighash_flags = SIGHASH_ALL | SIGHASH_FORKID;
         self.sign_funding_tx_inputs(&mut tx, &[unspent.value], &change_script, sighash_flags)?;
 
-        let index = self
-            .unspent
-            .iter()
-            .position(|x| x == unspent)
-            .ok_or_else(|| "UTXO not found in local cache.".to_string())?;
         let change_entry = self.change_is_worth_paying(change).then(|| UtxoEntry {
             // Just built and not yet broadcast, let alone mined. Recording it
             // as height 0 said "confirmed in block 0" under chain-gang's
@@ -956,7 +950,6 @@ impl Client {
         Ok((
             tx,
             FundingSpendPlan {
-                spent_indices: vec![index],
                 change_entry,
                 spent_outpoints: vec![unspent.clone()],
             },
@@ -1013,7 +1006,6 @@ impl Client {
         Ok((
             tx,
             FundingSpendPlan {
-                spent_indices: selected_indices.to_vec(),
                 change_entry,
                 spent_outpoints: selected_indices
                     .iter()
@@ -1056,7 +1048,7 @@ impl Client {
     /// spend its own change until the chain caught up.
     pub fn commit_funding_spend(&mut self, plan: FundingSpendPlan) {
         let change_entry = plan.change_entry.clone();
-        self.spend_utxos(&plan.spent_indices, plan.change_entry);
+        self.remove_spent(&plan.spent_outpoints, plan.change_entry);
         let now = Instant::now();
         for entry in plan.spent_outpoints {
             self.reserved.insert(outpoint_key(&entry), now);
@@ -1074,6 +1066,47 @@ impl Client {
         }
     }
 
+    /// Take a plan's inputs out of what any other request can select, before
+    /// its transaction is broadcast (CS-473).
+    ///
+    /// A broadcast takes as long as the network does, and a plan used to hold
+    /// nothing while it ran: every request for the client planned against the
+    /// same cache, picked the same smallest suitable UTXO, and all but one of
+    /// the transactions they built were refused as conflicts. Claiming at
+    /// planning time, under the same exclusive section that planned, means a
+    /// concurrent request never sees an input another is spending.
+    ///
+    /// The inputs are reserved as well as removed, so that a refresh while the
+    /// broadcast is in flight does not put them back. A claim is then
+    /// committed ([`Self::commit_funding_spend`]), kept as a reservation when
+    /// the outcome is unknown ([`Self::commit_uncertain_funding_spend`]), or
+    /// given back ([`Self::release_claim`]).
+    pub fn claim_inputs(&mut self, plan: &FundingSpendPlan) {
+        self.remove_spent(&plan.spent_outpoints, None);
+        let now = Instant::now();
+        for entry in &plan.spent_outpoints {
+            self.reserved.insert(outpoint_key(entry), now);
+        }
+    }
+
+    /// Give back a plan's inputs after a broadcast the upstream definitely did
+    /// not take: nothing was spent, so they are spendable again at once.
+    ///
+    /// Put back in the cache now rather than left for the next refresh, which
+    /// may be a whole freshness window away. If the refusal was a conflict --
+    /// the input spent by something outside this service -- the caller marks
+    /// the chain state stale, and the next refresh drops it again.
+    pub fn release_claim(&mut self, plan: &FundingSpendPlan) {
+        for entry in &plan.spent_outpoints {
+            let key = outpoint_key(entry);
+            self.reserved.remove(&key);
+            if !self.unspent.iter().any(|utxo| outpoint_key(utxo) == key) {
+                self.unspent.push(entry.clone());
+            }
+        }
+        self.unspent.sort_by_key(|utxo| utxo.value);
+    }
+
     /// Commit a spend whose transaction may or may not have reached the
     /// network, reserving its inputs so no later refresh offers them again.
     ///
@@ -1089,14 +1122,7 @@ impl Client {
     /// only if the transaction landed, and unlike the inputs, wrongly counting
     /// it would have the service try to spend an output that may not exist.
     pub fn commit_uncertain_funding_spend(&mut self, plan: FundingSpendPlan) {
-        let spent: std::collections::HashSet<usize> = plan.spent_indices.iter().copied().collect();
-        self.unspent = self
-            .unspent
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| !spent.contains(index))
-            .map(|(_, utxo)| utxo.clone())
-            .collect();
+        self.remove_spent(&plan.spent_outpoints, None);
 
         let now = Instant::now();
         for entry in plan.spent_outpoints {
@@ -1319,13 +1345,24 @@ mod tests {
     }
 
     #[test]
-    fn sr_fund_010_plan_funding_tx_leaves_utxo_cache_unchanged_until_commit() {
+    fn sr_fund_010_planning_is_pure_and_a_claim_keeps_the_next_plan_off_its_inputs() {
         let mut client = test_client_with_utxos(&[50_000, 40_000]);
         let fund_request = sample_fund_request(1_000);
-        let (_, plan_a) = client.plan_funding_tx(&fund_request).unwrap();
-        let (_, plan_b) = client.plan_funding_tx(&fund_request).unwrap();
-        assert_eq!(plan_a.spent_indices, plan_b.spent_indices);
-        client.commit_funding_spend(plan_a);
+        // Planning alone changes nothing: two plans against the same cache
+        // choose the same input. That is why a plan on its own is not enough
+        // to fund concurrently -- this used to be asserted as the goal.
+        let (_, first) = client.plan_funding_tx(&fund_request).unwrap();
+        let (_, again) = client.plan_funding_tx(&fund_request).unwrap();
+        assert_eq!(first.spent_outpoints, again.spent_outpoints);
+
+        // The claim is what keeps a concurrent plan off them (CS-473).
+        client.claim_inputs(&first);
+        let (_, next) = client.plan_funding_tx(&fund_request).unwrap();
+        assert_ne!(
+            first.spent_outpoints, next.spent_outpoints,
+            "a plan made after a claim picked the claimed input"
+        );
+        client.commit_funding_spend(first);
         assert!(client.plan_funding_tx(&fund_request).is_ok());
     }
 
@@ -1640,11 +1677,71 @@ mod tests {
         assert_eq!(client.reserved_outpoint_count(), 1);
     }
 
+    // ---- CS-473: concurrent requests must not share an input ----
+
+    /// Two requests planned against the same cache, as concurrent requests
+    /// are, picking different inputs. Committing them in turn must remove the
+    /// input each actually spent. Removing by the position an input held when
+    /// it was planned goes wrong as soon as the first commit reshuffles the
+    /// cache: the second removes whatever now sits there, and the input it
+    /// really spent stays offered to the next request.
+    #[test]
+    fn cs_473_committing_one_plan_after_another_removes_the_inputs_each_spent() {
+        let mut client = client_holding_at_rate(
+            vec![
+                cs_422_utxo(1, 0, 1_000),
+                cs_422_utxo(2, 0, 2_000),
+                cs_422_utxo(3, 0, 3_000),
+            ],
+            100,
+        );
+        // the 2000 is the smallest that covers 1500; the 1000 covers 500
+        let (_, a) = client
+            .plan_funding_tx(&cs_422_request(1_500))
+            .expect("plans");
+        let (_, b) = client.plan_funding_tx(&cs_422_request(500)).expect("plans");
+        client.commit_funding_spend(a);
+        client.commit_funding_spend(b);
+
+        let held: Vec<i64> = client.unspent.iter().map(|u| u.value).collect();
+        assert!(
+            !held.contains(&2_000),
+            "the first plan's input is still offered: {held:?}"
+        );
+        assert!(
+            !held.contains(&1_000),
+            "the second plan's input is still offered: {held:?}"
+        );
+        assert!(
+            held.contains(&3_000),
+            "an input nobody spent was removed: {held:?}"
+        );
+    }
+
+    /// A refresh while a claimed input's broadcast is still in flight: the
+    /// chain has not seen the transaction, so it still reports the input as
+    /// unspent. The claim has to survive that, or the refresh hands the input
+    /// to the next request just as if it had never been claimed.
+    #[test]
+    fn cs_473_a_refresh_during_the_broadcast_does_not_hand_a_claimed_input_back() {
+        let chain = vec![cs_422_utxo(1, 0, 1_000), cs_422_utxo(2, 0, 2_000)];
+        let mut client = client_holding_at_rate(chain.clone(), 100);
+        let (_, claimed) = client.plan_funding_tx(&cs_422_request(500)).expect("plans");
+        client.claim_inputs(&claimed);
+
+        client.apply_chain_state(chain);
+
+        let (_, next) = client.plan_funding_tx(&cs_422_request(500)).expect("plans");
+        assert_ne!(
+            claimed.spent_outpoints, next.spent_outpoints,
+            "the refresh put the claimed input back and the next plan took it"
+        );
+    }
+
     /// Reserve the first cached outpoint, as an uncertain broadcast does.
     fn reserve_first(client: &mut Client) -> UtxoEntry {
         let entry = client.unspent[0].clone();
         client.commit_uncertain_funding_spend(FundingSpendPlan {
-            spent_indices: vec![0],
             change_entry: Some(utxo("change", 0, 1, 0)),
             spent_outpoints: vec![entry.clone()],
         });
@@ -1732,7 +1829,6 @@ mod tests {
     fn sr_fund_012_an_uncertain_commit_does_not_add_the_change_output() {
         let mut client = client_holding(vec![utxo("aa", 0, 5_000, 100)]);
         client.commit_uncertain_funding_spend(FundingSpendPlan {
-            spent_indices: vec![0],
             change_entry: Some(utxo("change", 0, 4_800, 0)),
             spent_outpoints: vec![utxo("aa", 0, 5_000, 100)],
         });
@@ -1751,7 +1847,6 @@ mod tests {
     fn sr_fund_012_a_successful_broadcast_reserves_its_inputs() {
         let mut client = client_holding(vec![utxo("aa", 0, 5_000, 100)]);
         client.commit_funding_spend(FundingSpendPlan {
-            spent_indices: vec![0],
             change_entry: Some(utxo("change", 0, 4_800, 0)),
             spent_outpoints: vec![utxo("aa", 0, 5_000, 100)],
         });

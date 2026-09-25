@@ -248,6 +248,8 @@ The status is derived from the code, so a caller that cannot read the body — a
 |---|---|---|---|
 | `insufficient_balance` | 409 | The balance cannot cover the request once fees are paid, however the UTXOs were arranged | Top the wallet up; the description gives the ceiling |
 | `no_suitable_utxo` | 409 | The balance would cover it, but not split the way it is — spending the extra UTXOs costs more in fees than they add | Consolidate the wallet's UTXOs; the description gives both limits |
+
+**Both of these also mean "all in flight".** Under concurrent load for one client, each request claims the UTXOs it spends while it plans, so no two in-flight requests can spend the same input. A request that arrives while every UTXO is claimed by requests still broadcasting sees none available, and is refused with one of these two codes — before anything reaches the network. The funds are not missing: they come back as change once those requests complete, so **retrying shortly succeeds**. A client funded from a single UTXO, chaining through its own change, funds one request at a time.
 | `unknown_client` | 404 / 400 | No such `client_id`. 404 where the id is a path segment, 400 where it is a body field | Fix configuration; never retryable as-is |
 | `client_exists` | 409 | `client_id` is already configured | `POST /client` only |
 | `invalid_request` | 400 | The request is malformed | Fix the request; never retryable unchanged |
