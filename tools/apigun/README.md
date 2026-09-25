@@ -150,7 +150,7 @@ cargo run 2>&1 | tee fs.log
 
 **A release build logs only `warn` and above.**
 
-`[logging] level = "info"` is enough for both techniques below. At a few
+`[logging] level = "info"` is enough for the techniques below. At a few
 hundred failures a second this file grows quickly, so send it to disk rather
 than a terminal.
 
@@ -199,6 +199,37 @@ every funding transaction touches the client's address.
 A smaller increase is the gap -- fundings the service reported that never
 reached a block.
 
+### 3. Did two callers get the same outpoint?
+
+Concurrent requests can select the same UTXO and, because signing is
+deterministic, build the identical transaction. The second broadcast comes back
+as "already known", which counts as success -- so both callers are handed the
+same outpoints, both are told they succeeded, and nothing is logged as an
+error. The responses are the only place this shows.
+
+With `LOG_OUTPOINTS=true` both scripts print `outpoint=<hash>:<index>` for
+every outpoint returned, replays excluded. Any repeat is two callers holding
+the same output:
+
+```sh
+k6 run -e LOG_OUTPOINTS=true --log-output=file=k6console.log tools/apigun/breakpoint.js
+grep -o "outpoint=[0-9a-f]*:[0-9]*" k6console.log | sort | uniq -d
+```
+
+A single line of output is enough. This is a double spend at the client level,
+and unlike the one in technique 1 it fails silently -- the loser finds out only
+when it tries to spend.
+
+The service log screens for the same thing, since a duplicate outpoint requires
+the same transaction to have been built twice:
+
+```sh
+grep -o "broadcasting funding tx [0-9a-f]\{64\}" fs.log | awk '{print $NF}' | sort | uniq -d
+```
+
+That cannot miss one, but it records attempts rather than outcomes, so a hit
+needs the response check above to confirm it.
+
 ## Environment variables
 
 | Variable | Default | Used by | Meaning |
@@ -212,6 +243,7 @@ reached a block.
 | `LOCKING_SCRIPT` | a throwaway P2PKH | both | Hex locking script; see [docs/LockingScripts.md](../../docs/LockingScripts.md). |
 | `IDEMPOTENCY` | `off` | both | `unique` for a fresh `idempotency_key` per iteration, `replay` to reuse one key for the run. |
 | `TIMEOUT` | `30s` | both | Per-request timeout. |
+| `LOG_OUTPOINTS` | `false` | both | Print `outpoint=<hash>:<index>` per outpoint returned, for the duplicate check. Leave off for a TPS run. |
 | `ITERATIONS` | `5` | smoke | Number of fundings. |
 | `SLEEP` | `1` | smoke | Seconds between iterations. |
 | `RATES` | `1,2,5,10,20` | breakpoint | Request rates (req/s) to hold, in order. |
