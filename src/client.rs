@@ -245,6 +245,17 @@ pub struct Client {
     /// Claiming inputs at planning (CS-473) removed the cause; this makes any
     /// recurrence an error rather than a second 200.
     handed_out: HashMap<String, Instant>,
+    /// The change each claimed but uncommitted plan will return, by txid
+    /// (CS-475).
+    ///
+    /// What separates "every UTXO is in flight" from "the wallet is short":
+    /// a request refused now, which this change would let through, only has
+    /// to wait for the requests ahead of it. It is a lower bound on what comes
+    /// back whichever way their broadcasts go -- a success returns this
+    /// change, a refusal returns the whole input, which is more -- so a
+    /// request judged fundable on it will be. A plan whose change went to the
+    /// fee returns nothing if it succeeds, so it is not recorded.
+    in_flight_change: HashMap<String, PendingChange>,
 }
 
 impl Client {
@@ -270,6 +281,7 @@ impl Client {
             reserved: HashMap::new(),
             pending_change: HashMap::new(),
             handed_out: HashMap::new(),
+            in_flight_change: HashMap::new(),
             fee_satoshis_per_kb: DEFAULT_SATOSHIS_PER_KB,
         })
     }
@@ -833,7 +845,53 @@ impl Client {
     /// many inputs as it needs, or one transaction per outpoint each spending
     /// a single input -- so they are judged separately rather than through one
     /// estimate that suits neither.
+    ///
+    /// A refusal that the change of requests still broadcasting would lift is
+    /// reported as [`ErrorCode::FundsInFlight`] instead (CS-475): the caller
+    /// only has to wait, where the other codes need an operator to act. One it
+    /// would not lift is judged as the wallet will stand once they settle.
     pub fn funding_balance_error(&self, fund_request: &FundRequest) -> Option<CodedError> {
+        let error = self.funding_balance_error_now(fund_request)?;
+
+        let now = Instant::now();
+        let returning: Vec<UtxoEntry> = self
+            .in_flight_change
+            .values()
+            .filter(|claim| now.duration_since(claim.since) < UNCERTAIN_SPEND_RESERVATION)
+            .map(|claim| claim.entry.clone())
+            .collect();
+        if returning.is_empty() {
+            return Some(error);
+        }
+
+        // Judged by the same rules as the refusal, against the cache as it
+        // will be once the claims ahead of this request are settled. A clone
+        // rather than a second set of checks over a borrowed UTXO list, so the
+        // two verdicts cannot drift apart; it is taken only on this path.
+        let returning_satoshi: i64 = returning.iter().map(|entry| entry.value).sum();
+        let requests = returning.len();
+        let mut settled = self.clone();
+        settled.unspent.extend(returning);
+        // Still refused once everything in flight has settled: the wallet
+        // really is short, and the settled verdict is the one to act on. The
+        // unsettled one can be "no UTXOs available" for a wallet whose UTXOs
+        // are merely all claimed, which is the confusion CS-475 is about.
+        if let Some(settled_error) = settled.funding_balance_error_now(fund_request) {
+            return Some(settled_error);
+        }
+        Some(CodedError::new(
+            ErrorCode::FundsInFlight,
+            format!(
+                "This client's funds are held by {requests} funding request(s) still being \
+                 broadcast. The {returning_satoshi} satoshi of change they return when they \
+                 complete covers this request, so retry shortly; nothing needs topping up."
+            ),
+        ))
+    }
+
+    /// Whether the cache as it stands, with nothing in flight counted, can
+    /// fund the request.
+    fn funding_balance_error_now(&self, fund_request: &FundRequest) -> Option<CodedError> {
         if self.unspent.is_empty() {
             return Some(CodedError::new(
                 ErrorCode::NoSuitableUtxo,
@@ -1083,6 +1141,9 @@ impl Client {
     /// second caller would be told it owns outpoints someone else was already
     /// given, and would find out only when its own transaction failed.
     pub fn commit_funding_spend(&mut self, plan: FundingSpendPlan) -> Result<(), String> {
+        // Settled either way: committed, its change is in the cache below; if
+        // refused, there is no longer a request in flight to wait for.
+        self.in_flight_change.remove(&plan.txid);
         self.forget_expired_handed_out();
         if self.handed_out.contains_key(&plan.txid) {
             log::error!(
@@ -1148,6 +1209,20 @@ impl Client {
         for entry in &plan.spent_outpoints {
             self.reserved.insert(outpoint_key(entry), now);
         }
+        // A claim is normally settled within a broadcast. One never settled --
+        // its request dropped mid-flight -- is forgotten at the same age its
+        // reservation is.
+        self.in_flight_change
+            .retain(|_, claim| now.duration_since(claim.since) < UNCERTAIN_SPEND_RESERVATION);
+        if let Some(change) = &plan.change_entry {
+            self.in_flight_change.insert(
+                plan.txid.clone(),
+                PendingChange {
+                    entry: change.clone(),
+                    since: now,
+                },
+            );
+        }
     }
 
     /// Give back a plan's inputs after a broadcast the upstream definitely did
@@ -1158,6 +1233,7 @@ impl Client {
     /// the input spent by something outside this service -- the caller marks
     /// the chain state stale, and the next refresh drops it again.
     pub fn release_claim(&mut self, plan: &FundingSpendPlan) {
+        self.in_flight_change.remove(&plan.txid);
         for entry in &plan.spent_outpoints {
             let key = outpoint_key(entry);
             self.reserved.remove(&key);
@@ -1183,6 +1259,10 @@ impl Client {
     /// only if the transaction landed, and unlike the inputs, wrongly counting
     /// it would have the service try to spend an output that may not exist.
     pub fn commit_uncertain_funding_spend(&mut self, plan: FundingSpendPlan) {
+        // No longer a request that will settle shortly: its change may never
+        // exist, and its inputs are held for the whole reservation window, so
+        // a request refused behind it is not told to retry in a second.
+        self.in_flight_change.remove(&plan.txid);
         self.remove_spent(&plan.spent_outpoints, None);
 
         let now = Instant::now();
@@ -1971,6 +2051,150 @@ mod tests {
         );
         assert_eq!(client.unspent.len(), 1);
         assert_eq!(client.unspent[0].value, 4_800, "change is spendable");
+    }
+
+    // ---- CS-475: "all in flight" is not "the wallet is short" ----
+
+    /// Claim a plan for `satoshi` against the client, as a request that has
+    /// planned and is now broadcasting holds it.
+    fn claim_one(client: &mut Client, satoshi: u64) -> FundingSpendPlan {
+        let (_, plan) = client
+            .plan_funding_tx(&cs_422_request(satoshi))
+            .expect("plans");
+        client.claim_inputs(&plan);
+        plan
+    }
+
+    /// The ticket's case. The only UTXO is claimed by a request still
+    /// broadcasting, and its change would cover the next one: that request is
+    /// told to wait, not to top up -- and once the first settles, it funds.
+    #[test]
+    fn cs_475_a_request_behind_a_claim_is_told_its_funds_are_in_flight() {
+        let mut client = client_holding_at_rate(vec![cs_422_utxo(1, 0, 5_000)], 100);
+        let first = claim_one(&mut client, 10);
+
+        let refused = client
+            .funding_balance_error(&cs_422_request(10))
+            .expect("nothing is spendable now");
+        assert_eq!(refused.code, ErrorCode::FundsInFlight, "{refused:?}");
+        assert!(
+            refused.description.contains("1 funding request"),
+            "{}",
+            refused.description
+        );
+
+        client.commit_funding_spend(first).expect("commits");
+        assert!(
+            client.funding_balance_error(&cs_422_request(10)).is_none(),
+            "the change has come back"
+        );
+    }
+
+    /// A wallet that could not cover the request even with every claim
+    /// settled is short, and says so. Only a refusal the returning change
+    /// would lift is reported as in flight -- and this one is not reported as
+    /// "no UTXOs available" either, which is all the cache can say while its
+    /// only UTXO is claimed.
+    #[test]
+    fn cs_475_a_wallet_short_even_after_its_claims_settle_is_still_short() {
+        let mut client = client_holding_at_rate(vec![cs_422_utxo(1, 0, 5_000)], 100);
+        claim_one(&mut client, 10);
+        let refused = client
+            .funding_balance_error(&cs_422_request(10_000))
+            .expect("refused");
+        assert_eq!(refused.code, ErrorCode::InsufficientBalance, "{refused:?}");
+    }
+
+    /// A committed claim is settled: its change is in the cache now, and
+    /// counting it as still to come would count it twice. Here the change is
+    /// then spent in turn, and a request the wallet cannot cover must be told
+    /// so rather than told to wait for change it already has.
+    #[test]
+    fn cs_475_a_committed_claim_is_no_longer_in_flight() {
+        let mut client = client_holding_at_rate(vec![cs_422_utxo(1, 0, 5_000)], 100);
+        let first = claim_one(&mut client, 10);
+        client.commit_funding_spend(first).expect("commits");
+        let second = claim_one(&mut client, 4_900);
+        client.commit_funding_spend(second).expect("commits");
+
+        let refused = client
+            .funding_balance_error(&cs_422_request(4_000))
+            .expect("a few dozen satoshi of change is all that is left");
+        assert_eq!(refused.code, ErrorCode::InsufficientBalance, "{refused:?}");
+    }
+
+    /// A claim given back after a refused broadcast has nothing left in
+    /// flight: its input is spendable at once, so the next request funds.
+    #[test]
+    fn cs_475_a_released_claim_is_no_longer_in_flight() {
+        let mut client = client_holding_at_rate(vec![cs_422_utxo(1, 0, 5_000)], 100);
+        let first = claim_one(&mut client, 10);
+        client.release_claim(&first);
+        assert!(client.in_flight_change.is_empty());
+        assert!(client.funding_balance_error(&cs_422_request(10)).is_none());
+    }
+
+    /// An uncertain outcome holds its inputs for the whole reservation window,
+    /// and its change may never exist. A request refused behind it will not
+    /// succeed in a second, so it is not told it will.
+    #[test]
+    fn cs_475_an_uncertain_outcome_is_not_reported_as_in_flight() {
+        let mut client = client_holding_at_rate(vec![cs_422_utxo(1, 0, 5_000)], 100);
+        let first = claim_one(&mut client, 10);
+        client.commit_uncertain_funding_spend(first);
+        let refused = client
+            .funding_balance_error(&cs_422_request(10))
+            .expect("refused");
+        assert_ne!(refused.code, ErrorCode::FundsInFlight, "{refused:?}");
+    }
+
+    /// A claim whose change went to the fee returns nothing if its broadcast
+    /// succeeds, so it cannot promise the next request anything.
+    #[test]
+    fn cs_475_a_claim_with_no_change_promises_nothing() {
+        // 10 and the fee leave less of 60 than the 38 dust threshold
+        let mut client = client_holding_at_rate(vec![cs_422_utxo(1, 0, 60)], 100);
+        let first = claim_one(&mut client, 10);
+        assert!(first.change_entry.is_none(), "the change went to the fee");
+        let refused = client
+            .funding_balance_error(&cs_422_request(10))
+            .expect("refused");
+        assert_eq!(refused.code, ErrorCode::NoSuitableUtxo, "{refused:?}");
+    }
+
+    /// A claim never settled -- its request dropped mid-broadcast -- stops
+    /// counting when its reservation would have expired, rather than telling
+    /// callers to retry for ever.
+    #[test]
+    fn cs_475_a_claim_never_settled_stops_counting() {
+        let mut client = client_holding_at_rate(vec![cs_422_utxo(1, 0, 5_000)], 100);
+        claim_one(&mut client, 10);
+        for claim in client.in_flight_change.values_mut() {
+            claim.since -= UNCERTAIN_SPEND_RESERVATION + Duration::from_secs(1);
+        }
+        let refused = client
+            .funding_balance_error(&cs_422_request(10))
+            .expect("refused");
+        assert_ne!(refused.code, ErrorCode::FundsInFlight, "{refused:?}");
+    }
+
+    /// One transaction per outpoint is judged the same way: each needs a UTXO
+    /// of its own, and the change coming back provides them.
+    #[test]
+    fn cs_475_multiple_transactions_wait_for_funds_in_flight_too() {
+        let mut client = client_holding_at_rate(
+            vec![cs_422_utxo(1, 0, 5_000), cs_422_utxo(2, 0, 5_000)],
+            100,
+        );
+        claim_one(&mut client, 10);
+        claim_one(&mut client, 10);
+        let request = FundRequest {
+            no_of_outpoints: 2,
+            multiple_tx: true,
+            ..cs_422_request(10)
+        };
+        let refused = client.funding_balance_error(&request).expect("refused");
+        assert_eq!(refused.code, ErrorCode::FundsInFlight, "{refused:?}");
     }
 
     // ---- CS-426: the same outpoint handed out more than once ----

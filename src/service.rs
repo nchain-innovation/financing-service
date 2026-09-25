@@ -2427,4 +2427,57 @@ mod tests {
             "outpoints given to more than one caller: {shared:?}"
         );
     }
+
+    // ---- CS-475: a refusal under load says the funds are in flight ----
+
+    /// The ticket's load against a wallet of three UTXOs. Every request that
+    /// finds them all claimed is refused with `funds_in_flight` -- not with
+    /// the codes that tell an operator to top up or consolidate -- and none
+    /// of the refusals is anything else.
+    #[tokio::test]
+    async fn cs_475_contention_is_reported_as_funds_in_flight() {
+        use crate::test_support::SlowRecordingBroadcaster;
+
+        let config = test_config(&unique_dynamic_config_path());
+        let broadcaster = SlowRecordingBroadcaster::new(Duration::from_millis(100));
+        let chain = vec![
+            confirmed_utxo(50_000),
+            chain_gang::interface::UtxoEntry {
+                tx_pos: 1,
+                ..confirmed_utxo(50_000)
+            },
+            chain_gang::interface::UtxoEntry {
+                tx_pos: 2,
+                ..confirmed_utxo(50_000)
+            },
+        ];
+        let service = service_with(
+            &config,
+            chain_holding(&config, chain).await,
+            broadcaster.clone(),
+        )
+        .await;
+        let mut request = sample_fund_request(TEST_CLIENT_ID);
+        request.satoshi = 10;
+
+        let calls: Vec<_> = (0..8)
+            .map(|_| {
+                let (service, request) = (Arc::clone(&service), request.clone());
+                tokio::spawn(async move { Service::execute_funding(&service, &request).await })
+            })
+            .collect();
+        let mut refusals = Vec::new();
+        for call in calls {
+            if let Err(error) = call.await.expect("task") {
+                refusals.push(error.code);
+            }
+        }
+        assert!(!refusals.is_empty(), "the load outran the wallet");
+        assert!(
+            refusals
+                .iter()
+                .all(|code| *code == ErrorCode::FundsInFlight),
+            "{refusals:?}"
+        );
+    }
 }
