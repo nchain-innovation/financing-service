@@ -75,7 +75,8 @@ filename = "./data/dynamic.toml"
 #
 # The fee is ceil(tx_bytes * satoshis_per_kb / 1000), rounded up so rounding
 # never underpays. An ordinary funding transaction -- one input, two outputs --
-# is 217 bytes, so at 100 sat/KB it pays 22 satoshi.
+# is 226 bytes, so at 100 sat/KB it pays 23 satoshi. tx_bytes is the
+# serialised size, counted as an upper bound, so the rate is never undercut.
 #
 # Before v4.3.0 this was hardcoded as ((tx_bytes / 1000) * 500) + 750, which
 # charged 750 for that same transaction. Upgrading without setting these pays
