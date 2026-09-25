@@ -151,6 +151,9 @@ fn from_unix(since_unix: u64, now: Instant, now_unix: u64) -> Option<Instant> {
 
 #[derive(Clone, Debug)]
 pub struct FundingSpendPlan {
+    /// The transaction this plan built, which is what its funded outpoints
+    /// are named after.
+    txid: String,
     /// `None` when the change was dust and went to the fee instead, so
     /// there is no change output to track (CS-452).
     change_entry: Option<UtxoEntry>,
@@ -232,6 +235,16 @@ pub struct Client {
     /// spend its own change without waiting for the chain to confirm what the
     /// service already knows it sent.
     pending_change: HashMap<OutPointKey, PendingChange>,
+    /// Transactions whose outpoints have been handed to a caller within the
+    /// reservation window, by txid (CS-474).
+    ///
+    /// Two callers given the same transaction are given the same outpoints,
+    /// and only one of them owns them. That happened silently: concurrent
+    /// requests with identical parameters built byte-identical transactions,
+    /// and the upstream answers a transaction it already holds with success.
+    /// Claiming inputs at planning (CS-473) removed the cause; this makes any
+    /// recurrence an error rather than a second 200.
+    handed_out: HashMap<String, Instant>,
 }
 
 impl Client {
@@ -256,6 +269,7 @@ impl Client {
             chain_state_at: None,
             reserved: HashMap::new(),
             pending_change: HashMap::new(),
+            handed_out: HashMap::new(),
             fee_satoshis_per_kb: DEFAULT_SATOSHIS_PER_KB,
         })
     }
@@ -432,6 +446,15 @@ impl Client {
     #[cfg(test)]
     pub fn reserved_outpoint_count(&self) -> usize {
         self.reserved.len()
+    }
+
+    /// Age every handed-out transaction by `by`, so a test can reach the end
+    /// of its window without waiting for it.
+    #[cfg(test)]
+    fn backdate_handed_out(&mut self, by: Duration) {
+        for since in self.handed_out.values_mut() {
+            *since -= by;
+        }
     }
 
     /// Age every reservation by `by`, so a test can reach the expiry without
@@ -947,9 +970,11 @@ impl Client {
             value: change,
         });
 
+        let txid = tx.hash().encode();
         Ok((
             tx,
             FundingSpendPlan {
+                txid,
                 change_entry,
                 spent_outpoints: vec![unspent.clone()],
             },
@@ -1003,9 +1028,11 @@ impl Client {
             value: change,
         });
 
+        let txid = tx.hash().encode();
         Ok((
             tx,
             FundingSpendPlan {
+                txid,
                 change_entry,
                 spent_outpoints: selected_indices
                     .iter()
@@ -1046,10 +1073,33 @@ impl Client {
     /// -- the transaction carrying it was broadcast -- but it is not on chain
     /// yet either, so a refresh would drop it and leave the client unable to
     /// spend its own change until the chain caught up.
-    pub fn commit_funding_spend(&mut self, plan: FundingSpendPlan) {
+    ///
+    /// Refuses a transaction whose outpoints have already been handed to a
+    /// caller (CS-474). Nothing a correct service does builds the same
+    /// transaction twice -- claiming inputs at planning keeps concurrent
+    /// requests off each other's -- so this is an invariant check. But the
+    /// failure it guards against is silent everywhere else: the upstream
+    /// answers a transaction it already holds with success, so without it a
+    /// second caller would be told it owns outpoints someone else was already
+    /// given, and would find out only when its own transaction failed.
+    pub fn commit_funding_spend(&mut self, plan: FundingSpendPlan) -> Result<(), String> {
+        self.forget_expired_handed_out();
+        if self.handed_out.contains_key(&plan.txid) {
+            log::error!(
+                "refusing to hand out the outpoints of {} a second time: they already belong to \
+                 another caller. Two funding requests built the same transaction, which should \
+                 be impossible (CS-474).",
+                plan.txid
+            );
+            return Err(format!(
+                "transaction {} was already handed to another caller",
+                plan.txid
+            ));
+        }
         let change_entry = plan.change_entry.clone();
         self.remove_spent(&plan.spent_outpoints, plan.change_entry);
         let now = Instant::now();
+        self.handed_out.insert(plan.txid, now);
         for entry in plan.spent_outpoints {
             self.reserved.insert(outpoint_key(&entry), now);
         }
@@ -1064,6 +1114,17 @@ impl Client {
                 },
             );
         }
+        Ok(())
+    }
+
+    /// Drop transactions handed out longer ago than the reservation window.
+    ///
+    /// Past it the inputs have been released too, so a transaction built from
+    /// them would be a new one, not a duplicate.
+    fn forget_expired_handed_out(&mut self) {
+        let now = Instant::now();
+        self.handed_out
+            .retain(|_, since| now.duration_since(*since) < UNCERTAIN_SPEND_RESERVATION);
     }
 
     /// Take a plan's inputs out of what any other request can select, before
@@ -1125,6 +1186,10 @@ impl Client {
         self.remove_spent(&plan.spent_outpoints, None);
 
         let now = Instant::now();
+        // It may be on the network, so another request building the same
+        // transaction would be a duplicate of it just the same.
+        self.forget_expired_handed_out();
+        self.handed_out.insert(plan.txid.clone(), now);
         for entry in plan.spent_outpoints {
             log::warn!(
                 "reserving outpoint {}:{} for up to {}s: its funding transaction was handed to \
@@ -1141,7 +1206,7 @@ impl Client {
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn create_funding_tx(&mut self, fund_request: &FundRequest) -> Result<Tx, String> {
         let (tx, plan) = self.plan_funding_tx(fund_request)?;
-        self.commit_funding_spend(plan);
+        self.commit_funding_spend(plan)?;
         Ok(tx)
     }
 }
@@ -1362,7 +1427,7 @@ mod tests {
             first.spent_outpoints, next.spent_outpoints,
             "a plan made after a claim picked the claimed input"
         );
-        client.commit_funding_spend(first);
+        client.commit_funding_spend(first).expect("commits");
         assert!(client.plan_funding_tx(&fund_request).is_ok());
     }
 
@@ -1700,8 +1765,8 @@ mod tests {
             .plan_funding_tx(&cs_422_request(1_500))
             .expect("plans");
         let (_, b) = client.plan_funding_tx(&cs_422_request(500)).expect("plans");
-        client.commit_funding_spend(a);
-        client.commit_funding_spend(b);
+        client.commit_funding_spend(a).expect("commits");
+        client.commit_funding_spend(b).expect("commits");
 
         let held: Vec<i64> = client.unspent.iter().map(|u| u.value).collect();
         assert!(
@@ -1738,10 +1803,55 @@ mod tests {
         );
     }
 
+    // ---- CS-474: an outpoint is handed to one caller ----
+
+    /// The same transaction committed twice is refused the second time: its
+    /// outpoints already belong to whoever it was first handed to. Nothing
+    /// correct builds it twice, but the upstream answers a resubmission with
+    /// success, so this is the only place a duplicate could be caught.
+    #[test]
+    fn cs_474_the_same_transaction_is_never_handed_out_twice() {
+        let mut client = client_holding_at_rate(vec![cs_422_utxo(1, 0, 5_000)], 100);
+        let (_, plan) = client.plan_funding_tx(&cs_422_request(10)).expect("plans");
+        client
+            .commit_funding_spend(plan.clone())
+            .expect("handed out once");
+        let refused = client.commit_funding_spend(plan).expect_err("not twice");
+        assert!(
+            refused.contains("already handed to another caller"),
+            "{refused}"
+        );
+    }
+
+    /// A transaction whose outcome was unknown may be on the network, so it
+    /// counts as handed out too.
+    #[test]
+    fn cs_474_an_uncertain_transaction_counts_as_handed_out() {
+        let mut client = client_holding_at_rate(vec![cs_422_utxo(1, 0, 5_000)], 100);
+        let (_, plan) = client.plan_funding_tx(&cs_422_request(10)).expect("plans");
+        client.commit_uncertain_funding_spend(plan.clone());
+        assert!(client.commit_funding_spend(plan).is_err());
+    }
+
+    /// Past the reservation window the inputs have been released as well, so
+    /// the record goes with them rather than growing without bound.
+    #[test]
+    fn cs_474_the_record_of_handed_out_transactions_expires() {
+        let mut client = client_holding_at_rate(vec![cs_422_utxo(1, 0, 5_000)], 100);
+        let (_, plan) = client.plan_funding_tx(&cs_422_request(10)).expect("plans");
+        client
+            .commit_funding_spend(plan.clone())
+            .expect("handed out");
+        client.backdate_handed_out(UNCERTAIN_SPEND_RESERVATION + Duration::from_secs(1));
+        client.forget_expired_handed_out();
+        assert!(client.handed_out.is_empty());
+    }
+
     /// Reserve the first cached outpoint, as an uncertain broadcast does.
     fn reserve_first(client: &mut Client) -> UtxoEntry {
         let entry = client.unspent[0].clone();
         client.commit_uncertain_funding_spend(FundingSpendPlan {
+            txid: "test".to_string(),
             change_entry: Some(utxo("change", 0, 1, 0)),
             spent_outpoints: vec![entry.clone()],
         });
@@ -1829,6 +1939,7 @@ mod tests {
     fn sr_fund_012_an_uncertain_commit_does_not_add_the_change_output() {
         let mut client = client_holding(vec![utxo("aa", 0, 5_000, 100)]);
         client.commit_uncertain_funding_spend(FundingSpendPlan {
+            txid: "test".to_string(),
             change_entry: Some(utxo("change", 0, 4_800, 0)),
             spent_outpoints: vec![utxo("aa", 0, 5_000, 100)],
         });
@@ -1846,10 +1957,13 @@ mod tests {
     #[test]
     fn sr_fund_012_a_successful_broadcast_reserves_its_inputs() {
         let mut client = client_holding(vec![utxo("aa", 0, 5_000, 100)]);
-        client.commit_funding_spend(FundingSpendPlan {
-            change_entry: Some(utxo("change", 0, 4_800, 0)),
-            spent_outpoints: vec![utxo("aa", 0, 5_000, 100)],
-        });
+        client
+            .commit_funding_spend(FundingSpendPlan {
+                txid: "test".to_string(),
+                change_entry: Some(utxo("change", 0, 4_800, 0)),
+                spent_outpoints: vec![utxo("aa", 0, 5_000, 100)],
+            })
+            .expect("commits");
         assert_eq!(
             client.reserved_outpoint_count(),
             1,
