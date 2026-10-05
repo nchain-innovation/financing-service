@@ -431,9 +431,10 @@ fn replay(outcome: Outcome) -> HttpResponse {
 /// Free the `idempotency_key` only when the failure cannot have spent
 /// anything, so the client may retry with the same `idempotency_key`.
 ///
-/// This is deliberately conservative. `insufficient_balance` and
-/// `no_suitable_utxo` are decided before a transaction is built, so releasing
-/// is safe. `broadcast_rejected` is safe for a different reason: the upstream
+/// This is deliberately conservative. `insufficient_balance`,
+/// `no_suitable_utxo` and `funds_in_flight` are decided before a transaction
+/// is built, so releasing is safe -- and for `funds_in_flight` it is the point:
+/// the caller is told to retry the same request, key and all, in a second. `broadcast_rejected` is safe for a different reason: the upstream
 /// answered and refused the transaction, which is as definite as "nothing was
 /// spent" gets -- and since that rejection will not change on a resubmission,
 /// holding the key would only stop the client using it for the corrected
@@ -452,7 +453,10 @@ async fn release_if_nothing_was_spent(
 ) {
     let certainly_pre_broadcast = matches!(
         code,
-        ErrorCode::InsufficientBalance | ErrorCode::NoSuitableUtxo | ErrorCode::BroadcastRejected
+        ErrorCode::InsufficientBalance
+            | ErrorCode::NoSuitableUtxo
+            | ErrorCode::FundsInFlight
+            | ErrorCode::BroadcastRejected
     );
     if certainly_pre_broadcast {
         if let Some((key, _)) = record {
@@ -825,9 +829,19 @@ mod tests {
     ) {
         let config = test_config(&unique_dynamic_config_path());
         let blockchain = test_blockchain_interface(&config).await;
-        let service = Arc::new(
-            Service::new_for_test_with_broadcaster(&config, blockchain, broadcaster).await,
-        );
+        build_app_over(&config, blockchain, broadcaster).await
+    }
+
+    async fn build_app_over(
+        config: &Config,
+        blockchain: Arc<dyn chain_gang::interface::BlockchainInterface + Send + Sync>,
+        broadcaster: Arc<dyn crate::broadcaster::TxBroadcaster>,
+    ) -> (
+        impl ActixService<Request, Response = ServiceResponse, Error = Error>,
+        Arc<Service>,
+    ) {
+        let service =
+            Arc::new(Service::new_for_test_with_broadcaster(config, blockchain, broadcaster).await);
         let app_state = web::Data::new(AppState {
             service: Arc::clone(&service),
         });
@@ -2255,6 +2269,79 @@ mod tests {
         .await;
         let json: Value = test::read_body_json(retry).await;
         assert_eq!(json["code"], "key_in_progress");
+    }
+
+    /// CS-475 end to end. A request arriving while the client's only UTXO is
+    /// held by one still broadcasting is answered 503 with `Retry-After`, so
+    /// a retry policy reading only the status and headers waits and retries
+    /// rather than paging someone. Its `idempotency_key` is released: the
+    /// advice is to retry the same request, and that must not be refused as
+    /// `key_in_progress`.
+    #[actix_web::test]
+    async fn cs_475_funds_in_flight_is_a_503_that_says_when_to_retry() {
+        use chain_gang::interface::BlockchainInterface;
+
+        let config = test_config(&unique_dynamic_config_path());
+        let mut chain = chain_gang::interface::TestInterface::new();
+        chain.set_network(&config.get_network().unwrap());
+        chain
+            .set_utxo(
+                TEST_ADDRESS,
+                &vec![crate::test_support::test_utxo()[0].clone()],
+            )
+            .await;
+        chain.set_height(1_517_571).await;
+        let (app, _service) = build_app_over(
+            &config,
+            Arc::new(chain),
+            crate::test_support::SlowRecordingBroadcaster::new(std::time::Duration::from_millis(
+                100,
+            )),
+        )
+        .await;
+
+        let first = test::TestRequest::post()
+            .uri("/fund")
+            .set_json(fund_body(TEST_CLIENT_ID, 10, 1, LOCKING_SCRIPT_HEX))
+            .to_request();
+        let mut body = fund_body(TEST_CLIENT_ID, 10, 1, LOCKING_SCRIPT_HEX);
+        body["idempotency_key"] = json!("in-flight-1");
+        let second = async {
+            // behind the first, which has claimed the UTXO and is broadcasting
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri("/fund")
+                    .set_json(body.clone())
+                    .to_request(),
+            )
+            .await
+        };
+        let (first, second) = tokio::join!(test::call_service(&app, first), second);
+
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(second.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            second
+                .headers()
+                .get(actix_web::http::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+        let json: Value = test::read_body_json(second).await;
+        assert_eq!(json["code"], "funds_in_flight");
+
+        // and the retry it was told to make, same key and all, funds
+        let retry = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/fund")
+                .set_json(body)
+                .to_request(),
+        )
+        .await;
+        assert_eq!(retry.status(), StatusCode::OK);
     }
 
     /// CS-422 asked how a client is supposed to know what it can withdraw.

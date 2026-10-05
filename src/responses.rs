@@ -1,4 +1,4 @@
-use actix_web::{http::header::ContentType, http::StatusCode, HttpResponse};
+use actix_web::{http::header, http::header::ContentType, http::StatusCode, HttpResponse};
 use serde::Serialize;
 
 #[derive(Debug, Serialize, Clone, Copy)]
@@ -22,6 +22,16 @@ pub enum ErrorCode {
     /// The balance is sufficient in total, but no combination of UTXOs can
     /// satisfy the request. Retryable once the wallet's UTXOs are split.
     NoSuitableUtxo,
+    /// Every UTXO that could fund the request is held by funding requests
+    /// still being broadcast, and the change they return will cover it
+    /// (CS-475). Nothing is wrong with the wallet: retry unchanged after the
+    /// interval in `Retry-After`.
+    ///
+    /// Separate from [`ErrorCode::InsufficientBalance`] and
+    /// [`ErrorCode::NoSuitableUtxo`] because the advice is the opposite. Those
+    /// need an operator to top up or consolidate; this clears by itself as
+    /// soon as the requests ahead of it finish.
+    FundsInFlight,
     /// No such `client_id`. Never retryable without a configuration change.
     UnknownClient,
     /// The `client_id` is already configured.
@@ -105,7 +115,12 @@ impl ErrorCode {
             // caller and this service that retries on a status alone must be
             // able to see that this one is not a clean "it did not happen".
             ErrorCode::BroadcastOutcomeUnknown => StatusCode::GATEWAY_TIMEOUT,
-            ErrorCode::ChainUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            // Busy rather than wrong: the same request succeeds once the
+            // funding ahead of it completes, which is what 5xx tells anything
+            // reading the status alone.
+            ErrorCode::ChainUnavailable | ErrorCode::FundsInFlight => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             ErrorCode::Internal => StatusCode::INTERNAL_SERVER_ERROR,
             ErrorCode::Unauthorized => StatusCode::UNAUTHORIZED,
             ErrorCode::RateLimited => StatusCode::TOO_MANY_REQUESTS,
@@ -115,6 +130,21 @@ impl ErrorCode {
             // is WebDAV and rarely handled, and any plain failure status would
             // invite a caller to ignore a body it must not ignore.
             ErrorCode::PartialBroadcast => StatusCode::UNPROCESSABLE_ENTITY,
+        }
+    }
+
+    /// Seconds a caller should wait before retrying, sent as `Retry-After`.
+    ///
+    /// Only where the wait is known to be short. Funds in flight come back
+    /// when the requests holding them finish broadcasting, which takes about
+    /// as long as a submit does -- well under a second in the common case --
+    /// so one second is enough for most retries to succeed without leaving
+    /// the caller idle for long. A retry that comes too soon is answered the
+    /// same way again.
+    pub fn retry_after_seconds(self) -> Option<u64> {
+        match self {
+            ErrorCode::FundsInFlight => Some(1),
+            _ => None,
         }
     }
 }
@@ -322,12 +352,15 @@ pub fn error_response_with_status(
     code: ErrorCode,
     description: impl Into<String>,
 ) -> HttpResponse {
-    HttpResponse::build(status)
-        .content_type(ContentType::json())
-        .json(ErrorResponse {
-            code,
-            description: description.into(),
-        })
+    let mut response = HttpResponse::build(status);
+    response.content_type(ContentType::json());
+    if let Some(seconds) = code.retry_after_seconds() {
+        response.insert_header((header::RETRY_AFTER, seconds.to_string()));
+    }
+    response.json(ErrorResponse {
+        code,
+        description: description.into(),
+    })
 }
 
 /// Build an error response from an error that already carries its code.
@@ -361,6 +394,7 @@ mod tests {
         let cases = [
             (ErrorCode::InsufficientBalance, "insufficient_balance"),
             (ErrorCode::NoSuitableUtxo, "no_suitable_utxo"),
+            (ErrorCode::FundsInFlight, "funds_in_flight"),
             (ErrorCode::UnknownClient, "unknown_client"),
             (ErrorCode::ClientExists, "client_exists"),
             (ErrorCode::InvalidRequest, "invalid_request"),
@@ -403,6 +437,7 @@ mod tests {
             (ErrorCode::IdempotencyKeyReused, S::CONFLICT),
             (ErrorCode::BroadcastFailed, S::BAD_GATEWAY),
             (ErrorCode::ChainUnavailable, S::SERVICE_UNAVAILABLE),
+            (ErrorCode::FundsInFlight, S::SERVICE_UNAVAILABLE),
             (ErrorCode::Internal, S::INTERNAL_SERVER_ERROR),
             (ErrorCode::Unauthorized, S::UNAUTHORIZED),
             (ErrorCode::RateLimited, S::TOO_MANY_REQUESTS),
@@ -417,7 +452,11 @@ mod tests {
     /// unchanged, 4xx needs the caller or an operator to act.
     #[test]
     fn retryable_codes_are_5xx_and_client_errors_are_4xx() {
-        for code in [ErrorCode::BroadcastFailed, ErrorCode::ChainUnavailable] {
+        for code in [
+            ErrorCode::BroadcastFailed,
+            ErrorCode::ChainUnavailable,
+            ErrorCode::FundsInFlight,
+        ] {
             assert!(code.status().is_server_error(), "{code:?} should be 5xx");
         }
         for code in [
@@ -427,6 +466,36 @@ mod tests {
             ErrorCode::IdempotencyKeyReused,
         ] {
             assert!(code.status().is_client_error(), "{code:?} should be 4xx");
+        }
+    }
+
+    /// A caller that reads only headers can still learn how long to wait
+    /// (CS-475), and no other code claims a wait it cannot promise.
+    #[test]
+    fn cs_475_funds_in_flight_says_when_to_retry() {
+        let response = error_response(ErrorCode::FundsInFlight, "busy");
+        assert_eq!(
+            response.status(),
+            actix_http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+
+        for code in [
+            ErrorCode::InsufficientBalance,
+            ErrorCode::NoSuitableUtxo,
+            ErrorCode::ChainUnavailable,
+        ] {
+            let response = error_response(code, "no");
+            assert!(
+                response.headers().get(header::RETRY_AFTER).is_none(),
+                "{code:?} promises no wait"
+            );
         }
     }
 

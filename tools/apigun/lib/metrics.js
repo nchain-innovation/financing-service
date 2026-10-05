@@ -3,7 +3,8 @@
 // k6's built-in http_req_failed counts every non-2xx as a failure, which is
 // the wrong lens for POST /fund. The service answers a refusal it expects --
 // the wallet has no suitable UTXO, the balance is short -- with 409 and a
-// machine-readable `code`. That is the wallet running out, not the service
+// machine-readable `code`, or all its UTXOs are in flight, with 503 and
+// `funds_in_flight`. That is the wallet running out, not the service
 // breaking, and a breakpoint test has to tell the two apart or it will report
 // the wallet's limit as the service's.
 //
@@ -17,7 +18,10 @@ export const fundOk = new Rate('fund_ok');
 /** 5xx: the service or its upstream broke. This is the breakpoint signal. */
 export const fundFailed = new Rate('fund_failed');
 
-/** 409: well-formed but refused against current state -- usually the wallet. */
+/**
+ * 409, or 503 `funds_in_flight`: well-formed but refused against current
+ * state -- usually the wallet.
+ */
 export const fundRefused = new Rate('fund_refused');
 
 /** 429: the configured [web_interface.rate_limit] turned the request away. */
@@ -50,6 +54,7 @@ export const FUND_CODES = [
   'ok',
   'insufficient_balance',
   'no_suitable_utxo',
+  'funds_in_flight',
   'broadcast_failed',
   'broadcast_rejected',
   'broadcast_outcome_unknown',

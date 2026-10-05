@@ -116,6 +116,7 @@ genuine service or upstream limit, and 4 req/s is the last rate that held.
 | --- | --- |
 | `broadcast_failed`, `chain_unavailable`, `internal` (5xx) | The service or its upstream. **This is max TPS.** |
 | `broadcast_rejected` | Concurrent requests for one client picked the same UTXO. Fan out across clients. |
+| `funds_in_flight` | Every UTXO was claimed by requests still broadcasting: the wallet has fewer UTXOs than the rate needs in flight. Pre-split it and re-run. |
 | `no_suitable_utxo`, `insufficient_balance` | The wallet ran dry. Pre-split it and re-run. |
 | `rate_limited` | `[web_interface.rate_limit]`, a deliberate answer. That *is* your configured ceiling. |
 
@@ -201,11 +202,25 @@ reached a block.
 
 ### 3. Did two callers get the same outpoint?
 
-Concurrent requests can select the same UTXO and, because signing is
-deterministic, build the identical transaction. The second broadcast comes back
-as "already known", which counts as success -- so both callers are handed the
-same outpoints, both are told they succeeded, and nothing is logged as an
-error. The responses are the only place this shows.
+Before v4.4.0, concurrent requests could select the same UTXO and, because
+signing is deterministic, build the identical transaction. The second broadcast
+came back as "already known", which counts as success -- so both callers were
+handed the same outpoints, both were told they succeeded, and nothing was
+logged as an error. The responses were the only place this showed (CS-474).
+
+**From v4.4.0 this check should find nothing; run it as a regression test.**
+Each request claims its inputs while it plans, so no two build the same
+transaction (CS-473). Behind that, the service refuses to hand out a
+transaction it has already handed out: if one were ever built twice, the second
+caller would get `500 internal` rather than the outpoints, and the service log
+would say so:
+
+```sh
+grep "refusing to hand out the outpoints" fs.log
+```
+
+A hit on either check against v4.4.0 or later is a bug worth reporting. Against
+an earlier version, this is how the bug shows.
 
 With `LOG_OUTPOINTS=true` both scripts print `outpoint=<hash>:<index>` for
 every outpoint returned, replays excluded. Any repeat is two callers holding
@@ -218,7 +233,8 @@ grep -o "outpoint=[0-9a-f]*:[0-9]*" k6console.log | sort | uniq -d
 
 A single line of output is enough. This is a double spend at the client level,
 and unlike the one in technique 1 it fails silently -- the loser finds out only
-when it tries to spend.
+when it tries to spend. (From v4.4.0 the refusal above makes it fail loudly
+instead.)
 
 The service log screens for the same thing, since a duplicate outpoint requires
 the same transaction to have been built twice:
@@ -263,7 +279,7 @@ machine-readable `code`. `lib/fund.js` classifies against
 | Status | Metric | Meaning |
 | --- | --- | --- |
 | 200 | `fund_ok` | Funded. `fund_replayed` counts those that were idempotency replays. |
-| 409 | `fund_refused` | Well-formed but conflicts with state — usually `no_suitable_utxo` or `insufficient_balance`. **The wallet, not the service.** |
+| 409, or 503 `funds_in_flight` | `fund_refused` | Well-formed but conflicts with state — usually `no_suitable_utxo`, `insufficient_balance` or `funds_in_flight`. **The wallet, not the service.** `funds_in_flight` is a 503 so retry policies retry it, and is classified by its code for that reason. |
 | 429 | `fund_throttled` | `[web_interface.rate_limit]` turned the request away. |
 | 422 | `fund_partial` | Some transactions broadcast and some did not. Needs a human. |
 | 5xx, timeout | `fund_failed` | The service or its upstream broke. **This is the breakpoint signal.** |
@@ -279,7 +295,8 @@ iteration broadcasts a transaction. Run against regtest or a testnet client you
 are willing to drain, and keep `SATOSHI` small.
 
 **The wallet is usually the limit, not the service.** Once the client's UTXOs
-are consumed, `/fund` answers `409 no_suitable_utxo` and the run is measuring
+are consumed, `/fund` answers `409 no_suitable_utxo` -- or `503 funds_in_flight`
+while they are all claimed by requests still broadcasting -- and the run is measuring
 the wallet's shape rather than the service's throughput. Watch `fund_refused`:
 if it climbs before `fund_failed` does, the number you got is the wallet's
 limit. Pre-split the wallet into many outputs before a serious run.
