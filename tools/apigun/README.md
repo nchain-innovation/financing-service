@@ -202,11 +202,25 @@ reached a block.
 
 ### 3. Did two callers get the same outpoint?
 
-Concurrent requests can select the same UTXO and, because signing is
-deterministic, build the identical transaction. The second broadcast comes back
-as "already known", which counts as success -- so both callers are handed the
-same outpoints, both are told they succeeded, and nothing is logged as an
-error. The responses are the only place this shows.
+Before v4.4.0, concurrent requests could select the same UTXO and, because
+signing is deterministic, build the identical transaction. The second broadcast
+came back as "already known", which counts as success -- so both callers were
+handed the same outpoints, both were told they succeeded, and nothing was
+logged as an error. The responses were the only place this showed (CS-474).
+
+**From v4.4.0 this check should find nothing; run it as a regression test.**
+Each request claims its inputs while it plans, so no two build the same
+transaction (CS-473). Behind that, the service refuses to hand out a
+transaction it has already handed out: if one were ever built twice, the second
+caller would get `500 internal` rather than the outpoints, and the service log
+would say so:
+
+```sh
+grep "refusing to hand out the outpoints" fs.log
+```
+
+A hit on either check against v4.4.0 or later is a bug worth reporting. Against
+an earlier version, this is how the bug shows.
 
 With `LOG_OUTPOINTS=true` both scripts print `outpoint=<hash>:<index>` for
 every outpoint returned, replays excluded. Any repeat is two callers holding
@@ -219,7 +233,8 @@ grep -o "outpoint=[0-9a-f]*:[0-9]*" k6console.log | sort | uniq -d
 
 A single line of output is enough. This is a double spend at the client level,
 and unlike the one in technique 1 it fails silently -- the loser finds out only
-when it tries to spend.
+when it tries to spend. (From v4.4.0 the refusal above makes it fail loudly
+instead.)
 
 The service log screens for the same thing, since a duplicate outpoint requires
 the same transaction to have been built twice:
