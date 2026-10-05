@@ -591,3 +591,60 @@ impl TxBroadcaster for StubMapiBroadcaster {
         self.quoted_fee
     }
 }
+
+/// Every log line this test's thread has written, as `(level, message)`, in
+/// order (CS-482).
+///
+/// The first call installs a process-wide logger that records each line with
+/// the thread it came from. Tests run in parallel and share that logger, so
+/// lines are kept per thread: a `#[tokio::test]` runs on a current-thread
+/// runtime, and everything it spawns logs from the test's own thread.
+pub fn logged_on_this_thread() -> Vec<(log::Level, String)> {
+    let thread = std::thread::current().id();
+    capture_logger()
+        .lines
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(from, _, _)| *from == thread)
+        .map(|(_, level, line)| (*level, line.clone()))
+        .collect()
+}
+
+/// Install the capturing logger, if this is the first call, so a test can
+/// read back what it logs with [`logged_on_this_thread`].
+pub fn capture_logs() {
+    capture_logger();
+}
+
+struct CaptureLogger {
+    lines: std::sync::Mutex<Vec<(std::thread::ThreadId, log::Level, String)>>,
+}
+
+impl log::Log for CaptureLogger {
+    fn enabled(&self, _: &log::Metadata) -> bool {
+        true
+    }
+
+    fn log(&self, record: &log::Record) {
+        self.lines.lock().unwrap().push((
+            std::thread::current().id(),
+            record.level(),
+            record.args().to_string(),
+        ));
+    }
+
+    fn flush(&self) {}
+}
+
+fn capture_logger() -> &'static CaptureLogger {
+    static LOGGER: std::sync::OnceLock<&'static CaptureLogger> = std::sync::OnceLock::new();
+    LOGGER.get_or_init(|| {
+        let logger: &'static CaptureLogger = Box::leak(Box::new(CaptureLogger {
+            lines: std::sync::Mutex::new(Vec::new()),
+        }));
+        log::set_logger(logger).expect("no other logger is installed in tests");
+        log::set_max_level(log::LevelFilter::Trace);
+        logger
+    })
+}
