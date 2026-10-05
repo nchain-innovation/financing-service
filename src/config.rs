@@ -194,8 +194,8 @@ pub struct IdempotencyConfig {
 /// Before CS-451 this was hardcoded as `((tx_bytes / 1000) * 500) + 750`,
 /// which is a step function rather than a rate: it charged 750 satoshi for any
 /// transaction under a kilobyte, and jumped by 500 at each kilobyte after.
-/// A 250-byte funding transaction -- the ordinary shape, one input and two
-/// outputs -- therefore paid 750 satoshi, an effective 3000 sat/KB. The rate
+/// A 226-byte funding transaction -- the ordinary shape, one input and two
+/// outputs -- therefore paid 750 satoshi, an effective 3300 sat/KB. The rate
 /// is now stated directly, so what the service pays is a number an operator
 /// can read and change rather than an artefact of an expression.
 #[derive(Debug, Deserialize, Clone, PartialEq)]
