@@ -100,14 +100,54 @@ export function fund() {
     if (res.json('replayed') === true) {
       fundReplayed.add(1);
     }
+    if (config.logOutpoints) {
+      printOutpoints(res);
+    }
   } else if (outcome === 'partial') {
     fundPartial.add(1);
+    // A partial broadcast still hands the caller real outpoints for the
+    // transactions that did go out, so they belong in the same check.
+    if (config.logOutpoints) {
+      printOutpoints(res);
+    }
   } else if (outcome === 'misconfigured') {
     fundMisconfigured.add(1);
     console.error(`/fund ${res.status} ${code}: ${res.body}`);
   }
 
   return { res, outcome, code };
+}
+
+/**
+ * Print every outpoint this response handed back, one per line as
+ * `outpoint=<hash>:<index>`.
+ *
+ * The same outpoint appearing twice across the output means two calls were
+ * each told they own the same output, and only one of them can spend it.
+ * Concurrent requests can select the same UTXO and, since signing is
+ * deterministic, build the identical transaction; the second broadcast then
+ * comes back as "already known", which counts as success. Both callers get a
+ * 200 and nothing is logged as an error, so the responses are the only place
+ * this is visible.
+ *
+ * Replays are skipped: an idempotency replay returning the outpoints of the
+ * original call is what `replayed` exists to signal, not a duplicate.
+ */
+function printOutpoints(res) {
+  try {
+    if (res.json('replayed') === true) {
+      return;
+    }
+    const outpoints = res.json('outpoints') || [];
+    for (let i = 0; i < outpoints.length; i++) {
+      const outpoint = outpoints[i];
+      if (outpoint && outpoint.hash !== undefined && outpoint.index !== undefined) {
+        console.log(`outpoint=${outpoint.hash}:${outpoint.index}`);
+      }
+    }
+  } catch (_) {
+    // A body that will not parse is already counted as a failed check.
+  }
 }
 
 /** True when the body really carries the outpoints that were asked for. */
