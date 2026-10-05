@@ -1059,7 +1059,7 @@ impl Service {
         client
             .write()
             .await
-            .commit_funding_spend(prepared.spend_plan.clone());
+            .commit_funding_spend(prepared.spend_plan.clone())?;
         service.save_inflight_state().await;
         Ok(())
     }
@@ -2380,6 +2380,51 @@ mod tests {
             broadcaster.spent_inputs().len(),
             1,
             "one transaction reached the network"
+        );
+    }
+
+    // ---- CS-474: the service's contract, stated from the caller's side ----
+
+    /// Concurrent identical requests -- the ticket's load -- and no outpoint
+    /// in any successful response may appear in another. Checked on what the
+    /// callers were told, not on what was broadcast: a duplicate used to be a
+    /// 200 to every one of them, with nothing logged.
+    #[tokio::test]
+    async fn cs_474_concurrent_identical_requests_are_never_given_the_same_outpoint() {
+        use crate::test_support::SlowRecordingBroadcaster;
+
+        let config = test_config(&unique_dynamic_config_path());
+        let broadcaster = SlowRecordingBroadcaster::new(Duration::from_millis(50));
+        let service = service_with(
+            &config,
+            test_blockchain_interface(&config).await,
+            broadcaster.clone(),
+        )
+        .await;
+        let mut request = sample_fund_request(TEST_CLIENT_ID);
+        request.satoshi = 10;
+
+        let calls: Vec<_> = (0..10)
+            .map(|_| {
+                let (service, request) = (Arc::clone(&service), request.clone());
+                tokio::spawn(async move { Service::execute_funding(&service, &request).await })
+            })
+            .collect();
+        let mut handed = std::collections::HashMap::new();
+        for call in calls {
+            if let Ok(response) = call.await.expect("task") {
+                for outpoint in &response.outpoints {
+                    *handed
+                        .entry((outpoint.hash.encode(), outpoint.index))
+                        .or_insert(0) += 1;
+                }
+            }
+        }
+        let shared: Vec<_> = handed.iter().filter(|(_, n)| **n > 1).collect();
+        assert!(!handed.is_empty(), "something was funded");
+        assert!(
+            shared.is_empty(),
+            "outpoints given to more than one caller: {shared:?}"
         );
     }
 }
