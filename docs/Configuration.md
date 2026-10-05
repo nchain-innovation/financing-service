@@ -278,7 +278,7 @@ satoshis_per_kb = 100
 use_mapi_fee_quote = true
 ```
 
-* `satoshis_per_kb` — the rate, in satoshis per kilobyte. The fee for a transaction is `ceil(tx_bytes * satoshis_per_kb / 1000)`, rounded **up** so that rounding never underpays. Must be greater than zero; the service refuses to start otherwise, because a transaction paying no fee is not relayed. Default `100`.
+* `satoshis_per_kb` — the rate, in satoshis per kilobyte. The fee for a transaction is `ceil(tx_bytes * satoshis_per_kb / 1000)`, rounded **up** so that rounding never underpays. `tx_bytes` is the transaction's serialised size, counted as an upper bound: every output is its 8-byte value, its script's length prefix and the script, and every input is costed at the longest a signature can be. So a transaction never pays less than the rate on the bytes it actually has — until CS-471 each funded output was counted as its script alone, nine bytes short, and an ordinary transaction paid about 97 sat/KB at a configured 100. Must be greater than zero; the service refuses to start otherwise, because a transaction paying no fee is not relayed. Default `100`.
 * `use_mapi_fee_quote` — when `[mapi_lite]` is configured, take the rate from its `feeQuote` rather than from `satoshis_per_kb`. Default `true`. Without `[mapi_lite]` it has no effect, because there is nothing to ask.
 
 ### Dust change goes to the fee
@@ -314,7 +314,7 @@ The `index` in each `outpoints` entry of the `POST /fund` response is correct ei
 
 Before this section existed the fee was hardcoded as `((tx_bytes / 1000) * 500) + 750`. That is a step function rather than a rate: 750 satoshi for any transaction under a kilobyte, jumping by 500 at each kilobyte after.
 
-An ordinary funding transaction — one input, two outputs — is 217 bytes, so it used to pay **750** satoshi, an effective 3000 sat/KB. At the new default of 100 sat/KB it pays **22**.
+An ordinary funding transaction — one input, two outputs — is 226 bytes, so it used to pay **750** satoshi, an effective 3300 sat/KB. At the new default of 100 sat/KB it pays **23**.
 
 That is the point of the change, but it is a change in behaviour and not only a refactor: **an existing deployment that upgrades without adding a `[fees]` section will pay less than it used to.** Set `satoshis_per_kb` explicitly if you need the old figures, and note that a rate your miners will not accept is only discovered at broadcast.
 
