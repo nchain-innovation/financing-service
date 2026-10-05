@@ -81,7 +81,7 @@ Admin       ──REST──▶       │                │
 * **Multi-tx partial failure** — in `multiple_tx` mode, earlier successful broadcasts remain on-chain if a later step fails. The service resyncs UTXO state and returns HTTP 422 with code `partial_broadcast` and `description`, plus `outpoints` and `txs` for any transactions that were broadcast successfully.
 * **No HTTPS** — expected to be handled at the deployment layer (reverse proxy, firewall).
 * **Rate limiting behind a reverse proxy** — limits apply to the proxy's IP unless the proxy forwards the original client address and a custom key extractor is added.
-* **Same-client concurrent funding** — concurrent requests for one client can contend for the same UTXO; one may fail and trigger a resync. Different clients are not blocked by each other.
+* **Same-client concurrent funding** — concurrent requests for one client never spend the same input: each claims its inputs while planning. A request that finds every UTXO already claimed by requests still broadcasting is refused with `insufficient_balance` or `no_suitable_utxo` until one completes, so a client funded from a single UTXO funds one request at a time. Different clients are not blocked by each other.
 
 ## Open items
 

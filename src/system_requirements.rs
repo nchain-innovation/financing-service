@@ -145,6 +145,7 @@ mod tests {
     fn sr_lim_005_same_client_concurrency_is_covered_by_service_tests() {
         let source = include_str!("service.rs");
         assert!(source.contains("concurrent_fund_requests_for_same_client_do_not_block"));
+        assert!(source.contains("cs_473_contention_for_one_utxo_is_refused_rather_than_conflicted"));
     }
 
     #[test]
