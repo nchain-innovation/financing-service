@@ -343,18 +343,26 @@ impl Client {
         // look identical from here, so applying the rule to those would
         // release the reservation the moment it was made. Those are held
         // until they expire instead.
+        //
+        // That includes change the service has spent in turn. Its reservation
+        // is what keeps it out of the cache once the chain reports it, which
+        // can happen before the chain reports the transaction spending it: an
+        // index that has seen the parent but not yet the child. So pending
+        // change stays pending while it is spent, and its reservation stays
+        // with it (see `restore_pending_change`).
         let ours: std::collections::HashSet<OutPointKey> =
             self.pending_change.keys().cloned().collect();
-        self.reserved.retain(|key, _| {
-            ours.contains(key) || unspent.iter().any(|entry| &outpoint_key(entry) == key)
-        });
+        let reported: std::collections::HashSet<OutPointKey> =
+            unspent.iter().map(outpoint_key).collect();
+        self.reserved
+            .retain(|key, _| ours.contains(key) || reported.contains(key));
 
         self.unspent = unspent;
         if !self.reserved.is_empty() {
             self.unspent
                 .retain(|entry| !self.reserved.contains_key(&outpoint_key(entry)));
         }
-        self.restore_pending_change();
+        self.restore_pending_change(&reported);
         self.unspent.sort_by_key(|x| x.value);
     }
 
@@ -372,20 +380,29 @@ impl Client {
     /// does not yet say anything about a transaction still in the mempool. So
     /// the inputs it spent are held out of `unspent` and the change it created
     /// is put back here -- the two halves of the same gap. An entry goes once
-    /// the chain reports it, which is the chain catching up, or once the
-    /// service has spent it in turn.
+    /// the chain reports it, which is the chain catching up, or once it
+    /// expires.
+    ///
+    /// Change the service has spent in turn is kept, but not put back. It used
+    /// to be dropped, which also dropped the only thing holding its
+    /// reservation while the chain had never reported it: the next refresh
+    /// released the reservation as "no longer reported", and when the index
+    /// then caught up with the parent transaction but not yet the child, the
+    /// change read as unspent and was offered again -- a double spend the
+    /// upstream refuses, repeated until the index saw the child.
+    ///
+    /// `reported` is the chain's answer before reservations are taken out of
+    /// it, so spent change the chain has caught up with is recognised as such.
     ///
     /// Putting the entry back in `unspent` is all that is needed for it to
     /// count: the balance is derived from that set, not tracked alongside it.
-    fn restore_pending_change(&mut self) {
-        let reported: std::collections::HashSet<OutPointKey> =
-            self.unspent.iter().map(outpoint_key).collect();
+    fn restore_pending_change(&mut self, reported: &std::collections::HashSet<OutPointKey>) {
         self.pending_change.retain(|key, _| !reported.contains(key));
-        self.pending_change
-            .retain(|key, _| !self.reserved.contains_key(key));
 
-        for pending in self.pending_change.values() {
-            self.unspent.push(pending.entry.clone());
+        for (key, pending) in &self.pending_change {
+            if !self.reserved.contains_key(key) {
+                self.unspent.push(pending.entry.clone());
+            }
         }
     }
 
@@ -2488,6 +2505,60 @@ mod tests {
             3,
             "three requests must produce three different transactions"
         );
+    }
+
+    /// Change the service spends before the chain has reported it must stay
+    /// held until the chain has seen the spend, not just the change. An index
+    /// a refresh or two behind used to lose the hold, then -- having caught up
+    /// with the parent but not yet the child -- report the change as unspent,
+    /// and it was offered to the next request: a double spend, refused, and
+    /// refused again on every retry until the index saw the child.
+    #[test]
+    fn sr_fund_033_spent_own_change_is_not_offered_while_the_index_lags() {
+        let input = cs_426_utxo(1, 5_000);
+        let mut client = client_holding(vec![input.clone()]);
+        let parent = client
+            .create_funding_tx(&cs_426_request(1_000))
+            .expect("funds");
+        let change = client.unspent[0].clone();
+        assert_eq!(change.tx_hash, parent.hash().encode());
+        let child = client
+            .create_funding_tx(&cs_426_request(1_000))
+            .expect("funds from its own change");
+        assert_eq!(child.inputs[0].prev_output.hash.encode(), change.tx_hash);
+        let offered = |client: &Client| {
+            client
+                .unspent
+                .iter()
+                .any(|utxo| outpoint_key(utxo) == outpoint_key(&change))
+        };
+
+        // two refreshes from an index that has seen neither transaction
+        client.apply_chain_state(vec![input.clone()]);
+        client.apply_chain_state(vec![input.clone()]);
+        assert!(!offered(&client));
+
+        // the index has the parent, not yet the child, for a refresh or two
+        let parent_seen = vec![UtxoEntry {
+            height: -1,
+            ..change.clone()
+        }];
+        client.apply_chain_state(parent_seen.clone());
+        assert!(!offered(&client), "spent change offered again");
+        client.apply_chain_state(parent_seen);
+        assert!(!offered(&client), "spent change offered again");
+
+        // and once it has the child, there is nothing left to hold: what is
+        // left is the child's own change, as the chain reports it
+        let child_change = client
+            .unspent
+            .iter()
+            .find(|utxo| utxo.tx_hash == child.hash().encode())
+            .expect("the child's change is pending")
+            .clone();
+        client.apply_chain_state(vec![child_change.clone()]);
+        assert_eq!(client.reserved_outpoint_count(), 0);
+        assert_eq!(client.unspent, vec![child_change]);
     }
 
     /// The mechanism behind it. A refresh replaces the cache with what the
