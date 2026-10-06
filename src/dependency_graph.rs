@@ -94,7 +94,7 @@ mod tests {
 
     /// The lowest chain-gang this crate is correct against.
     ///
-    /// Three reasons, all about the WhatsOnChain interface.
+    /// Three reasons about the WhatsOnChain interface, and one about signing.
     ///
     /// 0.11.2 and earlier read UTXOs from `/unspent`, which stops at 1000
     /// entries and offers no way to ask for the rest, so a busy address came
@@ -117,10 +117,18 @@ mod tests {
     /// holds a spent input back for ten minutes (CS-465); a transaction still
     /// unconfirmed after that would otherwise have its input offered again, as
     /// if it were unspent.
-    const CHAIN_GANG_FLOOR: (u32, u32, u32) = (0, 11, 5);
+    ///
+    /// 0.11.6 builds the BIP143 script code correctly for every key. Earlier
+    /// releases found `OP_CODESEPARATOR` and `OP_CHECKSIG` by scanning raw
+    /// bytes, so a P2PKH locking script whose 20-byte hash contained two `0xab`
+    /// bytes was cut mid-hash and signed over the wrong digest (CS-483). Every
+    /// funding input is signed with the client's own key through that path, so
+    /// for about one client key in 345 every funding transaction was refused
+    /// on chain as `NULLFAIL`, whatever its fee or the load.
+    const CHAIN_GANG_FLOOR: (u32, u32, u32) = (0, 11, 6);
 
     #[test]
-    fn chain_gang_is_new_enough_to_read_a_whole_utxo_set() {
+    fn chain_gang_is_at_or_above_the_floor() {
         let versions = locked_versions(&lockfile(), "chain-gang");
         let [version] = versions.as_slice() else {
             // chain_gang_resolves_to_exactly_one_package reports this case
@@ -139,8 +147,9 @@ mod tests {
             "chain-gang {version} is below {CHAIN_GANG_FLOOR:?}. Below it a client address \
              with more than 1000 UTXOs reports only the first 1000 and the service refuses \
              funding it could cover, an address holding an unconfirmed output cannot be read \
-             at all, there is no way to bound the rate of the requests paging makes, and \
-             outputs already spent in the mempool are reported as unspent. \
+             at all, there is no way to bound the rate of the requests paging makes, \
+             outputs already spent in the mempool are reported as unspent, and about one \
+             client key in 345 signs every funding input over the wrong digest. \
              See docs/Dependencies.md.",
         );
     }
