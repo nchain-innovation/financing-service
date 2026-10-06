@@ -178,6 +178,18 @@ The logging level can be one of:
 * `debug` — detailed information
 * `trace` — very verbose information
 
+Every funding broadcast is logged before it is sent and again with its outcome, each line naming the transaction as `funding tx <txid>`:
+
+```text
+INFO  broadcasting funding tx <txid> (client_id=id1, outpoints=1, broadcaster=mapi-lite)
+INFO  broadcast accepted: funding tx <txid> (broadcaster=mapi-lite)
+WARN  broadcast failed: funding tx <txid> (class=rejected, broadcaster=mapi-lite): <upstream's reason>
+```
+
+`class` is `failed`, `rejected` or `indeterminate`, matching the `broadcast_failed`, `broadcast_rejected` or `broadcast_outcome_unknown` the caller was answered with. At `debug` the transaction's hex is logged too, as `funding tx <txid> hex=...`.
+
+**A release build logs only `warn` and above**, whatever `level` says: the levels below it are compiled out. In a release build, which is what the Docker image runs, a failed broadcast is logged but the attempt and acceptance lines are not.
+
 ## [telemetry]
 
 Optional OpenTelemetry trace export via OTLP (gRPC). Disabled by default.

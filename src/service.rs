@@ -1229,50 +1229,41 @@ impl Service {
             .ok_or_else(|| CodedError::internal("No funding transaction prepared."))?;
         let mut response = FundingResponse::default();
         response.txs.push(tx.clone());
-        log::info!("broadcasting funding tx {}", tx.hash().encode());
+        // One line before and one after every broadcast, each naming the
+        // transaction, so a txid found anywhere -- a caller's report, a block
+        // explorer -- leads to what happened to it (CS-482). `funding tx
+        // <txid>` is common to every line about a transaction, so one grep
+        // finds them all. The attempt line stays even though an outcome line
+        // follows: for an outcome that is unknown it is the only record that
+        // the transaction left.
+        let txid = tx.hash().encode();
+        log::info!(
+            "broadcasting funding tx {txid} (client_id={}, outpoints={}, broadcaster={})",
+            prepared.client_id,
+            prepared.no_of_outpoints,
+            broadcaster.name()
+        );
         log::debug!(
-            "funding tx hex = {}",
+            "funding tx {txid} hex={}",
             tx_as_hexstr(&tx).map_err(CodedError::internal)?
         );
         // The client sees a fixed message whatever the upstream said; the
         // detail, including the upstream's own reason and its view of whether
         // a resubmission could work, goes to the log through `BroadcastError`'s
         // Display.
-        //
-        // The code carries the distinctions the caller's next move depends on,
-        // and the three are genuinely different moves: a broadcast that failed
-        // spent nothing and may work on retry; one that was refused outright
-        // spent nothing and will never work on retry; one whose outcome is
-        // unknown may have spent everything.
-        broadcaster.broadcast_tx(&tx).await.map_err(|e| {
+        if let Err(e) = broadcaster.broadcast_tx(&tx).await {
+            let error = coded_broadcast_error(&e);
             log::warn!(
-                "Failed to broadcast funding transaction via {}: {e}",
+                "broadcast failed: funding tx {txid} (class={}, broadcaster={}): {e}",
+                broadcast_failure_class(error.code),
                 broadcaster.name()
             );
-            match e {
-                BroadcastError::Indeterminate(_) => CodedError::new(
-                    ErrorCode::BroadcastOutcomeUnknown,
-                    "The funding transaction was sent and its outcome is unknown; it may be on \
-                     the network. Do not retry with a new idempotency_key, which would risk \
-                     funding twice.",
-                ),
-                // The upstream looked at this transaction and will not take
-                // it however many times it is offered.
-                BroadcastError::Rejected {
-                    retryable: false, ..
-                } => CodedError::new(
-                    ErrorCode::BroadcastRejected,
-                    "The upstream refused the funding transaction and will not accept it on \
-                     retry. See the service log for its reason.",
-                ),
-                // Unreachable, or refused in a way the upstream itself called
-                // worth retrying. Either way nothing was spent.
-                _ => CodedError::new(
-                    ErrorCode::BroadcastFailed,
-                    "Failed to broadcast funding transaction.",
-                ),
-            }
-        })?;
+            return Err(error);
+        }
+        log::info!(
+            "broadcast accepted: funding tx {txid} (broadcaster={})",
+            broadcaster.name()
+        );
         let hash = tx.hash();
         // The funded outputs are the last `no_of_outpoints` of the
         // transaction. They used to be assumed to start at index 1, because a
@@ -1334,6 +1325,52 @@ async fn fetch_chain_state(
         .get_utxo(address)
         .await
         .map_err(|e| format!("get_utxo failed: {e}"))
+}
+
+/// The answer a caller gets for a broadcast that did not succeed.
+///
+/// The code carries the distinctions the caller's next move depends on, and
+/// the three are genuinely different moves: a broadcast that failed spent
+/// nothing and may work on retry; one that was refused outright spent nothing
+/// and will never work on retry; one whose outcome is unknown may have spent
+/// everything.
+fn coded_broadcast_error(error: &BroadcastError) -> CodedError {
+    match error {
+        BroadcastError::Indeterminate(_) => CodedError::new(
+            ErrorCode::BroadcastOutcomeUnknown,
+            "The funding transaction was sent and its outcome is unknown; it may be on the \
+             network. Do not retry with a new idempotency_key, which would risk funding twice.",
+        ),
+        // The upstream looked at this transaction and will not take it however
+        // many times it is offered.
+        BroadcastError::Rejected {
+            retryable: false, ..
+        } => CodedError::new(
+            ErrorCode::BroadcastRejected,
+            "The upstream refused the funding transaction and will not accept it on retry. \
+             See the service log for its reason.",
+        ),
+        // Unreachable, or refused in a way the upstream itself called worth
+        // retrying. Either way nothing was spent.
+        _ => CodedError::new(
+            ErrorCode::BroadcastFailed,
+            "Failed to broadcast funding transaction.",
+        ),
+    }
+}
+
+/// The class a failed broadcast is logged with (CS-482).
+///
+/// Read off the code the caller is answered with rather than off the
+/// upstream's error, so the log and the response cannot disagree: a refusal
+/// the upstream called retryable is answered `broadcast_failed`, and is logged
+/// as failed, not rejected.
+fn broadcast_failure_class(code: ErrorCode) -> &'static str {
+    match code {
+        ErrorCode::BroadcastRejected => "rejected",
+        ErrorCode::BroadcastOutcomeUnknown => "indeterminate",
+        _ => "failed",
+    }
 }
 
 #[cfg(test)]
@@ -2479,5 +2516,182 @@ mod tests {
                 .all(|code| *code == ErrorCode::FundsInFlight),
             "{refusals:?}"
         );
+    }
+
+    // ---- CS-482: every broadcast's outcome is logged with its txid ----
+
+    /// The lines this test's thread logged that name `txid`.
+    fn lines_naming(txid: &str) -> Vec<(log::Level, String)> {
+        crate::test_support::logged_on_this_thread()
+            .into_iter()
+            .filter(|(_, line)| line.contains(&format!("funding tx {txid}")))
+            .collect()
+    }
+
+    /// The txid of every attempt this test's thread logged, in order.
+    fn attempted_txids() -> Vec<String> {
+        crate::test_support::logged_on_this_thread()
+            .into_iter()
+            .filter_map(|(_, line)| {
+                line.strip_prefix("broadcasting funding tx ")
+                    .map(|rest| rest[..64].to_string())
+            })
+            .collect()
+    }
+
+    /// A success is logged as one: the attempt, naming the client, the
+    /// outpoint count and the broadcaster, then an acceptance. It used to log
+    /// nothing at all, so success could only be inferred from a failure line
+    /// not appearing.
+    #[tokio::test]
+    async fn cs_482_an_accepted_broadcast_is_logged_with_its_txid() {
+        crate::test_support::capture_logs();
+        let config = test_config(&unique_dynamic_config_path());
+        let service = service_with(
+            &config,
+            test_blockchain_interface(&config).await,
+            crate::test_support::CountingBroadcaster::new(),
+        )
+        .await;
+
+        let funded = Service::execute_funding(&service, &sample_fund_request(TEST_CLIENT_ID))
+            .await
+            .expect("funds");
+        let txid = funded.txs[0].hash().encode();
+
+        let lines = lines_naming(&txid);
+        let levels: Vec<_> = lines.iter().map(|(level, _)| *level).collect();
+        assert_eq!(
+            levels,
+            vec![log::Level::Info, log::Level::Debug, log::Level::Info],
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines[0].1,
+            format!(
+                "broadcasting funding tx {txid} (client_id={TEST_CLIENT_ID}, outpoints=1, \
+                 broadcaster=counting)"
+            )
+        );
+        assert!(
+            lines[1].1.starts_with(&format!("funding tx {txid} hex=")),
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines[2].1,
+            format!("broadcast accepted: funding tx {txid} (broadcaster=counting)")
+        );
+    }
+
+    /// A failure names the transaction, its class and the upstream's reason.
+    /// The class is the one the caller's error code says, so the log and the
+    /// response agree -- including a refusal the upstream called retryable,
+    /// which the caller is told is `broadcast_failed`.
+    #[tokio::test]
+    async fn cs_482_a_failed_broadcast_is_logged_with_its_txid_and_class() {
+        use crate::test_support::{RejectingBroadcaster, UncertainBroadcaster};
+
+        crate::test_support::capture_logs();
+        let cases: Vec<(Arc<dyn TxBroadcaster>, ErrorCode, &str, &str)> = vec![
+            (
+                RejectingBroadcaster::new(false),
+                ErrorCode::BroadcastRejected,
+                "class=rejected, broadcaster=rejecting",
+                "rejected: txn-mempool-conflict (retryable: false)",
+            ),
+            (
+                RejectingBroadcaster::new(true),
+                ErrorCode::BroadcastFailed,
+                "class=failed, broadcaster=rejecting",
+                "rejected: txn-mempool-conflict (retryable: true)",
+            ),
+            (
+                UncertainBroadcaster::new(),
+                ErrorCode::BroadcastOutcomeUnknown,
+                "class=indeterminate, broadcaster=uncertain",
+                "outcome unknown: simulated submit deadline expiry",
+            ),
+        ];
+        for (broadcaster, code, class, reason) in cases {
+            // Signing is deterministic, so every case builds the same
+            // transaction: read only what this case logged.
+            let already = crate::test_support::logged_on_this_thread().len();
+            let config = test_config(&unique_dynamic_config_path());
+            let service = service_with(
+                &config,
+                test_blockchain_interface(&config).await,
+                broadcaster,
+            )
+            .await;
+
+            let error = Service::execute_funding(&service, &sample_fund_request(TEST_CLIENT_ID))
+                .await
+                .expect_err("the broadcast does not succeed");
+            assert_eq!(error.code, code);
+
+            let txid = attempted_txids().pop().expect("the attempt was logged");
+            let this_case: Vec<_> = crate::test_support::logged_on_this_thread()
+                .split_off(already)
+                .into_iter()
+                .filter(|(_, line)| line.contains(&format!("funding tx {txid}")))
+                .collect();
+            let failure: Vec<_> = this_case
+                .iter()
+                .filter(|(level, _)| *level == log::Level::Warn)
+                .cloned()
+                .collect();
+            assert_eq!(
+                failure,
+                vec![(
+                    log::Level::Warn,
+                    format!("broadcast failed: funding tx {txid} ({class}): {reason}")
+                )],
+                "{code:?}"
+            );
+            assert!(
+                !this_case
+                    .iter()
+                    .any(|(_, line)| line.starts_with("broadcast accepted")),
+                "a failure is not also logged as accepted"
+            );
+        }
+    }
+
+    /// Separate transactions get a pair of lines each, so a partial broadcast
+    /// reads as accepted lines followed by one failure -- each naming its own
+    /// transaction.
+    #[tokio::test]
+    async fn cs_482_a_partial_broadcast_logs_each_transaction() {
+        crate::test_support::capture_logs();
+        let config = test_config(&unique_dynamic_config_path());
+        let service = service_with(
+            &config,
+            test_blockchain_interface(&config).await,
+            crate::test_support::FailingBroadcaster::new(1),
+        )
+        .await;
+        let request = FundRequest {
+            no_of_outpoints: 2,
+            multiple_tx: true,
+            ..sample_fund_request(TEST_CLIENT_ID)
+        };
+
+        let _ = Service::fund_with_multiple_transactions(&service, &request)
+            .await
+            .expect_err("the second transaction fails");
+
+        let txids = attempted_txids();
+        assert_eq!(txids.len(), 2, "{txids:?}");
+        assert_ne!(txids[0], txids[1]);
+        assert!(lines_naming(&txids[0])
+            .iter()
+            .any(|(level, line)| *level == log::Level::Info
+                && line.starts_with("broadcast accepted")));
+        assert!(lines_naming(&txids[1])
+            .iter()
+            .any(|(level, line)| *level == log::Level::Warn
+                && line.starts_with(&format!("broadcast failed: funding tx {}", txids[1]))
+                && line.contains("class=failed, broadcaster=failing")
+                && line.ends_with("upstream error: simulated broadcast failure")));
     }
 }

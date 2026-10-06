@@ -181,8 +181,10 @@ so they form one chain, and a transaction cannot confirm unless its inputs
 exist. If the last one confirmed, every ancestor confirmed with it.
 
 Take the txid from the service log. Every attempt is logged as
-`broadcasting funding tx <txid>`, so the last one is the last transaction the
-service tried to broadcast.
+`broadcasting funding tx <txid>`, and its outcome as `broadcast accepted:
+funding tx <txid>` or `broadcast failed: funding tx <txid> (class=...)`, so
+the last accepted line is the last transaction the upstream took. Searching
+for `funding tx <txid>` finds every line about one transaction.
 
 Look that txid up on a block explorer, or `getrawtransaction` on regtest.
 
