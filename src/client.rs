@@ -231,6 +231,12 @@ pub struct Client {
     /// has not been, or has been marked stale. Drives the freshness check
     /// that keeps a burst of requests from each fetching the same answer.
     chain_state_at: Option<Instant>,
+    /// Whether `unspent` can be funded from without fetching it first: it has
+    /// been taken from the chain at least once, and nothing has marked it
+    /// untrustworthy since. Not the same as fresh. A usable state can be older
+    /// than the window, and only then may a refresh run behind a funding
+    /// request instead of in front of it (SR-FUND-031).
+    chain_state_usable: bool,
     /// Keyed by outpoint, valued by when it was reserved. Only the moment is
     /// needed: the balance is derived from what is left in `unspent`, so
     /// removing the entry from there is all it takes to withhold its value.
@@ -289,6 +295,7 @@ impl Client {
             address,
             unspent: Vec::new(),
             chain_state_at: None,
+            chain_state_usable: false,
             reserved: HashMap::new(),
             pending_change: HashMap::new(),
             handed_out: HashMap::new(),
@@ -323,6 +330,7 @@ impl Client {
     /// would offer the same input to the next funding request.
     pub fn apply_chain_state(&mut self, unspent: Utxo) {
         self.chain_state_at = Some(Instant::now());
+        self.chain_state_usable = true;
         self.release_expired_reservations();
         self.expire_pending_change();
 
@@ -500,6 +508,17 @@ impl Client {
         }
     }
 
+    /// Whether the cached unspent set may be funded from without fetching it
+    /// first.
+    ///
+    /// False until the first refresh, since there is nothing to fund from, and
+    /// after [`Client::invalidate_chain_state`], since then the cache is known
+    /// not to be trustworthy. Merely being older than the window leaves it
+    /// usable: nothing says it is wrong, only that it may be behind.
+    pub fn chain_state_usable(&self) -> bool {
+        self.chain_state_usable
+    }
+
     /// Treat the cached chain state as stale, whatever its age.
     ///
     /// Used when something has happened that the cache cannot be trusted to
@@ -510,6 +529,9 @@ impl Client {
     /// the *next* request pay for it, and only if one comes.
     pub fn invalidate_chain_state(&mut self) {
         self.chain_state_at = None;
+        // Stale *and* untrusted, so the next request waits for the refresh
+        // even where staleness alone would let it run behind (SR-FUND-031).
+        self.chain_state_usable = false;
     }
 
     /// The client's balance, derived from its unspent set.

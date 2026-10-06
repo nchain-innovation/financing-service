@@ -136,6 +136,12 @@ pub struct Service {
     chain_health: Mutex<ChainHealth>,
     /// How old cached chain state may be before a request refreshes it.
     chain_state_max_age: Duration,
+    /// One lock per client, held for the length of a chain-state refresh, so a
+    /// client is never fetched twice at once -- whether the refresh was started
+    /// by a request, in the background, or by the periodic sweep (SR-FUND-032).
+    /// Two fetches of the same client in flight return the same answer and
+    /// spend the interface's allowance twice for it.
+    chain_refresh_locks: std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// The rate every client currently costs its transactions at, in satoshis
     /// per kilobyte (CS-451).
     ///
@@ -318,6 +324,7 @@ impl Service {
             mapi_health: Mutex::new(None),
             chain_health: Mutex::new(ChainHealth::default()),
             chain_state_max_age: config.service.chain_state_max_age(),
+            chain_refresh_locks: std::sync::Mutex::new(HashMap::new()),
             fee_satoshis_per_kb: Mutex::new(config.fees.satoshis_per_kb),
             use_mapi_fee_quote: config.fees.use_mapi_fee_quote,
             inflight_state_path,
@@ -543,6 +550,18 @@ impl Service {
         self.clients.read().await.get(client_id).cloned()
     }
 
+    /// The lock that serialises chain-state refreshes of `client_id`.
+    ///
+    /// A std mutex guards the map, never held across an await; the lock it
+    /// hands out is tokio's, held across the fetch.
+    fn chain_refresh_lock(&self, client_id: &str) -> Arc<Mutex<()>> {
+        let mut locks = self
+            .chain_refresh_locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::clone(locks.entry(client_id.to_string()).or_default())
+    }
+
     /// Write every client's in-flight funding state to disk (CS-465).
     ///
     /// Called after each commit, so what is on disk is never behind what has
@@ -737,9 +756,17 @@ impl Service {
     pub async fn refresh_balances(service: &Arc<Service>) {
         service.refresh_fee_rate().await;
         let (blockchain, handles) = {
-            let mut snapshot = Vec::new();
-            for client in service.client_handles().await {
-                snapshot.push((Arc::clone(&client), client.read().await.get_address()));
+            let clients: Vec<(String, Arc<RwLock<Client>>)> = service
+                .clients
+                .read()
+                .await
+                .iter()
+                .map(|(id, client)| (id.clone(), Arc::clone(client)))
+                .collect();
+            let mut snapshot = Vec::with_capacity(clients.len());
+            for (client_id, client) in clients {
+                let address = client.read().await.get_address();
+                snapshot.push((client_id, client, address));
             }
             (Arc::clone(&service.blockchain_interface), snapshot)
         };
@@ -753,22 +780,25 @@ impl Service {
         // -- the window equal to this period -- a client touched by traffic
         // since the last tick is already current, so the sweep pays only for
         // the quiet ones.
+        //
+        // Skip, too, a client whose refresh is already running -- a request's,
+        // or one started in the background (SR-FUND-032). It will bring that
+        // client up to date, and fetching alongside it would spend the
+        // allowance twice for one answer. Each client is applied as soon as it
+        // is fetched and its lock released, so a request waiting on one client
+        // does not wait for the whole sweep.
         let max_age = service.chain_state_max_age;
-        let mut chain_updates = Vec::with_capacity(handles.len());
-        for (client, address) in &handles {
+        let mut status = BlockchainConnectionStatus::Connected;
+        for (client_id, client, address) in handles {
             if client.read().await.chain_state_is_fresh(max_age) {
-                chain_updates.push(None);
                 continue;
             }
-            chain_updates.push(Some(fetch_chain_state(blockchain.as_ref(), address).await));
-        }
-
-        let mut status = BlockchainConnectionStatus::Connected;
-        for ((client, _), chain_state) in handles.into_iter().zip(chain_updates) {
-            match chain_state {
-                None => {}
-                Some(Ok(utxo)) => client.write().await.apply_chain_state(utxo),
-                Some(Err(e)) => {
+            let Ok(_refreshing) = service.chain_refresh_lock(&client_id).try_lock_owned() else {
+                continue;
+            };
+            match fetch_chain_state(blockchain.as_ref(), &address).await {
+                Ok(utxo) => client.write().await.apply_chain_state(utxo),
+                Err(e) => {
                     service.record_chain_failure(&e).await;
                     status = BlockchainConnectionStatus::Failed;
                 }
@@ -812,7 +842,101 @@ impl Service {
         {
             return Ok(());
         }
-        Self::refresh_client_chain_state(service, client_id).await
+        let lock = service.chain_refresh_lock(client_id);
+        let _refreshing = lock.lock().await;
+        // Checked again under the lock. Every request that found the state
+        // stale queues here; the first through refreshes it, and the rest find
+        // it fresh and reuse that answer instead of each fetching the same one
+        // behind the rate limit (SR-FUND-032). A zero window still refreshes
+        // for every request, one after another.
+        if client
+            .read()
+            .await
+            .chain_state_is_fresh(service.chain_state_max_age)
+        {
+            return Ok(());
+        }
+        Self::fetch_and_apply_chain_state(service, client_id).await
+    }
+
+    /// Make sure a funding request has chain state it may build on.
+    ///
+    /// With `[mapi_lite]` configured, a request whose cache is usable but
+    /// older than the window does not wait for the refresh: it is funded from
+    /// the cached state, and the refresh runs behind it (SR-FUND-031). The
+    /// broadcast goes to mapi-lite, so the request has no other reason to touch
+    /// the blockchain interface -- and on WhatsOnChain that interface is paced
+    /// at a few requests a second, which is what made funding calls queue.
+    ///
+    /// It still waits when the cache is not usable: before the client's state
+    /// has ever been loaded, and after a refused or uncertain broadcast has
+    /// marked it untrustworthy. Building on that view is the risk the refresh
+    /// exists to prevent.
+    ///
+    /// Without `[mapi_lite]` nothing changes. The broadcast itself goes through
+    /// the paced interface (SR-BCHN-013), so the request waits on it either
+    /// way, and a fresh view is worth the same wait.
+    pub async fn prepare_chain_state_for_funding(
+        service: &Arc<Service>,
+        client_id: &str,
+    ) -> Result<(), String> {
+        if service.mapi_lite_configured() {
+            let client = service
+                .client_handle(client_id)
+                .await
+                .ok_or_else(|| format!("Unknown client_id {client_id}"))?;
+            let (usable, fresh) = {
+                let client = client.read().await;
+                (
+                    client.chain_state_usable(),
+                    client.chain_state_is_fresh(service.chain_state_max_age),
+                )
+            };
+            if usable {
+                if !fresh {
+                    Self::refresh_chain_state_in_background(service, client_id);
+                }
+                return Ok(());
+            }
+        }
+        Self::refresh_client_chain_state_if_stale(service, client_id).await
+    }
+
+    /// Start a refresh of `client_id` that nobody waits for, unless one is
+    /// already running.
+    ///
+    /// The lock is taken before the task is spawned, so a burst of requests
+    /// that all find the state stale starts one refresh, not one each. A
+    /// refresh already in flight -- another request's, an earlier background
+    /// one, or the periodic sweep's -- will bring the cache up to date, so this
+    /// has nothing to add and does nothing.
+    fn refresh_chain_state_in_background(service: &Arc<Service>, client_id: &str) {
+        let Ok(refreshing) = service.chain_refresh_lock(client_id).try_lock_owned() else {
+            return;
+        };
+        let service = Arc::clone(service);
+        let client_id = client_id.to_string();
+        tokio::spawn(async move {
+            let _refreshing = refreshing;
+            // A refresh that finished between the caller's check and taking
+            // the lock has already done this one's work.
+            let fresh = match service.client_handle(&client_id).await {
+                Some(client) => client
+                    .read()
+                    .await
+                    .chain_state_is_fresh(service.chain_state_max_age),
+                None => return,
+            };
+            if fresh {
+                return;
+            }
+            if let Err(e) = Self::fetch_and_apply_chain_state(&service, &client_id).await {
+                // Already recorded as a chain failure. The request this was
+                // started for has been funded from the cache, so there is
+                // nobody to return it to.
+                log::warn!("background refresh_client_chain_state failed: {e}");
+            }
+        });
     }
 
     /// Mark a client's cached chain state stale, so the next request refreshes
@@ -828,7 +952,21 @@ impl Service {
     }
 
     /// Refresh one client's balance and UTXO set from the blockchain.
+    ///
+    /// Waits for any refresh of the same client already in flight, then
+    /// fetches regardless: callers of this one want a new answer, not a recent
+    /// one.
     pub async fn refresh_client_chain_state(
+        service: &Arc<Service>,
+        client_id: &str,
+    ) -> Result<(), String> {
+        let lock = service.chain_refresh_lock(client_id);
+        let _refreshing = lock.lock().await;
+        Self::fetch_and_apply_chain_state(service, client_id).await
+    }
+
+    /// The refresh itself. The caller holds the client's refresh lock.
+    async fn fetch_and_apply_chain_state(
         service: &Arc<Service>,
         client_id: &str,
     ) -> Result<(), String> {
@@ -1626,7 +1764,8 @@ mod tests {
         service: &Arc<Service>,
         fund_request: &FundRequest,
     ) -> Result<FundingResponse, CodedError> {
-        Service::refresh_client_chain_state_if_stale(service, &fund_request.client_id)
+        // The fund handler's path, so tests exercise what a request does.
+        Service::prepare_chain_state_for_funding(service, &fund_request.client_id)
             .await
             .map_err(CodedError::internal)?;
         Service::execute_funding(service, fund_request).await
@@ -1813,6 +1952,215 @@ mod tests {
             before,
             "the sweep refetched a client that was already current"
         );
+    }
+
+    // ---- SR-FUND-031/032, SR-BCHN-015: writes do not queue on the refresh ----
+
+    use crate::test_support::{GatedBlockchain, StubMapiBroadcaster};
+
+    /// Long enough for anything runnable to have run, on the current-thread
+    /// runtime a `#[tokio::test]` uses. Only ever used to show something did
+    /// NOT finish; nothing waits on it to succeed.
+    const SETTLE: std::time::Duration = std::time::Duration::from_millis(50);
+
+    /// A service with `[mapi_lite]` configured whose cache goes stale after
+    /// `seconds`, reading through a gate the test holds.
+    async fn mapi_lite_service(
+        seconds: u64,
+    ) -> (Arc<Service>, Arc<GatedBlockchain>, Arc<StubMapiBroadcaster>) {
+        let mut config = test_config(&unique_dynamic_config_path());
+        config.service.utxo_refresh_period = seconds;
+        let blockchain = GatedBlockchain::new(&config).await;
+        let broadcaster = StubMapiBroadcaster::new(true);
+        let service = service_with(&config, blockchain.clone(), broadcaster.clone()).await;
+        (service, blockchain, broadcaster)
+    }
+
+    /// Fund one transaction, failing the test rather than hanging it if the
+    /// write is held -- which is what a regression here would do.
+    async fn fund_without_waiting(service: &Arc<Service>) -> FundingResponse {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            fund_single_transaction(service, &sample_fund_request(TEST_CLIENT_ID)),
+        )
+        .await
+        .expect("the write waited on the paced interface")
+        .expect("funding should succeed")
+    }
+
+    fn fund_in_background(
+        service: &Arc<Service>,
+    ) -> tokio::task::JoinHandle<Result<FundingResponse, CodedError>> {
+        let service = Arc::clone(service);
+        tokio::spawn(async move {
+            fund_single_transaction(&service, &sample_fund_request(TEST_CLIENT_ID)).await
+        })
+    }
+
+    /// The point of the change. With mapi-lite taking the broadcast, a write
+    /// whose cache has merely aged is funded from it at once; the refresh it
+    /// prompts runs behind it, on an interface that is still paced.
+    #[tokio::test]
+    async fn sr_fund_031_a_mapi_lite_write_does_not_wait_for_a_stale_refresh() {
+        // a zero window: the cache is stale for every request
+        let (service, blockchain, broadcaster) = mapi_lite_service(0).await;
+        let before = blockchain.utxo_read_count();
+        blockchain.close();
+
+        let response = fund_without_waiting(&service).await;
+        assert_eq!(response.outpoints.len(), 1);
+        assert_eq!(broadcaster.broadcast_count(), 1);
+
+        tokio::time::sleep(SETTLE).await;
+        assert_eq!(
+            blockchain.utxo_read_count(),
+            before + 1,
+            "the stale cache should still have been refreshed, behind the write"
+        );
+        blockchain.open();
+    }
+
+    /// Without mapi-lite the broadcast goes through the paced interface, so
+    /// the write waits on it regardless and the refresh in front of it stays
+    /// where it was.
+    #[tokio::test]
+    async fn sr_fund_031_without_mapi_lite_a_stale_write_still_waits() {
+        let mut config = test_config(&unique_dynamic_config_path());
+        config.service.utxo_refresh_period = 0;
+        let blockchain = GatedBlockchain::new(&config).await;
+        let service = Arc::new(Service::new_for_test(&config, blockchain.clone()).await);
+        blockchain.close();
+
+        let write = fund_in_background(&service);
+        tokio::time::sleep(SETTLE).await;
+        assert!(
+            !write.is_finished(),
+            "the write should wait for the refresh"
+        );
+
+        blockchain.open();
+        write.await.unwrap().expect("funding should succeed");
+        assert_eq!(blockchain.broadcast_count(), 1);
+    }
+
+    /// A refused or uncertain broadcast is evidence the cache is wrong, so
+    /// the next write waits for a new view even with mapi-lite: funding from
+    /// the old one is the conflict the refresh is there to prevent.
+    #[tokio::test]
+    async fn sr_fund_031_an_invalidated_cache_makes_a_mapi_lite_write_wait() {
+        let (service, blockchain, broadcaster) = mapi_lite_service(3600).await;
+        Service::invalidate_chain_state(&service, TEST_CLIENT_ID).await;
+        let before = blockchain.utxo_read_count();
+        blockchain.close();
+
+        let write = fund_in_background(&service);
+        tokio::time::sleep(SETTLE).await;
+        assert!(
+            !write.is_finished(),
+            "the write should wait for the refresh"
+        );
+        assert_eq!(broadcaster.broadcast_count(), 0);
+
+        blockchain.open();
+        write.await.unwrap().expect("funding should succeed");
+        assert_eq!(blockchain.utxo_read_count(), before + 1);
+        assert_eq!(broadcaster.broadcast_count(), 1);
+    }
+
+    /// Requests that all find the cache stale share one fetch. Before, each
+    /// made its own, and on a paced interface every one past the first
+    /// queued for an answer the first had already fetched.
+    #[tokio::test]
+    async fn sr_fund_032_concurrent_stale_requests_share_one_refresh() {
+        let mut config = test_config(&unique_dynamic_config_path());
+        config.service.utxo_refresh_period = 3600;
+        let blockchain = GatedBlockchain::new(&config).await;
+        let service = Arc::new(Service::new_for_test(&config, blockchain.clone()).await);
+        Service::invalidate_chain_state(&service, TEST_CLIENT_ID).await;
+        let before = blockchain.utxo_read_count();
+        blockchain.close();
+
+        let requests: Vec<_> = (0..5)
+            .map(|_| {
+                let service = Arc::clone(&service);
+                tokio::spawn(async move {
+                    Service::refresh_client_chain_state_if_stale(&service, TEST_CLIENT_ID).await
+                })
+            })
+            .collect();
+        tokio::time::sleep(SETTLE).await;
+        assert_eq!(
+            blockchain.utxo_read_count(),
+            before + 1,
+            "one fetch in flight"
+        );
+
+        blockchain.open();
+        for request in requests {
+            request.await.unwrap().expect("refreshed");
+        }
+        assert_eq!(
+            blockchain.utxo_read_count(),
+            before + 1,
+            "the queued requests should have reused the first one's answer"
+        );
+    }
+
+    /// The background refresh is single-flighted too: a burst of mapi-lite
+    /// writes against a stale cache starts one, not one per write.
+    #[tokio::test]
+    async fn sr_fund_032_a_burst_of_mapi_lite_writes_starts_one_background_refresh() {
+        let (service, blockchain, broadcaster) = mapi_lite_service(0).await;
+        let before = blockchain.utxo_read_count();
+        blockchain.close();
+
+        for _ in 0..3 {
+            fund_without_waiting(&service).await;
+        }
+        tokio::time::sleep(SETTLE).await;
+
+        assert_eq!(broadcaster.broadcast_count(), 3);
+        assert_eq!(blockchain.utxo_read_count(), before + 1);
+        blockchain.open();
+    }
+
+    /// The periodic sweep leaves a client alone while a refresh of it is in
+    /// flight, rather than queueing a second fetch behind it.
+    #[tokio::test]
+    async fn sr_fund_032_the_periodic_sweep_skips_a_client_being_refreshed() {
+        let (service, blockchain, _broadcaster) = mapi_lite_service(0).await;
+        let before = blockchain.utxo_read_count();
+        blockchain.close();
+
+        fund_without_waiting(&service).await;
+        tokio::time::sleep(SETTLE).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            Service::refresh_balances(&service),
+        )
+        .await
+        .expect("the sweep waited on the refresh in flight");
+
+        assert_eq!(blockchain.utxo_read_count(), before + 1);
+        blockchain.open();
+    }
+
+    /// With mapi-lite, nothing a write waits on goes through the paced
+    /// interface: not the broadcast (SR-BCHN-009) and, with a usable cache,
+    /// not the refresh either. Held here at a closed gate, which is what a
+    /// paced interface with a queue in front of it looks like to a caller.
+    #[tokio::test]
+    async fn sr_bchn_015_a_mapi_lite_write_waits_on_nothing_from_the_paced_interface() {
+        let (service, blockchain, broadcaster) = mapi_lite_service(0).await;
+        blockchain.close();
+
+        for _ in 0..3 {
+            fund_without_waiting(&service).await;
+        }
+
+        assert_eq!(broadcaster.broadcast_count(), 3);
+        assert_eq!(blockchain.broadcast_count(), 0);
+        blockchain.open();
     }
 
     /// A service reading through `blockchain` and writing through
