@@ -253,6 +253,8 @@ After a restart the service now picks up where it stopped: inputs it spent stay 
 
 The ten-minute window is backed by the chain itself, from chain-gang 0.11.5. WhatsOnChain goes on listing an output after a mempool transaction spends it, flagged `isSpentInMempoolTx`; earlier chain-gang releases ignored the flag and reported such outputs as unspent, so a transaction still unconfirmed when its reservation ran out would have had its input offered again. Now the read interface drops them, the way a node's own `listunspent` does, and the reservation is a guard against the read interface lagging rather than the only thing standing between an input and a second spend.
 
+**Commits share writes** (CS-495). Each write serialises and flushes the whole state, so writing once per commit capped a busy client at the rate one write takes — and that rate falls as the state grows, which it does through each refresh window under load. Commits that finish while a write is in progress now wait for the next one, which covers them all, so a burst costs one write rather than one per request. Every request is still answered only after a write that includes it. The file is written compact rather than pretty-printed; `jq . dynamic.inflight.json` reads it.
+
 One window remains: the moment between a broadcast succeeding and the state reaching disk. A process killed in that moment can still lose it. A clean restart, or a crash at any other time, does not.
 
 ### How often the service reads the chain
