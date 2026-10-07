@@ -257,6 +257,88 @@ impl BlockchainInterface for CountingBlockchain {
     }
 }
 
+/// Test blockchain whose unspent-set reads can be held at a gate.
+///
+/// Stands in for an interface paced at a few requests a second, without the
+/// test waiting on a clock: while the gate is closed a refresh is in flight
+/// and cannot finish, so a test can tell a request that waits on the refresh
+/// from one that does not. Reads are counted on arrival, before the gate, so
+/// a refresh that has started counts even while it is held.
+pub struct GatedBlockchain {
+    inner: Arc<CountingBlockchain>,
+    open: tokio::sync::watch::Sender<bool>,
+    utxo_reads: AtomicU32,
+}
+
+impl GatedBlockchain {
+    /// Starts open, so the service's own startup load is not held.
+    pub async fn new(config: &Config) -> Arc<Self> {
+        Arc::new(Self {
+            inner: CountingBlockchain::new(config).await,
+            open: tokio::sync::watch::channel(true).0,
+            utxo_reads: AtomicU32::new(0),
+        })
+    }
+
+    /// Hold every unspent-set read from now until [`GatedBlockchain::open`].
+    pub fn close(&self) {
+        self.open.send_replace(false);
+    }
+
+    /// Release the reads being held, and stop holding new ones.
+    pub fn open(&self) {
+        self.open.send_replace(true);
+    }
+
+    pub fn broadcast_count(&self) -> u32 {
+        self.inner.broadcast_count()
+    }
+
+    /// Unspent-set reads started, including any held at the gate.
+    pub fn utxo_read_count(&self) -> u32 {
+        self.utxo_reads.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl BlockchainInterface for GatedBlockchain {
+    fn set_network(&mut self, _network: &Network) {}
+
+    async fn status(&self) -> Result<(), ChainGangError> {
+        self.inner.status().await
+    }
+
+    async fn get_balance(&self, address: &str) -> Result<Balance, ChainGangError> {
+        self.inner.get_balance(address).await
+    }
+
+    async fn get_utxo(&self, address: &str) -> Result<Utxo, ChainGangError> {
+        self.utxo_reads.fetch_add(1, Ordering::SeqCst);
+        self.open
+            .subscribe()
+            .wait_for(|open| *open)
+            .await
+            .expect("the gate outlives its readers");
+        self.inner.get_utxo(address).await
+    }
+
+    async fn broadcast_tx(&self, tx: &Tx) -> Result<String, ChainGangError> {
+        self.inner.broadcast_tx(tx).await
+    }
+
+    async fn get_tx(&self, txid: &str) -> Result<Tx, ChainGangError> {
+        self.inner.get_tx(txid).await
+    }
+
+    async fn get_latest_block_header(&self) -> Result<BlockHeader, ChainGangError> {
+        self.inner.get_latest_block_header().await
+    }
+
+    async fn get_block_headers(&self) -> Result<String, ChainGangError> {
+        self.inner.get_block_headers().await
+    }
+}
+
 /// Test blockchain that fails `broadcast_tx` after a configured number of successes.
 pub struct FailingBroadcastBlockchain {
     inner: tokio::sync::Mutex<TestInterface>,

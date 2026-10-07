@@ -265,6 +265,10 @@ So a request reuses the cached state while it is younger than `chain_state_max_a
 
 There is a backstop either way. A broadcast the upstream refuses — which is how a conflicting input shows up — marks the cached state stale, so the attempt after it works from a fresh read. Building on a stale view therefore costs one refused transaction, not a run of them.
 
+Requests that find the same client's state stale at the same moment **share one refresh**: the first fetches, and the rest wait for that answer rather than each fetching it again behind the rate limit. The periodic refresh leaves a client alone while a request is refreshing it.
+
+**With `[mapi_lite]`, a funding request does not wait for a refresh it only needs because the cache has aged.** The broadcast goes to mapi-lite, so the refresh in front of it was the only thing holding a `POST /fund` behind the paced interface. The request is funded from the cached state and the refresh runs behind it. The interface stays paced, so WhatsOnChain's limit is still respected. A request still waits when the cache is not usable: before a client's state has been loaded for the first time, and after a refused or uncertain broadcast has marked it stale (the backstop above). Without `[mapi_lite]` the broadcast itself goes through the paced interface, so nothing changes there. `GET /balance` always waits for a stale refresh, since a current balance is what it is asked for.
+
 ## [idempotency]
 
 Optional. Controls how long `POST /fund` idempotency records are retained; see [Idempotency](SupportedEndpoints.md#idempotency) for what they do. Both fields have defaults, so the section can be omitted entirely.
@@ -373,6 +377,7 @@ When the section is present the service:
 * Probes mapi-lite at startup (`GET /mapi/feeQuote`) and **warns** if it is unreachable, without refusing to start. Funding will fail until mapi-lite is reachable, but the read paths — `/status`, balances, UTXO refreshes — do not depend on it and keep serving, and the service recovers on its own when mapi-lite returns. Refusing to start would instead put the container in a restart loop driven by its own health check, taking the read paths down with it.
 * Probes mapi-lite for `GET /ready` and returns HTTP 503 when the probe fails, reusing a verdict for up to `health_timeout_seconds`. `GET /health` is unaffected. See [Readiness check](SupportedEndpoints.md#readiness-check).
 * Reports `"broadcaster": "mapi-lite"` in `GET /status`.
+* Funds a request from cached chain state that has merely aged, rather than waiting for it to be refreshed through `[blockchain_interface]`, and refreshes it behind the request — see [How often the service reads the chain](#how-often-the-service-reads-the-chain).
 * Submits each funding transaction as a one-element batch to `POST /mapi/txs`, with the merkle proof declined (no callbacks are wanted). A rejection by mapi-lite or the node surfaces to the caller as `broadcast_failed` (HTTP 502), with the reason in the service log. An answer that never arrives, or one this client cannot read, surfaces as `broadcast_outcome_unknown` (HTTP 504) instead, because the transaction may have reached the network.
 
 The mapi-lite server must be pointed at the same network as `network_type`, since the funding transactions are signed for that network. Because mapi-lite talks to a node directly, this is also a way to broadcast on regtest while still reading chain state through another interface.
