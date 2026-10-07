@@ -76,6 +76,18 @@ struct PendingChange {
     since: Instant,
 }
 
+/// Change this service created and then spent in a later transaction of its
+/// own, before the chain had reported that later transaction.
+///
+/// Keyed in [`Client`] by the txid of the spending transaction, because that
+/// is what the chain's answer proves: an output of that transaction listed as
+/// unspent means the chain has seen it, so it knows these are spent.
+#[derive(Clone, Debug)]
+struct SpentChange {
+    outpoints: Vec<OutPointKey>,
+    since: Instant,
+}
+
 /// A reservation, in a form that survives a restart (CS-465).
 ///
 /// `Instant` means nothing to another process, so the moment is stored as
@@ -231,6 +243,12 @@ pub struct Client {
     /// has not been, or has been marked stale. Drives the freshness check
     /// that keeps a burst of requests from each fetching the same answer.
     chain_state_at: Option<Instant>,
+    /// Whether `unspent` can be funded from without fetching it first: it has
+    /// been taken from the chain at least once, and nothing has marked it
+    /// untrustworthy since. Not the same as fresh. A usable state can be older
+    /// than the window, and only then may a refresh run behind a funding
+    /// request instead of in front of it (SR-FUND-031).
+    chain_state_usable: bool,
     /// Keyed by outpoint, valued by when it was reserved. Only the moment is
     /// needed: the balance is derived from what is left in `unspent`, so
     /// removing the entry from there is all it takes to withhold its value.
@@ -267,6 +285,16 @@ pub struct Client {
     /// request judged fundable on it will be. A plan whose change went to the
     /// fee returns nothing if it succeeds, so it is not recorded.
     in_flight_change: HashMap<String, PendingChange>,
+    /// The service's own change spent by each of its transactions the chain
+    /// has not been seen to report yet, by the spending txid (SR-FUND-033).
+    ///
+    /// Such change is reserved like any spent input, but the usual release --
+    /// "the chain no longer lists it" -- is unsound for it: the chain may
+    /// never have listed it, and may list it later, once it has seen the
+    /// transaction that created it but not yet the one that spent it. Released
+    /// instead when the chain lists an output of the spending transaction or
+    /// of anything built on it, which it cannot do without having seen it.
+    spent_change: HashMap<String, SpentChange>,
 }
 
 impl Client {
@@ -289,10 +317,12 @@ impl Client {
             address,
             unspent: Vec::new(),
             chain_state_at: None,
+            chain_state_usable: false,
             reserved: HashMap::new(),
             pending_change: HashMap::new(),
             handed_out: HashMap::new(),
             in_flight_change: HashMap::new(),
+            spent_change: HashMap::new(),
             fee_satoshis_per_kb: DEFAULT_SATOSHIS_PER_KB,
         })
     }
@@ -323,8 +353,12 @@ impl Client {
     /// would offer the same input to the next funding request.
     pub fn apply_chain_state(&mut self, unspent: Utxo) {
         self.chain_state_at = Some(Instant::now());
+        self.chain_state_usable = true;
         self.release_expired_reservations();
         self.expire_pending_change();
+        let reported: std::collections::HashSet<OutPointKey> =
+            unspent.iter().map(outpoint_key).collect();
+        self.release_seen_spent_change(&reported);
 
         // An outpoint the chain no longer reports as unspent has been spent,
         // so the reservation has done its job and can go.
@@ -334,11 +368,17 @@ impl Client {
         // "The chain stopped reporting it" and "the chain never reported it"
         // look identical from here, so applying the rule to those would
         // release the reservation the moment it was made. Those are held
-        // until they expire instead.
+        // until they expire instead. The same goes for change the service has
+        // spent in turn, until the chain is seen to know of the spend.
         let ours: std::collections::HashSet<OutPointKey> =
             self.pending_change.keys().cloned().collect();
+        let spent_ours: std::collections::HashSet<&OutPointKey> = self
+            .spent_change
+            .values()
+            .flat_map(|spent| &spent.outpoints)
+            .collect();
         self.reserved.retain(|key, _| {
-            ours.contains(key) || unspent.iter().any(|entry| &outpoint_key(entry) == key)
+            ours.contains(key) || spent_ours.contains(key) || reported.contains(key)
         });
 
         self.unspent = unspent;
@@ -355,6 +395,64 @@ impl Client {
         let now = Instant::now();
         self.pending_change
             .retain(|_, pending| now.duration_since(pending.since) < UNCERTAIN_SPEND_RESERVATION);
+        // Past the window its reservation has expired too, so there is
+        // nothing left for the record to hold.
+        self.spent_change
+            .retain(|_, spent| now.duration_since(spent.since) < UNCERTAIN_SPEND_RESERVATION);
+    }
+
+    /// Let go of spent change the chain has caught up with (SR-FUND-033).
+    ///
+    /// An output listed as unspent proves the chain has seen the transaction
+    /// that created it, and so every transaction that one was built on: the
+    /// change each of them spent is spent as far as the chain is concerned,
+    /// and its usual release applies from here. Walked from every listed
+    /// output, since the chain lists only the newest change in a run of the
+    /// service's own spends -- each earlier one is spent by the next.
+    fn release_seen_spent_change(&mut self, reported: &std::collections::HashSet<OutPointKey>) {
+        if self.spent_change.is_empty() {
+            return;
+        }
+        let mut seen: Vec<String> = reported
+            .iter()
+            .map(|(txid, _)| txid.clone())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        while let Some(txid) = seen.pop() {
+            if let Some(spent) = self.spent_change.remove(&txid) {
+                for outpoint in spent.outpoints {
+                    // Spent as far as the chain knows, so no longer pending
+                    // either; that would hold its reservation a refresh more.
+                    self.pending_change.remove(&outpoint);
+                    // It came from a transaction the chain has therefore seen
+                    // as well.
+                    seen.push(outpoint.0);
+                }
+            }
+        }
+    }
+
+    /// Note which of a transaction's inputs are the service's own change, so
+    /// their reservations outlast a chain that has not listed them yet.
+    ///
+    /// Own change is recognised by its txid: a transaction this service handed
+    /// out within the reservation window.
+    fn record_spent_change(&mut self, txid: &str, spent: &[UtxoEntry], now: Instant) {
+        let outpoints: Vec<OutPointKey> = spent
+            .iter()
+            .filter(|entry| self.handed_out.contains_key(&entry.tx_hash))
+            .map(outpoint_key)
+            .collect();
+        if !outpoints.is_empty() {
+            self.spent_change.insert(
+                txid.to_string(),
+                SpentChange {
+                    outpoints,
+                    since: now,
+                },
+            );
+        }
     }
 
     /// Put back the change the service has broadcast but the chain has not
@@ -487,6 +585,9 @@ impl Client {
         for since in self.reserved.values_mut() {
             *since -= by;
         }
+        for spent in self.spent_change.values_mut() {
+            spent.since -= by;
+        }
     }
 
     /// Whether the cached chain state is younger than `max_age`.
@@ -500,6 +601,17 @@ impl Client {
         }
     }
 
+    /// Whether the cached unspent set may be funded from without fetching it
+    /// first.
+    ///
+    /// False until the first refresh, since there is nothing to fund from, and
+    /// after [`Client::invalidate_chain_state`], since then the cache is known
+    /// not to be trustworthy. Merely being older than the window leaves it
+    /// usable: nothing says it is wrong, only that it may be behind.
+    pub fn chain_state_usable(&self) -> bool {
+        self.chain_state_usable
+    }
+
     /// Treat the cached chain state as stale, whatever its age.
     ///
     /// Used when something has happened that the cache cannot be trusted to
@@ -510,6 +622,9 @@ impl Client {
     /// the *next* request pay for it, and only if one comes.
     pub fn invalidate_chain_state(&mut self) {
         self.chain_state_at = None;
+        // Stale *and* untrusted, so the next request waits for the refresh
+        // even where staleness alone would let it run behind (SR-FUND-031).
+        self.chain_state_usable = false;
     }
 
     /// The client's balance, derived from its unspent set.
@@ -1201,6 +1316,7 @@ impl Client {
         let change_entry = plan.change_entry.clone();
         self.remove_spent(&plan.spent_outpoints, plan.change_entry);
         let now = Instant::now();
+        self.record_spent_change(&plan.txid, &plan.spent_outpoints, now);
         self.handed_out.insert(plan.txid, now);
         for entry in plan.spent_outpoints {
             self.reserved.insert(outpoint_key(&entry), now);
@@ -1310,6 +1426,7 @@ impl Client {
         // It may be on the network, so another request building the same
         // transaction would be a duplicate of it just the same.
         self.forget_expired_handed_out();
+        self.record_spent_change(&plan.txid, &plan.spent_outpoints, now);
         self.handed_out.insert(plan.txid.clone(), now);
         for entry in plan.spent_outpoints {
             log::warn!(
@@ -2466,6 +2583,113 @@ mod tests {
             3,
             "three requests must produce three different transactions"
         );
+    }
+
+    /// A run of spends of the service's own change, as a busy client makes:
+    /// each funding request takes the newest change, the smallest output.
+    /// Returns the change outputs in order, the last one still unspent.
+    fn spend_own_change(client: &mut Client, times: usize) -> Vec<UtxoEntry> {
+        let mut change = Vec::new();
+        for _ in 0..times {
+            let tx = client
+                .create_funding_tx(&cs_426_request(1_000))
+                .expect("funds");
+            let created = client
+                .unspent
+                .iter()
+                .find(|utxo| utxo.tx_hash == tx.hash().encode())
+                .expect("its change is in the cache")
+                .clone();
+            change.push(created);
+        }
+        change
+    }
+
+    /// Change the service spends before the chain has listed it must stay
+    /// held until the chain has seen the spend, not merely the change. An
+    /// index a refresh or two behind used to lose the hold, then -- having
+    /// caught up with the parent but not yet the child -- list the change as
+    /// unspent, and it was offered to the next request: a double spend,
+    /// refused, and refused again on each retry until the index saw the child.
+    #[test]
+    fn sr_fund_033_spent_own_change_is_not_offered_while_the_index_lags() {
+        let input = cs_426_utxo(1, 5_000);
+        let mut client = client_holding(vec![input.clone()]);
+        let change = spend_own_change(&mut client, 2);
+        let (parent_change, child_change) = (&change[0], &change[1]);
+        let offered = |client: &Client| {
+            client
+                .unspent
+                .iter()
+                .any(|utxo| outpoint_key(utxo) == outpoint_key(parent_change))
+        };
+
+        // two refreshes from an index that has seen neither transaction
+        client.apply_chain_state(vec![input.clone()]);
+        client.apply_chain_state(vec![input.clone()]);
+        assert!(!offered(&client));
+
+        // the index has the parent, not yet the child, for a refresh or two
+        let parent_seen = vec![UtxoEntry {
+            height: -1,
+            ..parent_change.clone()
+        }];
+        client.apply_chain_state(parent_seen.clone());
+        assert!(!offered(&client), "spent change offered again");
+        client.apply_chain_state(parent_seen);
+        assert!(!offered(&client), "spent change offered again");
+
+        // and once it lists the child's change, there is nothing left to hold
+        client.apply_chain_state(vec![child_change.clone()]);
+        assert_eq!(client.reserved_outpoint_count(), 0);
+        assert_eq!(client.unspent, vec![child_change.clone()]);
+    }
+
+    /// The cost side. Holding spent change until it expires would hold one
+    /// outpoint per request for ten minutes -- six thousand a minute at 100
+    /// requests a second, all rewritten to disk on every commit. The chain
+    /// lists only the newest change of a run, and that one listing is enough
+    /// to release everything before it.
+    #[test]
+    fn sr_fund_033_listing_the_newest_change_releases_the_whole_run() {
+        let mut client = client_holding(vec![cs_426_utxo(1, 1_000_000)]);
+        let change = spend_own_change(&mut client, 50);
+        let newest = change.last().unwrap().clone();
+        assert!(
+            client.reserved_outpoint_count() >= 50,
+            "every spend is held"
+        );
+
+        // what a node reports once it has the whole run: only its newest change
+        client.apply_chain_state(vec![newest.clone()]);
+
+        assert_eq!(client.reserved_outpoint_count(), 0);
+        assert!(client.spent_change.is_empty());
+        assert_eq!(client.unspent, vec![newest]);
+    }
+
+    /// A chain that is part way through the run releases the part it has seen
+    /// and keeps holding the rest.
+    #[test]
+    fn sr_fund_033_an_index_part_way_through_a_run_releases_only_what_it_has_seen() {
+        let mut client = client_holding(vec![cs_426_utxo(1, 1_000_000)]);
+        let change = spend_own_change(&mut client, 10);
+
+        // the index has the first five transactions: the fifth's change is the
+        // newest output it knows of, and is unspent as far as it can tell
+        client.apply_chain_state(vec![change[4].clone()]);
+
+        for (i, created) in change.iter().enumerate() {
+            let offered = client
+                .unspent
+                .iter()
+                .any(|utxo| outpoint_key(utxo) == outpoint_key(created));
+            // the last change is unspent and pending; every other one is spent
+            assert_eq!(offered, i == 9, "change {i}");
+        }
+        // change[0..4] released; change[4..9] still held, spent by
+        // transactions the index has not seen
+        assert_eq!(client.reserved_outpoint_count(), 5);
     }
 
     /// The mechanism behind it. A refresh replaces the cache with what the
