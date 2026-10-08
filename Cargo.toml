@@ -31,11 +31,12 @@ actix-governor = "0.10.0"
 # pins (cargo needs the ssh:// URL form, and .cargo/config.toml hands the fetch
 # to the system git). They MUST name the same rev, and that rev's chain-gang
 # requirement must be satisfiable by the chain-gang line above, or the graph
-# carries two chain-gangs and their types stop unifying. This is mapi-lite's
-# master on chain-gang 0.13, ahead of its v0.3.0 tag; teranode-event-rs is still
-# on v0.2.0 and chain-gang 0.11. See docs/Dependencies.md before changing it.
-uls-client = { git = "ssh://git@github.com/nchain-innovation/mapi-lite.git", rev = "9686a9071f22d648bea85efe10364965ef3d9439" }
-uls-core = { git = "ssh://git@github.com/nchain-innovation/mapi-lite.git", rev = "9686a9071f22d648bea85efe10364965ef3d9439" }
+# carries two chain-gangs and their types stop unifying. This is the commit
+# mapi-lite tagged v0.3.0, on chain-gang 0.13 -- pinned by rev, which unlike a
+# tag cannot move; teranode-event-rs is still on v0.2.0 and chain-gang 0.11.
+# See docs/Dependencies.md before changing it.
+uls-client = { git = "ssh://git@github.com/nchain-innovation/mapi-lite.git", rev = "d6aec86212b8d5bd310b247ec5fb6624c2c508d2" }
+uls-core = { git = "ssh://git@github.com/nchain-innovation/mapi-lite.git", rev = "d6aec86212b8d5bd310b247ec5fb6624c2c508d2" }
 # Only to build the timeout-bearing HTTP clients handed to uls-client, which
 # has no timeout setting of its own. Same major.minor as mapi-lite's so one
 # reqwest resolves; its TLS backend is whatever uls-client enables.

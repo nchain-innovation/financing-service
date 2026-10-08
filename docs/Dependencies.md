@@ -6,14 +6,14 @@ Most of this crate's dependencies come from crates.io and need nothing said abou
 
 | Crate | What it is | Source | Pin |
 |---|---|---|---|
-| `uls-client` | mapi-lite's typed HTTP client: `MapiClient::submit_transactions`, `fee_quote`, … | `ssh://git@github.com/nchain-innovation/mapi-lite.git` (**private**) | commit `9686a9071f22d648bea85efe10364965ef3d9439` |
+| `uls-client` | mapi-lite's typed HTTP client: `MapiClient::submit_transactions`, `fee_quote`, … | `ssh://git@github.com/nchain-innovation/mapi-lite.git` (**private**) | commit `d6aec86212b8d5bd310b247ec5fb6624c2c508d2` |
 | `uls-core` | The wire types and signed-envelope code both the server and client share | same repo, **same commit** | same |
 
 They exist for the optional mapi-lite transaction broadcaster (`src/broadcaster/mapi.rs`, configured by `[mapi_lite]`). They are compiled in whether or not that section is configured; a build without them is not offered, because a second build variant is more maintenance than the SSH requirement costs.
 
 ### Why a commit, not a tag or a version
 
-mapi-lite is not published to crates.io, and its newest tag, `v0.2.0`, is still on chain-gang 0.11. The pin names the `master` commit that moved it to chain-gang 0.13 (mapi-lite #67), which mapi-lite will release as `v0.3.0`; once that tag exists, pinning it instead is a no-op change.
+mapi-lite is not published to crates.io. The pin names the commit tagged `v0.3.0`, mapi-lite's first release on chain-gang 0.13. It names the commit rather than the tag because a tag can be moved and a commit cannot; `Cargo.lock` would record the commit either way, but a `rev` pin also keeps `Cargo.toml` honest about it, and `sr_bchn_009_uls_client_and_uls_core_are_pinned_to_one_mapi_lite_revision` relies on that form.
 
 `teranode-event-rs`, the other consumer, pins tag `v0.2.0` and is on chain-gang 0.11.6 until it makes the same move. The two pins differ, but the wire contract does not: between `v0.2.0`'s line and this commit, `uls-client` is unchanged and `uls-core` changed only its server-side configuration and metrics, not the wire types. When event-rs moves, it should take this commit or `v0.3.0`. The parent `uls-rs` repo's `scripts/preflight.sh` warns when a pin falls behind the mapi-lite checkout it is about to run.
 
