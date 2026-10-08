@@ -155,8 +155,17 @@ pub struct Service {
     /// (CS-465). See [`Config::inflight_state_path`].
     inflight_state_path: PathBuf,
     /// Serialises writes to that file, so two commits finishing together
-    /// cannot race and leave the older snapshot on disk.
-    inflight_save: Mutex<()>,
+    /// cannot race and leave the older snapshot on disk. Holds the ticket of
+    /// the newest commit the file on disk is known to include (CS-495).
+    inflight_save: Mutex<u64>,
+    /// Tickets handed to commits as they ask for a save, in order. A save
+    /// taken after reading this includes every commit holding a ticket up to
+    /// the value read, since each commit is applied before it takes one.
+    inflight_commits: std::sync::atomic::AtomicU64,
+    /// How many times the file has actually been written, so a test can tell
+    /// a shared save from one per commit.
+    #[cfg(test)]
+    inflight_writes: std::sync::atomic::AtomicU64,
 }
 
 /// Version of the in-flight state file's layout.
@@ -215,9 +224,13 @@ fn load_inflight_file(path: &Path) -> BTreeMap<String, InflightState> {
 
 /// Write `file` to `path` so that a reader never sees half of it: into a
 /// sibling first, flushed, then renamed over the original.
+///
+/// Compact rather than pretty-printed: it is written on the request path, and
+/// pretty-printing roughly doubles what has to be serialised and flushed
+/// (CS-495). `jq . <file>` reads it just as well.
 fn write_inflight_file(path: &Path, file: &InflightFile) -> std::io::Result<()> {
     use std::io::Write;
-    let text = serde_json::to_string_pretty(file).map_err(std::io::Error::other)?;
+    let text = serde_json::to_string(file).map_err(std::io::Error::other)?;
     let mut temporary = path.as_os_str().to_owned();
     temporary.push(".tmp");
     let temporary = PathBuf::from(temporary);
@@ -328,7 +341,10 @@ impl Service {
             fee_satoshis_per_kb: Mutex::new(config.fees.satoshis_per_kb),
             use_mapi_fee_quote: config.fees.use_mapi_fee_quote,
             inflight_state_path,
-            inflight_save: Mutex::new(()),
+            inflight_save: Mutex::new(0),
+            inflight_commits: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            inflight_writes: std::sync::atomic::AtomicU64::new(0),
             mapi_health_ttl: config
                 .mapi_lite
                 .as_ref()
@@ -562,18 +578,38 @@ impl Service {
         Arc::clone(locks.entry(client_id.to_string()).or_default())
     }
 
-    /// Write every client's in-flight funding state to disk (CS-465).
+    /// Write every client's in-flight funding state to disk (CS-465), or wait
+    /// for a write that already includes the caller's commit (CS-495).
     ///
     /// Called after each commit, so what is on disk is never behind what has
     /// been broadcast by more than the moment between the two. A failure is
     /// logged, not returned: the transaction is already on the network, and
     /// the caller has nothing it could do with the error.
     ///
+    /// Commits share writes. Each takes a ticket, then queues for the save
+    /// lock; whoever holds it snapshots every client and writes, and that
+    /// snapshot includes every commit ticketed before it was taken. A commit
+    /// that reaches the lock to find its ticket already written returns at
+    /// once. So the file is still written before any caller is answered, but
+    /// a burst of commits costs one write between them, not one each -- each
+    /// write serialises and flushes the whole state, and doing that per commit
+    /// is what capped a client at the rate one write takes.
+    ///
     /// The snapshot is taken under the save lock, not before it. Two commits
     /// finishing together would otherwise each snapshot, then write in either
     /// order -- and whichever snapshot is older could land last.
     pub async fn save_inflight_state(&self) {
-        let _serialised = self.inflight_save.lock().await;
+        use std::sync::atomic::Ordering;
+
+        // Taken after the caller applied its commit, so any snapshot that
+        // reads the counter first and the clients second includes it.
+        let ticket = self.inflight_commits.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut written_through = self.inflight_save.lock().await;
+        if *written_through >= ticket {
+            return;
+        }
+        let covers = self.inflight_commits.load(Ordering::SeqCst);
+
         let handles: Vec<(String, Arc<RwLock<Client>>)> = self
             .clients
             .read()
@@ -593,12 +629,24 @@ impl Service {
             version: INFLIGHT_FILE_VERSION,
             clients,
         };
-        if let Err(e) = write_inflight_file(&self.inflight_state_path, &file) {
-            log::error!(
+
+        // Off the async worker: the flush can take milliseconds, and the
+        // worker has other requests to serve meanwhile.
+        let path = self.inflight_state_path.clone();
+        let written = tokio::task::spawn_blocking(move || write_inflight_file(&path, &file))
+            .await
+            .unwrap_or_else(|e| Err(std::io::Error::other(e)));
+        #[cfg(test)]
+        self.inflight_writes.fetch_add(1, Ordering::SeqCst);
+        match written {
+            Ok(()) => *written_through = covers,
+            // Not marked written, so the next commit tries again rather than
+            // being told a failed write covered it.
+            Err(e) => log::error!(
                 "cannot save in-flight funding state to {}: {e}. A restart before the chain \
                  catches up could hand the same outpoints out again.",
                 self.inflight_state_path.display()
-            );
+            ),
         }
     }
 
@@ -2647,6 +2695,138 @@ mod tests {
         fund_single_transaction(&service, &sample_fund_request(TEST_CLIENT_ID))
             .await
             .expect("and funds as before");
+    }
+
+    // ---- CS-495: commits share in-flight saves ----
+
+    fn inflight_writes(service: &Service) -> u64 {
+        service
+            .inflight_writes
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn reservations_on_disk(config: &Config) -> usize {
+        load_inflight_file(&config.inflight_state_path())
+            .get(TEST_CLIENT_ID)
+            .map_or(0, |state| state.reserved.len())
+    }
+
+    /// The ticket's point. Commits that finish while a write is in progress
+    /// queue for the next one, and that one write covers all of them: three
+    /// fundings, one write, and all three of their spends on disk before any
+    /// of them is answered.
+    #[tokio::test]
+    async fn cs_495_commits_waiting_on_one_write_share_it() {
+        let config = test_config(&unique_dynamic_config_path());
+        let service = Arc::new(
+            Service::new_for_test(&config, test_blockchain_interface(&config).await).await,
+        );
+        let before = inflight_writes(&service);
+
+        // a write in progress
+        let writing = service.inflight_save.lock().await;
+        let requests: Vec<_> = (0..3)
+            .map(|_| {
+                let service = Arc::clone(&service);
+                tokio::spawn(async move {
+                    fund_single_transaction(&service, &sample_fund_request(TEST_CLIENT_ID)).await
+                })
+            })
+            .collect();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            requests.iter().all(|request| !request.is_finished()),
+            "a funding was answered before its spend was written"
+        );
+
+        drop(writing);
+        for request in requests {
+            request.await.unwrap().expect("funds");
+        }
+        assert_eq!(
+            inflight_writes(&service) - before,
+            1,
+            "one write for three commits"
+        );
+        assert_eq!(
+            reservations_on_disk(&config),
+            3,
+            "and it holds all three spends"
+        );
+    }
+
+    /// Sharing is only with commits already waiting. A commit that arrives
+    /// after a write has been taken is not in it, so it gets a write of its
+    /// own rather than being answered on the strength of an older one.
+    #[tokio::test]
+    async fn cs_495_a_commit_after_a_write_gets_the_next_one() {
+        let config = test_config(&unique_dynamic_config_path());
+        let service = Arc::new(
+            Service::new_for_test(&config, test_blockchain_interface(&config).await).await,
+        );
+        let before = inflight_writes(&service);
+
+        fund_single_transaction(&service, &sample_fund_request(TEST_CLIENT_ID))
+            .await
+            .expect("funds");
+        assert_eq!(reservations_on_disk(&config), 1);
+        fund_single_transaction(&service, &sample_fund_request(TEST_CLIENT_ID))
+            .await
+            .expect("funds");
+        assert_eq!(reservations_on_disk(&config), 2);
+        assert_eq!(inflight_writes(&service) - before, 2);
+    }
+
+    /// A write that fails covers nothing. Commits queued behind it are not
+    /// answered on the strength of it: the next one tries again. And once the
+    /// file can be written it holds every spend, including those whose own
+    /// write failed.
+    #[tokio::test]
+    async fn cs_495_a_failed_write_is_not_taken_as_covering_anything() {
+        let config = test_config(&unique_dynamic_config_path());
+        let service = Arc::new(
+            Service::new_for_test(&config, test_blockchain_interface(&config).await).await,
+        );
+        // nothing can be renamed over a directory that has something in it
+        let path = config.inflight_state_path();
+        let _ = std::fs::remove_file(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("occupied"), "").unwrap();
+        let before = inflight_writes(&service);
+
+        // two commits queued behind a write in progress, as in the sharing case
+        let writing = service.inflight_save.lock().await;
+        let requests: Vec<_> = (0..2)
+            .map(|_| {
+                let service = Arc::clone(&service);
+                tokio::spawn(async move {
+                    fund_single_transaction(&service, &sample_fund_request(TEST_CLIENT_ID)).await
+                })
+            })
+            .collect();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(writing);
+        for request in requests {
+            request
+                .await
+                .unwrap()
+                .expect("funds, though the state cannot be saved");
+        }
+        assert_eq!(
+            inflight_writes(&service) - before,
+            2,
+            "the second commit should have tried again after the first write failed"
+        );
+
+        std::fs::remove_dir_all(&path).unwrap();
+        fund_single_transaction(&service, &sample_fund_request(TEST_CLIENT_ID))
+            .await
+            .expect("funds");
+        assert_eq!(
+            reservations_on_disk(&config),
+            3,
+            "all three spends, once it could"
+        );
     }
 
     // ---- CS-473: concurrent requests for one client ----
