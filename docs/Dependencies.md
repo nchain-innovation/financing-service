@@ -6,14 +6,16 @@ Most of this crate's dependencies come from crates.io and need nothing said abou
 
 | Crate | What it is | Source | Pin |
 |---|---|---|---|
-| `uls-client` | mapi-lite's typed HTTP client: `MapiClient::submit_transactions`, `fee_quote`, … | `ssh://git@github.com/nchain-innovation/mapi-lite.git` (**private**) | commit `ab3c95846a72976783e5f2d901b69d75768426bc` |
+| `uls-client` | mapi-lite's typed HTTP client: `MapiClient::submit_transactions`, `fee_quote`, … | `ssh://git@github.com/nchain-innovation/mapi-lite.git` (**private**) | commit `9686a9071f22d648bea85efe10364965ef3d9439` |
 | `uls-core` | The wire types and signed-envelope code both the server and client share | same repo, **same commit** | same |
 
 They exist for the optional mapi-lite transaction broadcaster (`src/broadcaster/mapi.rs`, configured by `[mapi_lite]`). They are compiled in whether or not that section is configured; a build without them is not offered, because a second build variant is more maintenance than the SSH requirement costs.
 
 ### Why a commit, not a tag or a version
 
-mapi-lite has one tag (`v0.1.0`) and is not published to crates.io. The client surface this crate uses landed after that tag, so the pin names a `master` commit. It is the same commit `teranode-event-rs` pins, which keeps the two consumers of mapi-lite on one wire contract; the parent `uls-rs` repo's `scripts/preflight.sh` warns when a pin falls behind the mapi-lite checkout it is about to run.
+mapi-lite is not published to crates.io, and its newest tag, `v0.2.0`, is still on chain-gang 0.11. The pin names the `master` commit that moved it to chain-gang 0.13 (mapi-lite #67), which mapi-lite will release as `v0.3.0`; once that tag exists, pinning it instead is a no-op change.
+
+`teranode-event-rs`, the other consumer, pins tag `v0.2.0` and is on chain-gang 0.11.6 until it makes the same move. The two pins differ, but the wire contract does not: between `v0.2.0`'s line and this commit, `uls-client` is unchanged and `uls-core` changed only its server-side configuration and metrics, not the wire types. When event-rs moves, it should take this commit or `v0.3.0`. The parent `uls-rs` repo's `scripts/preflight.sh` warns when a pin falls behind the mapi-lite checkout it is about to run.
 
 ### Why the `ssh://` URL form
 
@@ -40,9 +42,9 @@ The same applies to `reqwest`, because `uls-client`'s error type wraps `reqwest:
 
 ### How to bump
 
-**chain-gang, within the range mapi-lite already asks for** (it asks for `0.11.0`, so anything `0.11.x`): raise the version in `Cargo.toml`, `cargo update -p chain-gang`, `cargo test`, commit `Cargo.lock`. Nothing about mapi-lite changes, because a patch release satisfies the requirement the pinned commit already states and Cargo unifies the two references on one package. `0.11.2` to `0.11.3` was done this way.
+**chain-gang, within the range mapi-lite already asks for** (it asks for `0.13.0`, so anything `0.13.x`): raise the version in `Cargo.toml`, `cargo update -p chain-gang`, `cargo test`, commit `Cargo.lock`. Nothing about mapi-lite changes, because a patch release satisfies the requirement the pinned commit already states and Cargo unifies the two references on one package. `0.11.2` to `0.11.3` was done this way.
 
-**chain-gang, out of that range** (`0.12` and up): move mapi-lite first. Once a mapi-lite commit on the new chain-gang exists, in one change here: repin `uls-client` and `uls-core` to that commit, raise `chain-gang` in `Cargo.toml`, run `cargo update -p chain-gang -p uls-client -p uls-core`, run `cargo test`, commit `Cargo.lock`.
+**chain-gang, out of that range** (`0.14` and up): move mapi-lite first. Once a mapi-lite commit on the new chain-gang exists, in one change here: repin `uls-client` and `uls-core` to that commit, raise `chain-gang` in `Cargo.toml`, run `cargo update -p chain-gang -p uls-client -p uls-core`, run `cargo test`, commit `Cargo.lock`. `0.11.6` to `0.13.0` was done this way.
 
 **mapi-lite alone** (no chain-gang change): edit both `rev`s to the same new commit, `cargo update -p uls-client -p uls-core`, `cargo test`, commit `Cargo.lock`. Check that `teranode-event-rs` is on the same commit, or the two services will speak subtly different wire contracts to the one mapi-lite they share.
 
