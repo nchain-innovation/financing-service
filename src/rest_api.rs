@@ -12,7 +12,7 @@ use crate::{
     responses::{
         coded_error_response, error_response, error_response_with_status, json_ok,
         partial_funding_error_response, AddressResponse, BalanceResponse, CodedError, ErrorCode,
-        HealthResponse, SuccessResponse,
+        HealthResponse, SuccessResponse, CHAIN_UNAVAILABLE,
     },
     secrets::{secret_reference, validate_env_var_name},
     service::Service,
@@ -236,7 +236,7 @@ pub async fn get_funds(
         Service::prepare_chain_state_for_funding(&data.service, client_id).await
     {
         log::warn!("refresh_client_chain_state failed: {}", description);
-        return error_response(ErrorCode::ChainUnavailable, description);
+        return error_response(ErrorCode::ChainUnavailable, CHAIN_UNAVAILABLE);
     }
 
     // Claim the `idempotency_key`, if the client supplied one, before anything
@@ -583,7 +583,7 @@ pub async fn balance(
         Service::refresh_client_chain_state_if_stale(&data.service, &client_id).await
     {
         log::warn!("refresh_client_chain_state failed: {}", description);
-        return error_response(ErrorCode::ChainUnavailable, description);
+        return error_response(ErrorCode::ChainUnavailable, CHAIN_UNAVAILABLE);
     }
 
     match data.service.get_balance_and_max_fundable(&client_id).await {
@@ -612,6 +612,7 @@ mod tests {
     use crate::{
         config::{ClientConfig, Config, RateLimitConfig},
         rate_limit,
+        responses::CHAIN_UNAVAILABLE,
         rest_api::{
             add_client, balance, delete_client, get_address, get_funds, health, index, ready,
             status, AppState,
@@ -2081,6 +2082,59 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body = String::from_utf8(test::read_body(resp).await.to_vec()).unwrap();
         assert!(!body.contains(secret_wif));
+    }
+
+    /// A chain read that fails names the address it could not reach -- a node
+    /// inside the network, or WhatsOnChain's URL. That is for the log: the
+    /// caller is told the chain is unavailable and nothing about where it
+    /// lives (CS-512). Event used to pass this description on to its own
+    /// callers word for word.
+    #[actix_web::test]
+    async fn sr_sec_016_chain_unavailable_does_not_disclose_the_chain_address() {
+        use crate::test_support::{
+            CountingBroadcaster, UnreadableBlockchain, UNREADABLE_CHAIN_URL,
+        };
+
+        let config = test_config(&unique_dynamic_config_path());
+        let blockchain = UnreadableBlockchain::new(&config).await;
+        let (app, _service) = build_app_over(&config, blockchain, CountingBroadcaster::new()).await;
+
+        let requests = [
+            (
+                "POST /fund",
+                test::TestRequest::post().uri("/fund").set_json(fund_body(
+                    TEST_CLIENT_ID,
+                    123,
+                    1,
+                    LOCKING_SCRIPT_HEX,
+                )),
+            ),
+            (
+                "POST /fund multiple_tx",
+                test::TestRequest::post().uri("/fund").set_json(json!({
+                    "client_id": TEST_CLIENT_ID,
+                    "satoshi": 123,
+                    "no_of_outpoints": 2,
+                    "multiple_tx": true,
+                    "locking_script": LOCKING_SCRIPT_HEX,
+                })),
+            ),
+            (
+                "GET balance",
+                test::TestRequest::get().uri(&format!("/client/{TEST_CLIENT_ID}/balance")),
+            ),
+        ];
+        for (name, request) in requests {
+            let resp = test::call_service(&app, request.to_request()).await;
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{name}");
+            let body: Value = test::read_body_json(resp).await;
+            assert_eq!(body["code"], "chain_unavailable", "{name}");
+            assert_eq!(body["description"], CHAIN_UNAVAILABLE, "{name}");
+            let text = body.to_string();
+            for leak in [UNREADABLE_CHAIN_URL, "10.20.30.40", "url", "get_utxo"] {
+                assert!(!text.contains(leak), "{name} disclosed {leak:?}: {text}");
+            }
+        }
     }
 
     #[actix_web::test]

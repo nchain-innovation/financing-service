@@ -256,7 +256,7 @@ The status is derived from the code, so a caller that cannot read the body — a
 | `broadcast_rejected` | 409 | The upstream looked at the transaction and refused it finally — either because it said so, or because it named a conflicting transaction | Nothing was spent, and **retrying will not help** — see below |
 | `broadcast_outcome_unknown` | 504 | The transaction was handed over and its fate is unknown — it may be on the network | **Do not retry with a new `idempotency_key`**; see below |
 | `partial_broadcast` | 422 | Some of the requested transactions broadcast, some did not | **Read the body** — the successful ones are in it |
-| `chain_unavailable` | 503 | The blockchain interface could not be reached | Retryable |
+| `chain_unavailable` | 503 | The blockchain interface could not be reached. The description is fixed; the read's own error, which names the interface's address, is in the service log | Retryable |
 | `internal` | 500 | Unexpected internal failure | Report it |
 | `unauthorized` | 401 | Authentication missing or invalid | Fix credentials |
 | `rate_limited` | 429 | Request rate exceeded | Retry after the interval in `description` |
