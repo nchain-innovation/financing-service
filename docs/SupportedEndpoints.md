@@ -208,9 +208,9 @@ The first call reserves the key and, once the transaction is broadcast, retains 
 |---|---|
 | New key | Funds normally, and the response is retained |
 | Same key, same request, already funded | Replays the first response with `"replayed": true`; nothing is broadcast |
-| Same key, still being processed | `422` `key_in_progress` — retry shortly |
+| Same key, still being processed | `409` `key_in_progress` — retry shortly |
 | Same key, materially different request | `422` `idempotency_key_reused` — use a fresh `idempotency_key` |
-| Refused before anything was built (`insufficient_balance`, `no_suitable_utxo`, `funds_in_flight`) | The key is freed, so it can be retried |
+| Refused before anything was built (`insufficient_balance`, `no_suitable_utxo`, `funds_in_flight`), or the broadcast certainly did not land (`broadcast_rejected`, `broadcast_failed`) | The key is freed, so it can be retried |
 
 **A replayed response is marked.** It carries `"replayed": true`; an ordinary funding response omits the field entirely, so read its absence as false.
 
@@ -227,7 +227,7 @@ Keys are scoped per `client_id`, so two clients may choose the same string witho
 **Two limits worth knowing:**
 
 * **Records are held in memory and are lost when the service restarts.** A retry that spans a restart can still produce a second funding transaction. Retention is bounded by `[idempotency] ttl_seconds` (default 600) and `max_entries` (default 10000); see [Configuration](Configuration.md).
-* **After a failure that may have spent something, the key is not freed** — only the refusals listed above free it. Any other failure leaves the key reserved until its TTL expires, and a retry with it returns `key_in_progress`. This is deliberate: a broadcast may have reached the node before the connection dropped, so releasing the key could cause the duplicate this mechanism exists to prevent. Use a fresh `idempotency_key` if you need to retry sooner.
+* **After a failure that may have spent something, the key is not freed** — only the outcomes listed above free it. Any other failure leaves the key reserved until its TTL expires, and a retry with it returns `key_in_progress`. This is deliberate: a broadcast may have reached the node before the connection dropped, so releasing the key could cause the duplicate this mechanism exists to prevent. Use a fresh `idempotency_key` if you need to retry sooner.
 
 ### Error responses
 
@@ -252,7 +252,7 @@ The status is derived from the code, so a caller that cannot read the body — a
 | `unknown_client` | 404 / 400 | No such `client_id`. 404 where the id is a path segment, 400 where it is a body field | Fix configuration; never retryable as-is |
 | `client_exists` | 409 | `client_id` is already configured | `POST /client` only |
 | `invalid_request` | 400 | The request is malformed | Fix the request; never retryable unchanged |
-| `broadcast_failed` | 502 | The upstream could not be reached, or refused the transaction in a way it said was worth retrying | Nothing was spent; retry may succeed |
+| `broadcast_failed` | 502 | The transaction certainly did not reach a node: the upstream could not be reached, answered that no node can have received it, or refused it in a way it said was worth retrying. Anything that may have landed is `broadcast_outcome_unknown` instead (CS-501) | Nothing was spent; retry may succeed, with the same `idempotency_key` |
 | `broadcast_rejected` | 409 | The upstream looked at the transaction and refused it finally — either because it said so, or because it named a conflicting transaction | Nothing was spent, and **retrying will not help** — see below |
 | `broadcast_outcome_unknown` | 504 | The transaction was handed over and its fate is unknown — it may be on the network | **Do not retry with a new `idempotency_key`**; see below |
 | `partial_broadcast` | 422 | Some of the requested transactions broadcast, some did not | **Read the body** — the successful ones are in it |
