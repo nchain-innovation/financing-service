@@ -16,19 +16,25 @@ Both scripts share `lib/`, so their numbers are comparable.
 
 ## Running
 
+`LOCKING_SCRIPT` is required and has no default: every funding pays real coins
+to that script, so you have to say where. Every `k6 run` below, including the
+later examples in this file, needs `-e LOCKING_SCRIPT=<hex>`; a run without it
+stops at start-up with an error.
+
 ```sh
 # Correctness: 5 sequential fundings, strict thresholds.
-k6 run tools/apigun/smoke.js
+k6 run -e LOCKING_SCRIPT=<hex> tools/apigun/smoke.js
 
 # Rate: hold 1, 2, 5, 10 and 20 req/s for 30s each.
-k6 run tools/apigun/breakpoint.js
+k6 run -e LOCKING_SCRIPT=<hex> tools/apigun/breakpoint.js
 ```
 
-Defaults point at `http://127.0.0.1:9080` and the `event-rs` client from
+Other defaults point at `http://127.0.0.1:9080` and the `event-rs` client from
 `data/financing-service.toml`. Override with `-e`:
 
 ```sh
 k6 run \
+  -e LOCKING_SCRIPT=<hex> \
   -e BASE_URL=http://127.0.0.1:9080 \
   -e CLIENT_ID=event-rs \
   -e API_KEY=secret \
@@ -258,7 +264,7 @@ needs the response check above to confirm it.
 | `SATOSHI` | `100` | both | Satoshi per outpoint. |
 | `NO_OF_OUTPOINTS` | `1` | both | Outpoints per request. |
 | `MULTIPLE_TX` | `false` | both | One transaction per outpoint instead of one carrying all. |
-| `LOCKING_SCRIPT` | a throwaway P2PKH | both | Hex locking script; see [docs/LockingScripts.md](../../docs/LockingScripts.md). |
+| `LOCKING_SCRIPT` | **required** | both | Hex locking script the funded outputs pay to; see [docs/LockingScripts.md](../../docs/LockingScripts.md). No default, because every request sends real coins there. |
 | `IDEMPOTENCY` | `off` | both | `unique` for a fresh `idempotency_key` per iteration, `replay` to reuse one key for the run. |
 | `TIMEOUT` | `30s` | both | Per-request timeout. |
 | `LOG_OUTPOINTS` | `false` | both | Print `outpoint=<hash>:<index>` per outpoint returned, for the duplicate check. Leave off for a TPS run. |
