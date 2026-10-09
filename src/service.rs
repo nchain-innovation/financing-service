@@ -1628,6 +1628,41 @@ mod tests {
         assert!(service.is_client_id_valid(TEST_CLIENT_ID).await);
     }
 
+    /// CS-502. A chain read that is accepted and never answered no longer
+    /// holds the client's refresh: it fails at the interface deadline, the
+    /// refresh lock is released, and the next refresh goes through.
+    #[tokio::test]
+    async fn cs_502_a_hung_chain_read_releases_the_refresh_at_the_deadline() {
+        use crate::interface_timeout::Bounded;
+        use crate::test_support::GatedBlockchain;
+
+        let config = test_config(&unique_dynamic_config_path());
+        let gated = GatedBlockchain::new(&config).await;
+        let bounded = Arc::new(Bounded::new(gated.clone(), Duration::from_millis(100)));
+        let service = Arc::new(Service::new_for_test(&config, bounded).await);
+        gated.close();
+
+        let started = Instant::now();
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            Service::refresh_client_chain_state(&service, TEST_CLIENT_ID),
+        )
+        .await
+        .expect("the refresh waited past the deadline")
+        .expect_err("the read never answered");
+        assert!(error.contains("did not answer"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        gated.open();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            Service::refresh_client_chain_state(&service, TEST_CLIENT_ID),
+        )
+        .await
+        .expect("the refresh lock was still held")
+        .expect("refreshes once the interface answers");
+    }
+
     fn sample_fund_request(client_id: &str) -> FundRequest {
         FundRequest {
             client_id: client_id.to_string(),

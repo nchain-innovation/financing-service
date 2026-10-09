@@ -40,7 +40,19 @@ pub struct BlockchainInterfaceConfig {
     /// `0` to turn the limit off.
     #[serde(default)]
     pub max_requests_per_second: Option<u32>,
+    /// Deadline on each call to the interface, in seconds (CS-502). Unset
+    /// means [`DEFAULT_INTERFACE_TIMEOUT_SECONDS`]; `0` turns it off.
+    ///
+    /// A call that outlives it fails as a chain failure, so a read that is
+    /// accepted and never answered cannot hold a client's refresh forever.
+    /// It bounds a whole call, which for WhatsOnChain's paged UTXO listing is
+    /// several paced requests, so leave room for the largest address.
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
 }
+
+/// The per-call deadline when `timeout_seconds` is unset (CS-502).
+pub const DEFAULT_INTERFACE_TIMEOUT_SECONDS: u64 = 30;
 
 fn default_rpc_import_addresses() -> bool {
     true
@@ -61,6 +73,7 @@ impl Default for BlockchainInterfaceConfig {
             rpc_password: None,
             rpc_import_addresses: default_rpc_import_addresses(),
             max_requests_per_second: None,
+            timeout_seconds: None,
         }
     }
 }
@@ -71,6 +84,18 @@ impl BlockchainInterfaceConfig {
     /// An explicit setting always wins, including an explicit `0` meaning
     /// unlimited. Otherwise only the interfaces that call somebody else's
     /// server are limited.
+    /// The deadline on each interface call, or `None` when it is turned off
+    /// (CS-502).
+    pub fn call_timeout(&self) -> Option<std::time::Duration> {
+        match self
+            .timeout_seconds
+            .unwrap_or(DEFAULT_INTERFACE_TIMEOUT_SECONDS)
+        {
+            0 => None,
+            seconds => Some(std::time::Duration::from_secs(seconds)),
+        }
+    }
+
     pub fn outbound_rate_limit(&self) -> Option<u32> {
         match self.max_requests_per_second {
             Some(0) => None,
@@ -1024,6 +1049,25 @@ filename = "./data/dynamic.toml"
         )
         .unwrap();
         assert!(config.rpc_import_addresses);
+    }
+
+    #[test]
+    fn cs_502_the_interface_deadline_defaults_to_30s_and_0_turns_it_off() {
+        let unset = BlockchainInterfaceConfig::default();
+        assert_eq!(
+            unset.call_timeout(),
+            Some(std::time::Duration::from_secs(30))
+        );
+        let off = BlockchainInterfaceConfig {
+            timeout_seconds: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(off.call_timeout(), None);
+        let set = BlockchainInterfaceConfig {
+            timeout_seconds: Some(7),
+            ..Default::default()
+        };
+        assert_eq!(set.call_timeout(), Some(std::time::Duration::from_secs(7)));
     }
 
     #[test]

@@ -19,6 +19,7 @@ network_type = "testnet"
 # rpc_password = "env:FS_RPC_PASSWORD"    # required for rpc
 # rpc_import_addresses = true             # rpc only; default true
 # max_requests_per_second = 3             # default 3 for woc, unset otherwise
+# timeout_seconds = 30                    # deadline on each interface call; 0 turns it off
 ```
 
 Supported `network_type` values: `mainnet`, `testnet`, `stn`, `regtest`.
@@ -113,6 +114,14 @@ The recovery line matters as much as the warnings. Without it, warnings simply s
 Note that `GET /health` stays `ok` throughout: it is a liveness check and deliberately depends on no upstream. `GET /ready` is the endpoint that reflects whether the service can do its job.
 
 **`test` is a fixture, not a backend.** It is an in-process stub used by the unit tests, with a UTXO set injected directly by the test harness. It has no network of its own, so the `network_type` you set alongside it only affects address encoding. It will start and serve requests as a configured backend, but its UTXO set is empty, so balances read zero and funding is refused — useful for exercising the API surface, not for funding anything.
+
+### Every interface call has a deadline
+
+`timeout_seconds` (default `30`) bounds each call to the blockchain interface — a chain refresh, the startup status check, a broadcast when `[mapi_lite]` is not configured — including any wait for a rate-limit slot. A call that outlives it fails like any other chain failure, and is logged and counted the same way (CS-502).
+
+It exists because WhatsOnChain's client has no timeout of its own, and a read that is accepted and never answered would otherwise wait forever. Chain refreshes are one at a time per client, so that one read would hold the client's refresh: every request needing a fresh read would queue behind it and the periodic refresh would skip the client, with nothing logged. A broadcast that runs out of time is reported as `broadcast_outcome_unknown`, since it may have reached the network.
+
+It bounds a whole call, and WhatsOnChain's UTXO listing is one call made of several paced page requests, so leave room for the largest address the service funds from. `0` turns the deadline off and logs a warning at startup.
 
 ### A note on the default port
 

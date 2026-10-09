@@ -6,6 +6,7 @@ use chain_gang::interface::{
 
 use crate::address_watcher::AddressWatcher;
 use crate::config::Config;
+use crate::interface_timeout::Bounded;
 use crate::outbound_rate_limit::RateLimited;
 
 /// A configured backend, plus the means to tell it which addresses to watch
@@ -36,6 +37,31 @@ fn paces_its_own_requests(interface_type: &str) -> bool {
 
 /// Takes a config and returns the appropriate configured object that implements BlockchainInterface
 pub fn blockchain_factory(config: &Config) -> Result<Backend, String> {
+    let backend = paced_backend(config)?;
+    // Outermost, so the deadline covers a call's wait for a pacing slot as
+    // well as the call itself: what it bounds is how long a caller waits.
+    match config.blockchain_interface.call_timeout() {
+        Some(timeout) => {
+            log::info!(
+                "bounding each blockchain interface call to {}s",
+                timeout.as_secs()
+            );
+            Ok(Backend {
+                interface: Arc::new(Bounded::new(backend.interface, timeout)),
+                address_watcher: backend.address_watcher,
+            })
+        }
+        None => {
+            log::warn!(
+                "blockchain interface calls have no deadline (timeout_seconds = 0): a read \
+                 that is never answered will hold that client's chain refresh forever"
+            );
+            Ok(backend)
+        }
+    }
+}
+
+fn paced_backend(config: &Config) -> Result<Backend, String> {
     let limit = config.blockchain_interface.outbound_rate_limit();
     let interface_type = config.blockchain_interface.interface_type.as_str();
     let backend = build_backend(config, limit)?;

@@ -1,0 +1,160 @@
+//! A deadline on every blockchain interface call (CS-502).
+//!
+//! chain-gang's WhatsOnChain client calls `reqwest::get`, which has no timeout,
+//! so a read that is accepted and never answered waits forever. Since chain
+//! state refreshes are single-flighted per client (SR-FUND-032), that one read
+//! also holds the client's refresh lock forever: every request that needs a
+//! fresh read queues behind it, the periodic sweep skips the client, and
+//! nothing is logged. Bounding each call here covers every interface and every
+//! caller -- refreshes, the startup status check, the sweep -- without
+//! depending on how a given interface builds its HTTP client.
+
+use std::future::Future;
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use chain_gang::interface::{Balance, BlockchainInterface, Utxo};
+use chain_gang::messages::{BlockHeader, Tx};
+use chain_gang::network::Network;
+use chain_gang::util::ChainGangError;
+
+/// Wraps a blockchain interface and fails any call that outlives `timeout`.
+pub struct Bounded {
+    inner: Arc<dyn BlockchainInterface + Send + Sync>,
+    timeout: Duration,
+}
+
+impl Bounded {
+    pub fn new(inner: Arc<dyn BlockchainInterface + Send + Sync>, timeout: Duration) -> Self {
+        Self { inner, timeout }
+    }
+
+    async fn bound<T>(
+        &self,
+        call: &str,
+        future: impl Future<Output = Result<T, ChainGangError>>,
+    ) -> Result<T, ChainGangError> {
+        match tokio::time::timeout(self.timeout, future).await {
+            Ok(result) => result,
+            Err(_) => Err(timed_out(call, self.timeout)),
+        }
+    }
+}
+
+/// The error a call that ran out of time is reported with.
+///
+/// chain-gang has no timeout variant, so it is an I/O error of kind
+/// `TimedOut`, which [`is_timeout`] recognises.
+fn timed_out(call: &str, after: Duration) -> ChainGangError {
+    ChainGangError::IoError(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!(
+            "{call} did not answer within {}s (blockchain_interface.timeout_seconds)",
+            after.as_secs()
+        ),
+    ))
+}
+
+/// Whether `error` says a call may have been carried out although it failed:
+/// it ran out of time (here, or in the interface's own HTTP client) or lost its
+/// answer after the request was sent.
+///
+/// For a broadcast that is the difference between "nothing was spent" and "the
+/// transaction may be on the network" (CS-501, CS-502). An HTTP error status
+/// is the server answering, so it is not one of these.
+pub fn may_have_been_delivered(error: &ChainGangError) -> bool {
+    match error {
+        ChainGangError::IoError(e) => e.kind() == std::io::ErrorKind::TimedOut,
+        ChainGangError::ReqwestError(e) => e.is_timeout() || (e.is_request() && !e.is_connect()),
+        _ => false,
+    }
+}
+
+/// Whether `error` is a call running out of time.
+#[cfg(test)]
+pub fn is_timeout(error: &ChainGangError) -> bool {
+    matches!(error, ChainGangError::IoError(e) if e.kind() == std::io::ErrorKind::TimedOut)
+}
+
+#[async_trait]
+impl BlockchainInterface for Bounded {
+    fn set_network(&mut self, _network: &Network) {
+        // The wrapped interface is configured before it is wrapped, as for
+        // `RateLimited`.
+    }
+
+    async fn status(&self) -> Result<(), ChainGangError> {
+        self.bound("status", self.inner.status()).await
+    }
+
+    async fn get_balance(&self, address: &str) -> Result<Balance, ChainGangError> {
+        self.bound("get_balance", self.inner.get_balance(address))
+            .await
+    }
+
+    async fn get_utxo(&self, address: &str) -> Result<Utxo, ChainGangError> {
+        self.bound("get_utxo", self.inner.get_utxo(address)).await
+    }
+
+    async fn broadcast_tx(&self, tx: &Tx) -> Result<String, ChainGangError> {
+        self.bound("broadcast_tx", self.inner.broadcast_tx(tx))
+            .await
+    }
+
+    async fn get_tx(&self, txid: &str) -> Result<Tx, ChainGangError> {
+        self.bound("get_tx", self.inner.get_tx(txid)).await
+    }
+
+    async fn get_latest_block_header(&self) -> Result<BlockHeader, ChainGangError> {
+        self.bound(
+            "get_latest_block_header",
+            self.inner.get_latest_block_header(),
+        )
+        .await
+    }
+
+    async fn get_block_headers(&self) -> Result<String, ChainGangError> {
+        self.bound("get_block_headers", self.inner.get_block_headers())
+            .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{test_config, unique_dynamic_config_path, GatedBlockchain};
+
+    /// CS-502. A read that is accepted and never answered fails at the
+    /// deadline, as a timeout, rather than waiting forever.
+    #[tokio::test]
+    async fn a_read_that_never_answers_times_out() {
+        let config = test_config(&unique_dynamic_config_path());
+        let gated = GatedBlockchain::new(&config).await;
+        gated.close();
+        let bounded = Bounded::new(gated.clone(), Duration::from_millis(50));
+
+        // Bounded from outside as well, so a regression fails here instead
+        // of hanging the suite -- the very failure this guards against.
+        let error = tokio::time::timeout(Duration::from_secs(5), bounded.get_utxo("anything"))
+            .await
+            .expect("the read was not bounded")
+            .unwrap_err();
+        assert!(is_timeout(&error), "{error}");
+        assert!(may_have_been_delivered(&error));
+        gated.open();
+    }
+
+    /// A call that answers in time is passed through untouched.
+    #[tokio::test]
+    async fn a_call_inside_the_deadline_is_unchanged() {
+        let config = test_config(&unique_dynamic_config_path());
+        let gated = GatedBlockchain::new(&config).await;
+        let bounded = Bounded::new(gated.clone(), Duration::from_secs(5));
+        bounded
+            .get_utxo(crate::test_support::TEST_ADDRESS)
+            .await
+            .unwrap();
+        assert_eq!(gated.utxo_read_count(), 1);
+    }
+}
