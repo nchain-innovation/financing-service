@@ -439,12 +439,16 @@ fn replay(outcome: Outcome) -> HttpResponse {
 /// answered and refused the transaction, which is as definite as "nothing was
 /// spent" gets -- and since that rejection will not change on a resubmission,
 /// holding the key would only stop the client using it for the corrected
-/// request.
+/// request. `broadcast_failed` is safe since CS-501: it now means the
+/// transaction certainly did not reach a node -- a refused connection, a
+/// mapi-lite `503`, or a refusal the node said was worth retrying -- because
+/// every failure that may have delivered it is `broadcast_outcome_unknown`.
+/// Its documented advice is "retry may succeed", and holding the key made
+/// that retry impossible with the same key.
 ///
-/// Everything else is left to expire. `broadcast_failed` covers an unreachable
-/// upstream as well as a retryable refusal; `broadcast_outcome_unknown` is
-/// unknown by definition; and a commit failure means the transaction is
-/// definitely on chain. The cost is that the same `idempotency_key` cannot be
+/// Everything else is left to expire. `broadcast_outcome_unknown` is unknown
+/// by definition, and a commit failure means the transaction is definitely on
+/// chain. The cost is that the same `idempotency_key` cannot be
 /// retried until the TTL elapses; the alternative risks the duplicate this
 /// whole mechanism exists to prevent.
 async fn release_if_nothing_was_spent(
@@ -458,6 +462,7 @@ async fn release_if_nothing_was_spent(
             | ErrorCode::NoSuitableUtxo
             | ErrorCode::FundsInFlight
             | ErrorCode::BroadcastRejected
+            | ErrorCode::BroadcastFailed
     );
     if certainly_pre_broadcast {
         if let Some((key, _)) = record {
@@ -2239,6 +2244,31 @@ mod tests {
             assert_eq!(resp.status(), StatusCode::CONFLICT);
             let json: Value = test::read_body_json(resp).await;
             assert_eq!(json["code"], "broadcast_rejected");
+        }
+    }
+
+    /// `broadcast_failed` now means the transaction certainly did not reach a
+    /// node (CS-501), and its advice is "retry may succeed" -- so the key is
+    /// free, and the retry is processed rather than refused as
+    /// `key_in_progress`.
+    #[actix_web::test]
+    async fn cs_501_a_retryable_refusal_releases_the_idempotency_key() {
+        let (app, _service) = build_app_with_rejecting_broadcaster(true).await;
+        let mut body = fund_body(TEST_CLIENT_ID, 123, 1, LOCKING_SCRIPT_HEX);
+        body["idempotency_key"] = json!("failed-1");
+
+        for _ in 0..2 {
+            let resp = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri("/fund")
+                    .set_json(body.clone())
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+            let json: Value = test::read_body_json(resp).await;
+            assert_eq!(json["code"], "broadcast_failed");
         }
     }
 

@@ -103,10 +103,18 @@ impl MapiBroadcaster {
             .min(RETRY_BACKOFF_CAP)
     }
 
+    /// Whether the one result is mapi-lite saying the node took the
+    /// transaction but it could not record that (CS-501).
+    fn accepted_but_unrecorded(payload: &uls_client::TxsPayload) -> bool {
+        matches!(payload.txs.as_slice(), [result] if result.accepted_but_unrecorded())
+    }
+
     /// Turn a submit response into a txid or an error.
     ///
     /// Everything here is the server's answer about our transaction, so none
-    /// of it is retried: it is settled, however unwelcome.
+    /// of it is retried: it is settled, however unwelcome. The one exception,
+    /// an acceptance mapi-lite could not record, is not a verdict and is
+    /// handled before this is reached.
     fn read_result(
         payload: uls_client::TxsPayload,
         expected: &str,
@@ -245,32 +253,17 @@ impl From<ClientError> for BroadcastError {
     /// sent and never answered may have taken everything.
     fn from(error: ClientError) -> Self {
         let detail = error.to_string();
-        match error {
-            // Sent, and no answer came back within the request timeout. The
-            // server may have relayed the transaction and been slow to say so.
-            ClientError::Transport(e) if e.is_timeout() => BroadcastError::Indeterminate(detail),
-            // The server answered and the answer is unreadable, so it took the
-            // transaction and its verdict is lost to us.
-            ClientError::Decode(_) | ClientError::BadSignature => {
-                BroadcastError::Indeterminate(detail)
-            }
-            // A refused or unresolvable connection never delivered anything,
-            // and an HTTP error status is the server declining to act. Both
-            // leave the transaction where it was built.
-            //
-            // `RetriesExhausted` lands here too, and that one is a judgement
-            // call: uls-client renders the last attempt's cause to a string,
-            // and a refused connection and an expired timeout render
-            // identically, so the distinction cannot be recovered. Calling it
-            // determinate is right for the failure that actually produces it
-            // in practice -- a mapi-lite that is down refuses connections in
-            // milliseconds and exhausts the budget long before the submit
-            // deadline, while a mapi-lite that is merely slow burns the
-            // deadline first and is reported as indeterminate by the caller
-            // above. That argument holds only while the retry budget cannot
-            // fit inside `total_timeout_seconds`; see the note in
-            // `MapiBroadcaster::broadcast_tx`.
-            _ => BroadcastError::Upstream(detail),
+        // uls-client says which (CS-501): a timeout after sending, an answer
+        // that could not be read, or a mapi-lite `5xx` other than `503` may all
+        // have carried the transaction to a node -- mapi-lite answers `504`
+        // when a node may have received it and `503` only when none can have.
+        // A refused connection, a request that could not be built, a `4xx` or
+        // a `503` delivered nothing. Before uls-client said so, an exhausted
+        // retry run was a string and this had to guess "delivered nothing".
+        if error.may_have_been_delivered() {
+            BroadcastError::Indeterminate(detail)
+        } else {
+            BroadcastError::Upstream(detail)
         }
     }
 }
@@ -320,6 +313,17 @@ impl TxBroadcaster for MapiBroadcaster {
             )
             .await
             {
+                // Accepted by the node but not recorded by mapi-lite (CS-501):
+                // the transaction is on the network, and resubmitting it is
+                // how mapi-lite records it -- the node answers "already
+                // known". So it is resubmitted like an unknown outcome, never
+                // read as the refusal its `failure` envelope looks like.
+                Ok(Ok(payload)) if Self::accepted_but_unrecorded(&payload) => {
+                    BroadcastError::Indeterminate(format!(
+                        "mapi-lite: {}",
+                        uls_core::status::ACCEPTED_NOT_RECORDED_DESCRIPTION
+                    ))
+                }
                 Ok(Ok(payload)) => return Self::read_result(payload, &expected),
                 Ok(Err(client_error)) => BroadcastError::from(client_error),
                 Err(_) => {
@@ -456,6 +460,17 @@ mod tests {
                 "relayFee": { "satoshis": 1, "bytes": 1000 },
             }],
         }))
+    }
+
+    /// mapi-lite's answer for a transaction the node accepted and it could not
+    /// record (CS-501).
+    fn accepted_but_unrecorded(txid: &str) -> Value {
+        json!({
+            "returnResult": "failure",
+            "resultDescription": uls_core::status::ACCEPTED_NOT_RECORDED_DESCRIPTION,
+            "txid": txid,
+            "failureRetryable": true,
+        })
     }
 
     /// One per-transaction success result.
@@ -789,8 +804,11 @@ mod tests {
         assert!(indeterminate_detail(error).contains("total_timeout_seconds"));
     }
 
+    /// A mapi-lite `500` can come after the node call -- it answers `503` when
+    /// no node can have received the batch -- so a run of them leaves the
+    /// outcome unknown, not failed (CS-501).
     #[tokio::test]
-    async fn mapi_broadcaster_retries_a_server_error_then_gives_up() {
+    async fn mapi_broadcaster_retries_a_server_error_then_reports_the_outcome_unknown() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/mapi/txs"))
@@ -808,7 +826,88 @@ mod tests {
             .broadcast_tx(&sample_tx())
             .await
             .expect_err("exhausted");
+        assert!(indeterminate_detail(error).contains("outcome unknown"));
+    }
+
+    /// A `503` is mapi-lite saying no node can have received the batch, so
+    /// exhausting the retries on it is a plain failure: nothing was spent, and
+    /// reserving the inputs would only idle them (CS-501).
+    #[tokio::test]
+    async fn mapi_broadcaster_retries_a_503_then_reports_a_failure() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/mapi/txs"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let mut config = config(&server);
+        config.max_retries = 1;
+        let broadcaster = MapiBroadcaster::new(&config).expect("broadcaster builds");
+
+        let error = broadcaster
+            .broadcast_tx(&sample_tx())
+            .await
+            .expect_err("exhausted");
         assert!(upstream_detail(error).contains("retries exhausted"));
+    }
+
+    /// mapi-lite's "accepted by the node but could not be recorded" is a
+    /// retryable `failure` on the wire, but the transaction is on the network
+    /// (CS-501). It is resubmitted, and the resubmission settles it.
+    #[tokio::test]
+    async fn an_acceptance_mapi_lite_could_not_record_is_resubmitted_not_refused() {
+        let server = MockServer::start().await;
+        let tx = sample_tx();
+        Mock::given(method("POST"))
+            .and(path("/mapi/txs"))
+            .respond_with(ok(txs_payload(accepted_but_unrecorded(
+                &tx.hash().encode(),
+            ))))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/mapi/txs"))
+            .respond_with(ok(txs_payload(success(
+                &tx.hash().encode(),
+                "Already known",
+            ))))
+            .mount(&server)
+            .await;
+
+        let txid = broadcaster(&server)
+            .broadcast_tx(&tx)
+            .await
+            .expect("the resubmission is answered as known");
+        assert_eq!(txid, tx.hash().encode());
+    }
+
+    /// And if every resubmission meets the same answer, the transaction is
+    /// still on the network: an unknown outcome, which reserves its inputs,
+    /// never a failure, which would release them for the next request to spend
+    /// again (CS-501).
+    #[tokio::test]
+    async fn an_acceptance_that_is_never_recorded_is_an_unknown_outcome() {
+        let server = MockServer::start().await;
+        let tx = sample_tx();
+        Mock::given(method("POST"))
+            .and(path("/mapi/txs"))
+            .respond_with(ok(txs_payload(accepted_but_unrecorded(
+                &tx.hash().encode(),
+            ))))
+            .mount(&server)
+            .await;
+
+        let mut config = config(&server);
+        config.max_retries = 1;
+        let error = MapiBroadcaster::new(&config)
+            .expect("broadcaster builds")
+            .broadcast_tx(&tx)
+            .await
+            .expect_err("never settled");
+        assert!(indeterminate_detail(error).contains("accepted by the node"));
     }
 
     /// A connection that was refused delivered nothing, so it is a plain
@@ -1035,12 +1134,13 @@ mod tests {
             .up_to_n_times(1)
             .mount(&server)
             .await;
-        // Everything after the first attempt is an undecodable answer, which
-        // on its own would be one thing; what matters is that the first
-        // attempt already put the transaction in doubt.
+        // Everything after the first attempt is a 503 -- mapi-lite saying
+        // nothing was sent -- which on its own would be a plain failure; what
+        // matters is that the first attempt already put the transaction in
+        // doubt.
         Mock::given(method("POST"))
             .and(path("/mapi/txs"))
-            .respond_with(ResponseTemplate::new(500))
+            .respond_with(ResponseTemplate::new(503))
             .mount(&server)
             .await;
 

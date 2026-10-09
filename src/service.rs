@@ -1237,17 +1237,48 @@ impl Service {
     pub async fn commit_prepared_funding(
         service: &Arc<Service>,
         prepared: &PreparedFunding,
-    ) -> Result<(), String> {
+    ) -> Result<(), CommitError> {
         let client = service
             .client_handle(&prepared.client_id)
             .await
-            .ok_or_else(|| format!("Unknown client_id {}", prepared.client_id))?;
+            .ok_or_else(|| CommitError::ClientGone(prepared.client_id.clone()))?;
         client
             .write()
             .await
-            .commit_funding_spend(prepared.spend_plan.clone())?;
+            .commit_funding_spend(prepared.spend_plan.clone())
+            .map_err(CommitError::Refused)?;
         service.save_inflight_state().await;
         Ok(())
+    }
+
+    /// Settle a funding transaction that has just been broadcast successfully.
+    ///
+    /// Only a refusal by the commit (CS-474: these outpoints were already
+    /// handed to another caller) withholds the response. A client removed
+    /// while its transaction was broadcasting does not (CS-501): the
+    /// transaction is on the network paying the caller's script, so the
+    /// caller is given its outpoints. Answering `internal` there told the
+    /// caller nothing had been created when a coin had.
+    async fn conclude_broadcast(
+        service: &Arc<Service>,
+        prepared: &PreparedFunding,
+        response: FundingResponse,
+    ) -> Result<FundingResponse, CodedError> {
+        match Self::commit_prepared_funding(service, prepared).await {
+            Ok(()) => Ok(response),
+            Err(CommitError::ClientGone(client_id)) => {
+                log::error!(
+                    "client {client_id} was removed while its funding transaction was \
+                     broadcasting; returning the outpoints it paid, which are on the network"
+                );
+                Ok(response)
+            }
+            Err(CommitError::Refused(description)) => {
+                log::warn!("commit_prepared_funding failed: {}", description);
+                let _ = Self::refresh_client_chain_state(service, &prepared.client_id).await;
+                Err(CodedError::internal(description))
+            }
+        }
     }
 
     pub async fn execute_funding(
@@ -1257,15 +1288,7 @@ impl Service {
         let (broadcaster, prepared) =
             Self::prepare_funding_outpoints(service, fund_request).await?;
         match Self::broadcast_prepared_funding(broadcaster, &prepared).await {
-            Ok(response) => {
-                if let Err(description) = Self::commit_prepared_funding(service, &prepared).await {
-                    log::warn!("commit_prepared_funding failed: {}", description);
-                    let _ =
-                        Self::refresh_client_chain_state(service, &fund_request.client_id).await;
-                    return Err(CodedError::internal(description));
-                }
-                Ok(response)
-            }
+            Ok(response) => Self::conclude_broadcast(service, &prepared, response).await,
             Err(error) => {
                 if error.code == ErrorCode::BroadcastOutcomeUnknown {
                     Self::reserve_uncertain_funding(service, &prepared).await;
@@ -1350,17 +1373,32 @@ impl Service {
                 Ok((broadcaster, prepared)) => {
                     match Self::broadcast_prepared_funding(broadcaster, &prepared).await {
                         Ok(partial) => {
-                            if let Err(description) =
-                                Self::commit_prepared_funding(service, &prepared).await
-                            {
-                                resync_after_multiple_tx_failure(service, fund_request).await;
-                                return Err(MultipleTxFundError::complete(
-                                    ErrorCode::Internal,
-                                    description,
-                                ));
+                            match Self::conclude_broadcast(service, &prepared, partial).await {
+                                Ok(partial) => {
+                                    combined.outpoints.extend(partial.outpoints);
+                                    combined.txs.extend(partial.txs);
+                                }
+                                // Refused (CS-474). Those outpoints are another
+                                // caller's, but the ones broadcast before them are
+                                // this caller's and on the network: report them
+                                // as a partial funding rather than dropping them
+                                // in a bare `internal` (CS-501).
+                                Err(cause) => {
+                                    resync_after_multiple_tx_failure(service, fund_request).await;
+                                    if tx_index == 0 {
+                                        return Err(MultipleTxFundError::complete(
+                                            cause.code,
+                                            cause.description,
+                                        ));
+                                    }
+                                    return Err(partial_broadcast_error(
+                                        tx_index + 1,
+                                        total,
+                                        &combined,
+                                        cause.description,
+                                    ));
+                                }
                             }
-                            combined.outpoints.extend(partial.outpoints);
-                            combined.txs.extend(partial.txs);
                         }
                         Err(cause) => {
                             if cause.code == ErrorCode::BroadcastOutcomeUnknown {
@@ -1472,6 +1510,17 @@ async fn resync_after_multiple_tx_failure(service: &Arc<Service>, fund_request: 
     }
 }
 
+/// Why a successfully broadcast funding transaction could not be committed.
+#[derive(Debug)]
+pub enum CommitError {
+    /// The client was removed while the transaction was broadcasting. The
+    /// transaction is still the caller's and on the network.
+    ClientGone(String),
+    /// The client refused the commit (CS-474): these outpoints were already
+    /// handed to another caller.
+    Refused(String),
+}
+
 fn partial_broadcast_error(
     failed_at: u32,
     total: u32,
@@ -1537,7 +1586,9 @@ fn coded_broadcast_error(error: &BroadcastError) -> CodedError {
              See the service log for its reason.",
         ),
         // Unreachable, or refused in a way the upstream itself called worth
-        // retrying. Either way nothing was spent.
+        // retrying. Either way nothing was spent: since CS-501 every failure
+        // that may have delivered the transaction is an unknown outcome
+        // instead, including an acceptance mapi-lite could not record.
         _ => CodedError::new(
             ErrorCode::BroadcastFailed,
             "Failed to broadcast funding transaction.",
@@ -1626,6 +1677,35 @@ mod tests {
         // None, as woc/uaas/test supply
         let service = Service::new_for_test_with_watcher(&config, blockchain, None).await;
         assert!(service.is_client_id_valid(TEST_CLIENT_ID).await);
+    }
+
+    /// CS-501: a client removed while its funding transaction was broadcasting
+    /// still gets its outpoints. The transaction is on the network paying the
+    /// caller's script; answering `internal` told the caller nothing had been
+    /// created when a coin had.
+    #[tokio::test]
+    async fn cs_501_a_client_removed_mid_broadcast_still_gets_its_outpoints() {
+        let config = test_config(&unique_dynamic_config_path());
+        let service = Arc::new(
+            Service::new_for_test(&config, test_blockchain_interface(&config).await).await,
+        );
+        let request = sample_fund_request(TEST_CLIENT_ID);
+        let (broadcaster, prepared) = Service::prepare_funding_outpoints(&service, &request)
+            .await
+            .expect("prepared");
+        let response = Service::broadcast_prepared_funding(broadcaster, &prepared)
+            .await
+            .expect("broadcast");
+
+        service
+            .delete_client(TEST_CLIENT_ID)
+            .await
+            .expect("deleted while the broadcast was in flight");
+
+        let settled = Service::conclude_broadcast(&service, &prepared, response)
+            .await
+            .expect("the outpoints are the caller's");
+        assert_eq!(settled.outpoints.len(), 1);
     }
 
     fn sample_fund_request(client_id: &str) -> FundRequest {
