@@ -475,6 +475,60 @@ impl TxBroadcaster for FailingBroadcaster {
     }
 }
 
+/// Broadcaster that answers from a script, one answer per call, and records
+/// every transaction it was handed. Accepts once the script runs out.
+pub struct ScriptedBroadcaster {
+    answers: std::sync::Mutex<std::collections::VecDeque<Option<BroadcastError>>>,
+    sent: std::sync::Mutex<Vec<Tx>>,
+}
+
+impl ScriptedBroadcaster {
+    /// `None` accepts; `Some(error)` refuses with it.
+    pub fn new(answers: Vec<Option<BroadcastError>>) -> Arc<Self> {
+        Arc::new(Self {
+            answers: std::sync::Mutex::new(answers.into()),
+            sent: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    pub fn sent(&self) -> Vec<Tx> {
+        self.sent.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl TxBroadcaster for ScriptedBroadcaster {
+    fn name(&self) -> &str {
+        "scripted"
+    }
+
+    async fn broadcast_tx(&self, tx: &Tx) -> Result<String, BroadcastError> {
+        self.sent.lock().unwrap().push(tx.clone());
+        match self.answers.lock().unwrap().pop_front().flatten() {
+            Some(error) => Err(error),
+            None => Ok(tx.hash().encode()),
+        }
+    }
+
+    async fn health_check(&self) -> Result<(), BroadcastError> {
+        Ok(())
+    }
+}
+
+/// The test blockchain, listing `utxos` for the test client's address.
+pub async fn blockchain_listing(
+    config: &Config,
+    utxos: &[UtxoEntry],
+) -> Arc<dyn BlockchainInterface + Send + Sync> {
+    let mut blockchain_interface = TestInterface::new();
+    blockchain_interface.set_network(&config.get_network().unwrap());
+    blockchain_interface
+        .set_utxo(TEST_ADDRESS, &utxos.to_vec())
+        .await;
+    blockchain_interface.set_height(1517571).await;
+    Arc::new(blockchain_interface)
+}
+
 /// Broadcaster whose upstream refuses every transaction.
 ///
 /// `retryable` is the upstream's own view of whether resubmitting could

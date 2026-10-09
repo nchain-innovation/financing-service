@@ -1401,6 +1401,67 @@ impl Client {
         self.unspent.sort_by_key(|utxo| utxo.value);
     }
 
+    /// Forget the service's own pending change that a refused plan spent, after
+    /// the node refused it as missing inputs, and any pending change built on
+    /// it (CS-506, SR-FUND-036). Returns how many outputs were forgotten.
+    ///
+    /// Call after [`Self::release_claim`], which puts every input back. That
+    /// is right for an input the chain reported -- a refresh will drop it
+    /// again if it was the missing one -- but not for the service's own
+    /// change: the chain has never listed it, so no refresh can say it is
+    /// gone, and [`Self::restore_pending_change`] put it back after every one.
+    /// Its creating transaction was dropped by the network (a conflict, a
+    /// reorg, an eviction), so it does not exist, and with a single chain of
+    /// change every later request selected it and was refused the same way
+    /// until it expired -- 95 refusals in a row on the regtest bench.
+    ///
+    /// "Built on it" follows [`SpentChange`]: a transaction of ours that spent
+    /// a missing output cannot exist either, so neither can its change.
+    pub fn forget_refused_own_change(&mut self, plan: &FundingSpendPlan) -> usize {
+        let mut doomed: Vec<OutPointKey> = plan
+            .spent_outpoints
+            .iter()
+            .map(outpoint_key)
+            .filter(|key| self.pending_change.contains_key(key))
+            .collect();
+        let mut forgotten: std::collections::HashSet<OutPointKey> =
+            std::collections::HashSet::new();
+        while let Some(key) = doomed.pop() {
+            if !forgotten.insert(key.clone()) {
+                continue;
+            }
+            self.pending_change.remove(&key);
+            self.reserved.remove(&key);
+            self.unspent.retain(|utxo| outpoint_key(utxo) != key);
+            log::warn!(
+                "forgetting own change {}:{}: the node refused a spend of it as missing inputs, \
+                 so the transaction that created it is not on the network",
+                key.0,
+                key.1
+            );
+
+            let spenders: Vec<String> = self
+                .spent_change
+                .iter()
+                .filter(|(_, spent)| spent.outpoints.contains(&key))
+                .map(|(txid, _)| txid.clone())
+                .collect();
+            for txid in spenders {
+                self.spent_change.remove(&txid);
+                // Its outputs: change still pending, or change it in turn
+                // spent, which is held as a reservation.
+                doomed.extend(
+                    self.pending_change
+                        .keys()
+                        .chain(self.reserved.keys())
+                        .filter(|(created_by, _)| *created_by == txid)
+                        .cloned(),
+                );
+            }
+        }
+        forgotten.len()
+    }
+
     /// Commit a spend whose transaction may or may not have reached the
     /// network, reserving its inputs so no later refresh offers them again.
     ///
@@ -3127,5 +3188,109 @@ mod tests {
             after.confirmed, 750,
             "the UTXOs that were not spent stay confirmed: {after:?}"
         );
+    }
+
+    // ---- CS-506: own change the node says is missing is forgotten ----
+
+    fn spends(plan: &FundingSpendPlan, txid: &str) -> bool {
+        plan.spent_outpoints
+            .iter()
+            .any(|entry| entry.tx_hash == txid)
+    }
+
+    /// The ticket's case, at the cache. The first funding leaves change; the
+    /// second spends it and is refused as missing inputs. Released as any
+    /// refusal is, the change came straight back -- and a refresh restored it
+    /// every time -- so every request selected it again.
+    #[test]
+    fn cs_506_refused_own_change_is_not_selected_again_or_restored() {
+        let small = cs_422_utxo(1, 0, 10_000);
+        let large = cs_422_utxo(2, 0, 50_000);
+        let mut client = client_holding_at_rate(vec![small.clone(), large.clone()], 100);
+
+        let first = claim_one(&mut client, 1_000);
+        let first_txid = first.txid.clone();
+        client.commit_funding_spend(first).expect("commits");
+
+        let second = claim_one(&mut client, 1_000);
+        assert!(
+            spends(&second, &first_txid),
+            "the change is the smallest suitable input, so it is selected"
+        );
+        client.release_claim(&second);
+        assert_eq!(client.forget_refused_own_change(&second), 1);
+
+        // A refresh: the chain still lists both originals (it has not seen the
+        // first funding transaction drop out), and has never listed the change.
+        client.apply_chain_state(vec![small, large]);
+        assert!(
+            !client.unspent.iter().any(|u| u.tx_hash == first_txid),
+            "the refresh did not put the change back"
+        );
+
+        let third = claim_one(&mut client, 1_000);
+        assert!(
+            !spends(&third, &first_txid),
+            "the next request selects a different input"
+        );
+    }
+
+    /// Without the missing-inputs verdict a refusal gives the change back as
+    /// before: it may be a conflict on another input, and the change is fine.
+    #[test]
+    fn cs_506_an_ordinary_refusal_keeps_own_change() {
+        let mut client = client_holding_at_rate(
+            vec![cs_422_utxo(1, 0, 10_000), cs_422_utxo(2, 0, 50_000)],
+            100,
+        );
+        let first = claim_one(&mut client, 1_000);
+        let first_txid = first.txid.clone();
+        client.commit_funding_spend(first).expect("commits");
+        let second = claim_one(&mut client, 1_000);
+        client.release_claim(&second);
+
+        assert!(client.unspent.iter().any(|u| u.tx_hash == first_txid));
+    }
+
+    /// Change built on missing change cannot exist either: the transaction
+    /// that created it spent an output that is not there.
+    #[test]
+    fn cs_506_change_built_on_missing_change_is_forgotten_with_it() {
+        let mut client = client_holding_at_rate(vec![cs_422_utxo(1, 0, 50_000)], 100);
+        let first = claim_one(&mut client, 1_000);
+        let first_txid = first.txid.clone();
+        client.commit_funding_spend(first).expect("commits");
+        let second = claim_one(&mut client, 1_000);
+        let second_txid = second.txid.clone();
+        assert!(spends(&second, &first_txid));
+        client
+            .commit_funding_spend(second.clone())
+            .expect("commits");
+
+        // The node says the first change is missing.
+        assert_eq!(client.forget_refused_own_change(&second), 2);
+        assert!(client.pending_change.is_empty());
+        assert!(client.spent_change.is_empty());
+        assert_eq!(
+            client.reserved_outpoint_count(),
+            1,
+            "only the wallet UTXO the first funding spent is still held; the missing change \
+             it reserved for the second is not"
+        );
+        assert!(
+            !client.unspent.iter().any(|u| u.tx_hash == second_txid),
+            "the second funding's change is gone too"
+        );
+    }
+
+    /// Only own change is forgotten. An input the chain lists is the chain's to
+    /// judge: the refresh after the refusal drops it if it really is gone.
+    #[test]
+    fn cs_506_a_chain_listed_input_is_left_to_the_refresh() {
+        let mut client = client_holding_at_rate(vec![cs_422_utxo(1, 0, 10_000)], 100);
+        let plan = claim_one(&mut client, 1_000);
+        client.release_claim(&plan);
+        assert_eq!(client.forget_refused_own_change(&plan), 0);
+        assert_eq!(client.unspent.len(), 1);
     }
 }

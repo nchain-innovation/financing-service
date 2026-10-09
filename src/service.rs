@@ -1266,11 +1266,14 @@ impl Service {
                 }
                 Ok(response)
             }
-            Err(error) => {
+            Err(FundingBroadcastError {
+                error,
+                inputs_missing,
+            }) => {
                 if error.code == ErrorCode::BroadcastOutcomeUnknown {
                     Self::reserve_uncertain_funding(service, &prepared).await;
                 } else {
-                    Self::release_prepared_funding(service, &prepared).await;
+                    Self::release_prepared_funding(service, &prepared, inputs_missing).await;
                 }
                 // Marked stale rather than refetched. The cache is already
                 // right -- nothing was spent on a refusal, and an uncertain
@@ -1296,9 +1299,29 @@ impl Service {
     /// Give back the inputs a prepared funding claimed, after a broadcast the
     /// upstream definitely did not take (CS-473). Nothing was spent, so they
     /// return to the cache at once rather than sitting reserved.
-    async fn release_prepared_funding(service: &Arc<Service>, prepared: &PreparedFunding) {
+    ///
+    /// Except, when the node said inputs are missing, the service's own
+    /// pending change among them, which it will never list and so could
+    /// never take back (CS-506): that is forgotten, with anything built on
+    /// it, and the in-flight state saved without it.
+    async fn release_prepared_funding(
+        service: &Arc<Service>,
+        prepared: &PreparedFunding,
+        inputs_missing: bool,
+    ) {
         if let Some(client) = service.client_handle(&prepared.client_id).await {
-            client.write().await.release_claim(&prepared.spend_plan);
+            let forgotten = {
+                let mut client = client.write().await;
+                client.release_claim(&prepared.spend_plan);
+                if inputs_missing {
+                    client.forget_refused_own_change(&prepared.spend_plan)
+                } else {
+                    0
+                }
+            };
+            if forgotten > 0 {
+                service.save_inflight_state().await;
+            }
         }
     }
 
@@ -1362,11 +1385,15 @@ impl Service {
                             combined.outpoints.extend(partial.outpoints);
                             combined.txs.extend(partial.txs);
                         }
-                        Err(cause) => {
+                        Err(FundingBroadcastError {
+                            error: cause,
+                            inputs_missing,
+                        }) => {
                             if cause.code == ErrorCode::BroadcastOutcomeUnknown {
                                 Self::reserve_uncertain_funding(service, &prepared).await;
                             } else {
-                                Self::release_prepared_funding(service, &prepared).await;
+                                Self::release_prepared_funding(service, &prepared, inputs_missing)
+                                    .await;
                             }
                             if tx_index == 0 {
                                 resync_after_multiple_tx_failure(service, fund_request).await;
@@ -1407,7 +1434,7 @@ impl Service {
     pub async fn broadcast_prepared_funding(
         broadcaster: Arc<dyn TxBroadcaster>,
         prepared: &PreparedFunding,
-    ) -> Result<FundingResponse, CodedError> {
+    ) -> Result<FundingResponse, FundingBroadcastError> {
         let tx = prepared
             .txs
             .first()
@@ -1444,7 +1471,10 @@ impl Service {
                 broadcast_failure_class(error.code),
                 broadcaster.name()
             );
-            return Err(error);
+            return Err(FundingBroadcastError {
+                error,
+                inputs_missing: e.inputs_missing(),
+            });
         }
         log::info!(
             "broadcast accepted: funding tx {txid} (broadcaster={})",
@@ -1511,6 +1541,24 @@ async fn fetch_chain_state(
         .get_utxo(address)
         .await
         .map_err(|e| format!("get_utxo failed: {e}"))
+}
+
+/// A funding broadcast that did not succeed: the caller's answer, and the one
+/// fact about the refusal the cache needs that the answer does not carry.
+#[derive(Debug)]
+pub struct FundingBroadcastError {
+    pub error: CodedError,
+    /// The node refused it because an input does not exist (CS-506).
+    pub inputs_missing: bool,
+}
+
+impl From<CodedError> for FundingBroadcastError {
+    fn from(error: CodedError) -> Self {
+        Self {
+            error,
+            inputs_missing: false,
+        }
+    }
 }
 
 /// The answer a caller gets for a broadcast that did not succeed.
@@ -2281,6 +2329,117 @@ mod tests {
     /// A broadcast that is *known* to have failed spent nothing, so its input
     /// must stay available -- reserving there would strand funds for no
     /// reason. The distinction is the whole point of the new variant.
+    /// CS-506, SR-FUND-036 acceptance: the node refuses a spend of the
+    /// service's own change as missing inputs. The next request selects a
+    /// different input, and the refresh between them does not restore the
+    /// change. Before, it did, and the same spend was refused on every request
+    /// until the change expired -- 95 times in a row on the regtest bench.
+    #[tokio::test]
+    async fn sr_fund_036_own_change_refused_as_missing_inputs_is_not_offered_again() {
+        use crate::test_support::{blockchain_listing, ScriptedBroadcaster};
+
+        let config = test_config(&unique_dynamic_config_path());
+        let utxo = |seed: char, value| chain_gang::interface::UtxoEntry {
+            height: 1517000,
+            tx_pos: 0,
+            tx_hash: seed.to_string().repeat(64),
+            value,
+        };
+        let blockchain = blockchain_listing(&config, &[utxo('a', 10_000), utxo('b', 50_000)]).await;
+        // Retryable, as mapi-lite reports it -- which is why the bench saw a
+        // 502 `broadcast_failed` on every request rather than a 409.
+        let broadcaster = ScriptedBroadcaster::new(vec![
+            None,
+            Some(BroadcastError::Rejected {
+                description: "Mempool error, retry again later. (details: 16 missing-inputs)"
+                    .to_string(),
+                retryable: true,
+            }),
+        ]);
+        let service = service_with(&config, blockchain, broadcaster.clone()).await;
+        let request = FundRequest {
+            satoshi: 1_000,
+            ..sample_fund_request(TEST_CLIENT_ID)
+        };
+
+        fund_single_transaction(&service, &request)
+            .await
+            .expect("the first funding is accepted");
+        let refused = fund_single_transaction(&service, &request)
+            .await
+            .expect_err("the second is refused");
+        assert_eq!(refused.code, ErrorCode::BroadcastFailed);
+        fund_single_transaction(&service, &request)
+            .await
+            .expect("the third funds from another input");
+
+        let sent = broadcaster.sent();
+        let first = sent[0].hash().encode();
+        let spends_first = |tx: &Tx| {
+            tx.inputs
+                .iter()
+                .any(|input| input.prev_output.hash.encode() == first)
+        };
+        assert!(
+            spends_first(&sent[1]),
+            "the refused one spent the first's change"
+        );
+        assert!(
+            !spends_first(&sent[2]),
+            "the next request did not select the refused change again"
+        );
+    }
+
+    /// The forgotten change is forgotten on disk too, or a restart would bring
+    /// it back (CS-465 persists pending change).
+    #[tokio::test]
+    async fn sr_fund_036_forgotten_change_is_not_persisted() {
+        use crate::test_support::{blockchain_listing, ScriptedBroadcaster};
+
+        let config = test_config(&unique_dynamic_config_path());
+        let utxo = |seed: char, value| chain_gang::interface::UtxoEntry {
+            height: 1517000,
+            tx_pos: 0,
+            tx_hash: seed.to_string().repeat(64),
+            value,
+        };
+        let blockchain = blockchain_listing(&config, &[utxo('c', 10_000), utxo('d', 50_000)]).await;
+        let broadcaster = ScriptedBroadcaster::new(vec![
+            None,
+            Some(BroadcastError::Rejected {
+                description: "16 missing-inputs".to_string(),
+                retryable: false,
+            }),
+        ]);
+        let service = service_with(&config, blockchain, broadcaster.clone()).await;
+        let request = FundRequest {
+            satoshi: 1_000,
+            ..sample_fund_request(TEST_CLIENT_ID)
+        };
+        fund_single_transaction(&service, &request).await.unwrap();
+        let first = broadcaster.sent()[0].hash().encode();
+        let persisted_change = || {
+            load_inflight_file(&config.inflight_state_path())
+                .get(TEST_CLIENT_ID)
+                .map(|state| {
+                    state
+                        .pending_change
+                        .iter()
+                        .any(|change| change.tx_hash == first)
+                })
+                .unwrap_or(false)
+        };
+        assert!(
+            persisted_change(),
+            "the first funding's change is saved as pending"
+        );
+
+        fund_single_transaction(&service, &request)
+            .await
+            .expect_err("refused as missing inputs");
+        assert!(!persisted_change(), "and no longer saved once forgotten");
+    }
+
     #[tokio::test]
     async fn sr_fund_012_a_failed_broadcast_leaves_its_input_spendable() {
         use crate::test_support::{CountingBlockchain, FailingBroadcaster};
