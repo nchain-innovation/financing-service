@@ -11,8 +11,8 @@ use crate::{
     idempotency::{request_fingerprint, Outcome, RecordKey, Reservation},
     responses::{
         coded_error_response, error_response, error_response_with_status, json_ok,
-        partial_funding_error_response, AddressResponse, BalanceResponse, CodedError, ErrorCode,
-        HealthResponse, SuccessResponse,
+        partial_funding_error_response, AddressResponse, BalanceResponse, CheckResult, CodedError,
+        ErrorCode, HealthResponse, SuccessResponse,
     },
     secrets::{secret_reference, validate_env_var_name},
     service::Service,
@@ -141,15 +141,28 @@ pub async fn health() -> impl Responder {
 /// mapi-lite URL that a public 503 body has no business disclosing.
 #[get("/ready")]
 pub async fn ready(data: web::Data<AppState>) -> impl Responder {
-    match data.service.mapi_lite_health().await {
-        None => json_ok(&HealthResponse::ok()),
-        Some(Ok(())) => json_ok(&HealthResponse::mapi_lite_ok()),
+    let mapi_lite = match data.service.mapi_lite_health().await {
+        None => None,
+        Some(Ok(())) => Some(CheckResult::passed()),
         Some(Err(error)) => {
             log::warn!("mapi-lite readiness probe failed: {error}");
-            HttpResponse::ServiceUnavailable().json(HealthResponse::mapi_lite_unhealthy(
-                "mapi-lite probe failed",
-            ))
+            Some(CheckResult::failed("mapi-lite probe failed"))
         }
+    };
+    // Its detail is an age and a client id, which a caller of /status can
+    // already see; nothing in it names an upstream.
+    let chain = match data.service.chain_readiness().await {
+        Ok(()) => CheckResult::passed(),
+        Err(detail) => {
+            log::warn!("chain readiness failed: {detail}");
+            CheckResult::failed(detail)
+        }
+    };
+    let response = HealthResponse::from_checks(mapi_lite, Some(chain));
+    if response.is_ok() {
+        json_ok(&response)
+    } else {
+        HttpResponse::ServiceUnavailable().json(response)
     }
 }
 
@@ -944,16 +957,44 @@ mod tests {
         assert_eq!(body, json!({ "status": "ok" }));
     }
 
-    /// Without `[mapi_lite]` there is no upstream to probe, so readiness is
-    /// the same answer as liveness rather than a different shape.
+    /// Without `[mapi_lite]` there is no mapi-lite to probe, so readiness
+    /// reports chain reads alone (CS-505). It used to be the same answer as
+    /// liveness, which said nothing a liveness probe did not.
     #[actix_web::test]
-    async fn sr_bchn_012_ready_matches_health_without_mapi_lite() {
+    async fn sr_bchn_012_ready_reports_chain_reads_without_mapi_lite() {
         let app = build_app().await;
         let resp =
             test::call_service(&app, test::TestRequest::get().uri("/ready").to_request()).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body: Value = test::read_body_json(resp).await;
-        assert_eq!(body, json!({ "status": "ok" }));
+        assert_eq!(body, json!({ "status": "ok", "chain": { "ok": true } }));
+    }
+
+    /// SR-BCHN-017: chain reads older than the bound take the service out of
+    /// rotation -- with `[mapi_lite]` it would otherwise go on funding from an
+    /// ever older cache -- and liveness is untouched (SR-BCHN-004).
+    #[actix_web::test]
+    async fn sr_bchn_017_ready_returns_503_when_chain_reads_are_stale() {
+        let config = test_config(&unique_dynamic_config_path());
+        let (app, service) = build_app_with_service(config).await;
+        service
+            .backdate_chain_reads(std::time::Duration::from_secs(61))
+            .await;
+
+        let resp =
+            test::call_service(&app, test::TestRequest::get().uri("/ready").to_request()).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["status"], "unhealthy");
+        assert_eq!(body["chain"]["ok"], false);
+        assert!(body["chain"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("last read"));
+
+        let resp =
+            test::call_service(&app, test::TestRequest::get().uri("/health").to_request()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[actix_web::test]

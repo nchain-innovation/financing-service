@@ -243,6 +243,11 @@ pub struct Client {
     /// has not been, or has been marked stale. Drives the freshness check
     /// that keeps a burst of requests from each fetching the same answer.
     chain_state_at: Option<Instant>,
+    /// When the unspent set was last read from the chain. Unlike
+    /// `chain_state_at` this is never cleared: marking the state stale says
+    /// "refresh before trusting it", not "nothing was ever read". It is what
+    /// `GET /ready` measures the cache against (CS-505, SR-BCHN-017).
+    chain_read_at: Option<Instant>,
     /// Whether `unspent` can be funded from without fetching it first: it has
     /// been taken from the chain at least once, and nothing has marked it
     /// untrustworthy since. Not the same as fresh. A usable state can be older
@@ -317,6 +322,7 @@ impl Client {
             address,
             unspent: Vec::new(),
             chain_state_at: None,
+            chain_read_at: None,
             chain_state_usable: false,
             reserved: HashMap::new(),
             pending_change: HashMap::new(),
@@ -352,7 +358,9 @@ impl Client {
     /// visible to the read interface still reads as unspent, and the service
     /// would offer the same input to the next funding request.
     pub fn apply_chain_state(&mut self, unspent: Utxo) {
-        self.chain_state_at = Some(Instant::now());
+        let now = Instant::now();
+        self.chain_state_at = Some(now);
+        self.chain_read_at = Some(now);
         self.chain_state_usable = true;
         self.release_expired_reservations();
         self.expire_pending_change();
@@ -587,6 +595,21 @@ impl Client {
         }
         for spent in self.spent_change.values_mut() {
             spent.since -= by;
+        }
+    }
+
+    /// How long ago the unspent set was last read from the chain, or `None` if
+    /// it never has been. Not reset by [`Client::invalidate_chain_state`].
+    pub fn chain_read_age(&self) -> Option<Duration> {
+        self.chain_read_at.map(|at| at.elapsed())
+    }
+
+    /// Age the last chain read by `by`, so a test can make the cache old
+    /// without waiting.
+    #[cfg(test)]
+    pub fn backdate_chain_read(&mut self, by: Duration) {
+        if let Some(at) = self.chain_read_at.as_mut() {
+            *at -= by;
         }
     }
 
