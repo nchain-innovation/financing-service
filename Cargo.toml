@@ -14,7 +14,7 @@ tokio = { version = "1.53.1", features = ["full"] }
 chrono = "0.4.45"
 hex = "0.4.3"
 async-trait = "0.1.92"
-chain-gang = { version = "0.11.6", features = ["interface"] }
+chain-gang = { version = "0.13.0", features = ["interface"] }
 log = { version = "0.4.34", features = ["max_level_trace", "release_max_level_warn"] }
 opentelemetry = { version = "0.32", features = ["trace"] }
 opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic", "trace"] }
@@ -31,10 +31,12 @@ actix-governor = "0.10.0"
 # pins (cargo needs the ssh:// URL form, and .cargo/config.toml hands the fetch
 # to the system git). They MUST name the same rev, and that rev's chain-gang
 # requirement must be satisfiable by the chain-gang line above, or the graph
-# carries two chain-gangs and their types stop unifying. This is the same rev
-# teranode-event-rs pins. See docs/Dependencies.md before changing it.
-uls-client = { git = "ssh://git@github.com/nchain-innovation/mapi-lite.git", rev = "ab3c95846a72976783e5f2d901b69d75768426bc" }
-uls-core = { git = "ssh://git@github.com/nchain-innovation/mapi-lite.git", rev = "ab3c95846a72976783e5f2d901b69d75768426bc" }
+# carries two chain-gangs and their types stop unifying. This is the commit
+# mapi-lite tagged v0.3.0, on chain-gang 0.13 -- pinned by rev, which unlike a
+# tag cannot move; teranode-event-rs is still on v0.2.0 and chain-gang 0.11.
+# See docs/Dependencies.md before changing it.
+uls-client = { git = "ssh://git@github.com/nchain-innovation/mapi-lite.git", rev = "d6aec86212b8d5bd310b247ec5fb6624c2c508d2" }
+uls-core = { git = "ssh://git@github.com/nchain-innovation/mapi-lite.git", rev = "d6aec86212b8d5bd310b247ec5fb6624c2c508d2" }
 # Only to build the timeout-bearing HTTP clients handed to uls-client, which
 # has no timeout setting of its own. Same major.minor as mapi-lite's so one
 # reqwest resolves; its TLS backend is whatever uls-client enables.
