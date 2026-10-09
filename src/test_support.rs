@@ -322,7 +322,15 @@ impl BlockchainInterface for GatedBlockchain {
         self.inner.get_utxo(address).await
     }
 
+    /// Held at the gate too, so a test can stand in for a broadcast the
+    /// interface accepts and never answers (CS-502). Counted on arrival, like
+    /// reads.
     async fn broadcast_tx(&self, tx: &Tx) -> Result<String, ChainGangError> {
+        self.open
+            .subscribe()
+            .wait_for(|open| *open)
+            .await
+            .expect("the gate outlives its readers");
         self.inner.broadcast_tx(tx).await
     }
 
