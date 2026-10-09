@@ -339,6 +339,61 @@ impl BlockchainInterface for GatedBlockchain {
     }
 }
 
+/// Where [`UnreadableBlockchain`] says it failed to connect: an internal
+/// address of the kind a real chain-read error carries, which a test can look
+/// for in a response to prove it did not leak.
+pub const UNREADABLE_CHAIN_URL: &str = "http://10.20.30.40:18332/";
+
+/// Test blockchain whose unspent set cannot be read, as when WhatsOnChain or
+/// the node behind the blockchain interface is down. The error names the
+/// address it could not reach, as reqwest's does.
+pub struct UnreadableBlockchain {
+    inner: Arc<CountingBlockchain>,
+}
+
+impl UnreadableBlockchain {
+    pub async fn new(config: &Config) -> Arc<Self> {
+        Arc::new(Self {
+            inner: CountingBlockchain::new(config).await,
+        })
+    }
+}
+
+#[async_trait]
+impl BlockchainInterface for UnreadableBlockchain {
+    fn set_network(&mut self, _network: &Network) {}
+
+    async fn status(&self) -> Result<(), ChainGangError> {
+        self.inner.status().await
+    }
+
+    async fn get_balance(&self, address: &str) -> Result<Balance, ChainGangError> {
+        self.inner.get_balance(address).await
+    }
+
+    async fn get_utxo(&self, _address: &str) -> Result<Utxo, ChainGangError> {
+        Err(ChainGangError::BadArgument(format!(
+            "error sending request for url ({UNREADABLE_CHAIN_URL})"
+        )))
+    }
+
+    async fn broadcast_tx(&self, tx: &Tx) -> Result<String, ChainGangError> {
+        self.inner.broadcast_tx(tx).await
+    }
+
+    async fn get_tx(&self, txid: &str) -> Result<Tx, ChainGangError> {
+        self.inner.get_tx(txid).await
+    }
+
+    async fn get_latest_block_header(&self) -> Result<BlockHeader, ChainGangError> {
+        self.inner.get_latest_block_header().await
+    }
+
+    async fn get_block_headers(&self) -> Result<String, ChainGangError> {
+        self.inner.get_block_headers().await
+    }
+}
+
 /// Test blockchain that fails `broadcast_tx` after a configured number of successes.
 pub struct FailingBroadcastBlockchain {
     inner: tokio::sync::Mutex<TestInterface>,

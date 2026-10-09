@@ -149,6 +149,16 @@ impl ErrorCode {
     }
 }
 
+/// The description a caller gets with [`ErrorCode::ChainUnavailable`].
+///
+/// Fixed rather than the read's own error, because that error is not the
+/// caller's to see: it names the blockchain interface's address -- a node
+/// inside the network, or WhatsOnChain's URL -- and the caller can do nothing
+/// with it but retry, which the code already says. The cause is logged where
+/// the response is built, for the operator who can act on it (SR-SEC-016).
+pub const CHAIN_UNAVAILABLE: &str =
+    "The blockchain could not be read to bring the wallet up to date. Retry shortly.";
+
 #[derive(Serialize)]
 pub struct ErrorResponse {
     pub code: ErrorCode,
