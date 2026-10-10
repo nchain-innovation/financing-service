@@ -377,6 +377,16 @@ auth_token = "env:FS_MAPI_LITE_AUTH_TOKEN"
 
 **The three interact.** The worst case is `timeout_seconds × (max_retries + 1)` plus back-off, and `total_timeout_seconds` cuts it off there. Set the deadline to the longest a `/fund` call may take, then choose the other two to fit inside it; the startup warning tells you when they do not.
 
+**`timeout_seconds` has to outlast mapi-lite's own ceiling (CS-510).** mapi-lite answers a submission it cannot finish within its `submit_timeout_sec` (default 10s) with HTTP 504, outcome unknown. An attempt that gives up first reports a hung node as *this* service's timeout instead: the same unknown outcome, from the wrong layer, with mapi-lite still working on a request nobody is waiting for. The budget, outermost first:
+
+| Layer | Gives up after (defaults) |
+|---|---|
+| Event → `POST /fund` | 90s, above this service's 45s submit deadline plus a chain read |
+| this service → mapi-lite, per attempt | `timeout_seconds` = 13s |
+| mapi-lite → node, whole submit | `submit_timeout_sec` = 10s, answered 504 |
+
+mapi-lite publishes its ceiling in `GET /ready` as `submitTimeoutSecs`. The service reads it whenever it probes mapi-lite, at startup included, and **warns** when `timeout_seconds` does not exceed it by at least a second, naming both values (SR-CFG-010). It still starts and funds: the combination works, it just reports a hung node less well. Fix it by raising `timeout_seconds` (and `total_timeout_seconds` with it), or by lowering mapi-lite's ceiling.
+
 When the section is present the service:
 
 * Logs at startup: `mapi-lite integration configured (base_url=...): funding transactions will be broadcast via mapi-lite`. Without the section the line reads `mapi-lite not configured: funding transactions will be broadcast via the 'woc' blockchain interface` (naming whichever `interface_type` is configured).
