@@ -198,4 +198,72 @@ mod tests {
         assert!(manifest.contains("features = [\"grpc-tonic\", \"trace\"]"));
         assert!(!manifest.contains("metrics"));
     }
+
+    // --- CI workflow (CS-528) ---
+
+    fn workflow() -> String {
+        std::fs::read_to_string(".github/workflows/rust.yml").unwrap()
+    }
+
+    /// The `uses:` lines, comments stripped.
+    fn uses_lines(workflow: &str) -> Vec<String> {
+        workflow
+            .lines()
+            .map(|l| l.split(" #").next().unwrap().trim())
+            .filter(|l| l.trim_start_matches("- ").starts_with("uses:"))
+            .map(|l| l.trim_start_matches("- ").to_string())
+            .collect()
+    }
+
+    /// A moved tag could hand the deploy key to other code.
+    #[test]
+    fn sr_sec_027_every_action_is_pinned_by_commit_sha() {
+        let uses = uses_lines(&workflow());
+        assert!(uses.len() >= 3, "{uses:?}");
+        for line in uses {
+            let target = line.trim_start_matches("uses:").trim();
+            if target.starts_with("./") {
+                continue;
+            }
+            let sha = target.split('@').nth(1).unwrap_or("");
+            assert!(
+                sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit()),
+                "not pinned by commit SHA: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn sr_sec_028_the_workflow_token_is_read_only_and_not_persisted() {
+        let workflow = workflow();
+        assert!(
+            workflow.lines().any(|l| l == "permissions: {}"),
+            "the workflow must default the token to no permissions"
+        );
+        assert!(workflow.contains("contents: read"));
+        assert!(
+            !workflow
+                .lines()
+                .map(|l| l.split(" #").next().unwrap().trim_end())
+                .any(|l| l.ends_with(": write") || l.trim() == "permissions: write-all"),
+            "no job needs a write permission"
+        );
+        assert!(workflow.contains("persist-credentials: false"));
+    }
+
+    /// The audit installer is third-party code: it runs before the deploy
+    /// key is in the agent, not after.
+    #[test]
+    fn sr_nfr_003_cargo_audit_runs_before_the_deploy_key_is_loaded() {
+        let workflow = workflow();
+        let audit = workflow.find("run: cargo audit").expect("an audit step");
+        let installer = workflow
+            .find("taiki-e/install-action")
+            .expect("its installer");
+        let key = workflow.find("webfactory/ssh-agent").expect("the key step");
+        assert!(
+            installer < key && audit < key,
+            "audit must run before the key is loaded"
+        );
+    }
 }

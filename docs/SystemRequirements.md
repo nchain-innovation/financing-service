@@ -125,6 +125,8 @@ Requirement IDs appear in test function names (for example `sr_fund_008_*`) or a
 | SR-SEC-013 | `/health` and `/ready` SHALL be exempt from rate limiting when rate limiting is enabled, so a throttled probe cannot report a healthy service as down. | Must | **AT:** `rest_api::tests::test_health_is_exempt_from_rate_limit`, `test_ready_is_exempt_from_rate_limit` |
 | SR-SEC-014 | The node RPC password SHALL be resolvable from an `env:VAR` reference, SHALL be overridable by `FS_RPC_PASSWORD`, and SHALL be reported when stored as plaintext. | Must | **AT:** `config::tests::sr_sec_014_rpc_password_resolves_from_an_env_reference`, `sr_sec_014_fs_rpc_password_env_overrides_the_config`, `sr_sec_014_plaintext_rpc_password_is_reported` |
 | SR-SEC-015 | The mapi-lite auth token SHALL be resolvable from an `env:VAR` reference, SHALL be overridable by `FS_MAPI_LITE_AUTH_TOKEN`, SHALL fail startup when a referenced variable is missing, and SHALL be reported when stored as plaintext. | Must | **AT:** `config::tests::sr_sec_015_mapi_lite_auth_token_resolves_from_an_env_reference`, `sr_sec_015_fs_mapi_lite_auth_token_env_overrides_the_config`, `sr_sec_015_missing_mapi_lite_auth_token_env_reference_fails_resolution`, `sr_sec_015_plaintext_mapi_lite_auth_token_is_reported` |
+| SR-SEC-027 | Every action in the CI workflow SHALL be pinned by full commit SHA, since the job hands one of them the mapi-lite deploy key and a tag can be moved to other code. | Must | **AT:** `system_requirements::tests::sr_sec_027_every_action_is_pinned_by_commit_sha` |
+| SR-SEC-028 | The CI workflow SHALL default its token to no permissions (`permissions: {}`), grant each job only `contents: read`, and check out with `persist-credentials: false`. | Must | **AT:** `system_requirements::tests::sr_sec_028_the_workflow_token_is_read_only_and_not_persisted` |
 
 ## Configuration and deployment requirements
 
@@ -156,7 +158,7 @@ Requirement IDs appear in test function names (for example `sr_fund_008_*`) or a
 |----|-------------|----------|--------------|
 | SR-NFR-001 | The codebase SHALL pass `cargo fmt --check` without formatting violations. | Must | **AT:** `system_requirements::tests::sr_nfr_001_ci_runs_cargo_fmt_check` |
 | SR-NFR-002 | The codebase SHALL pass `cargo clippy -- -D warnings` without warnings. | Must | **AT:** `system_requirements::tests::sr_nfr_002_ci_runs_cargo_clippy_with_warnings_denied` |
-| SR-NFR-003 | Dependencies SHALL pass `cargo audit` without known vulnerabilities (or with documented exceptions). | Must | **AT:** `system_requirements::tests::sr_nfr_003_ci_runs_cargo_audit` |
+| SR-NFR-003 | Dependencies SHALL pass `cargo audit` without known vulnerabilities (or with documented exceptions). CI SHALL run the audit before the mapi-lite deploy key is loaded. | Must | **AT:** `system_requirements::tests::sr_nfr_003_ci_runs_cargo_audit`, `sr_nfr_003_cargo_audit_runs_before_the_deploy_key_is_loaded` |
 | SR-NFR-004 | All automated tests SHALL pass on supported platforms in CI. | Must | **AT:** `system_requirements::tests::sr_nfr_004_ci_runs_cargo_test` |
 | SR-NFR-005 | `Cargo.lock` SHALL be committed for reproducible builds. | Must | **AT:** `system_requirements::tests::sr_nfr_005_cargo_lock_is_committed` |
 | SR-NFR-007 | Startup configuration or secret resolution errors SHALL return an error from `main` rather than panic. | Must | **AT:** `system_requirements::tests::sr_nfr_007_main_returns_error_instead_of_panicking_on_config_failure`, `config::tests::sr_nfr_007_load_config_returns_error_for_invalid_file` |
