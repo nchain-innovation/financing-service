@@ -393,7 +393,12 @@ Path to the file used to persist clients added at runtime via `POST /client`. Dy
 ```toml
 [dynamic_config]
 filename = "./data/dynamic.toml"
+# allow_plaintext_wif = false   # true lets POST /client store a raw wif; development only
 ```
+
+* **Only `env:VAR` references by default.** `POST /client` refuses a raw `wif` with HTTP 400 and stores nothing; send `wif_env`, naming an environment variable that holds the key, and the file records `env:VAR` instead. `allow_plaintext_wif = true` lifts this for development. A file written before this, holding raw WIFs, still loads, with the usual plaintext warning.
+* **Written atomically, owner-only.** Every change is written to a `0600` sibling file, synced, and renamed over the original, so a crash cannot truncate it and other users cannot read it. A file found readable by other users at startup is made `0600`, with a warning. A client is added or removed in memory only once the file has been written.
+* **A file that does not parse stops startup.** It is left exactly as it is, to be fixed by hand, rather than replaced with an empty list on the next `POST /client`. A missing or empty file means no dynamic clients.
 
 ## [[client]]
 
@@ -450,4 +455,4 @@ Example: for `client_id = "id1"`, set `FS_CLIENT_ID1_WIF`.
 
 When WIF keys, client `api_key`, `admin_api_key`, `rpc_password`, or `mapi_lite.auth_token` are stored as literal values in config files, the service logs a warning at startup. Literal values still work for local development.
 
-Dynamic clients added via `POST /client` can use `wif_env` and `api_key_env` instead of `wif` and `api_key`; the service stores `env:VAR` references in the dynamic config file rather than the secret values.
+Dynamic clients added via `POST /client` use `wif_env` and can use `api_key_env` instead of `wif` and `api_key`; the service stores `env:VAR` references in the dynamic config file rather than the secret values. A raw `wif` is refused unless `dynamic_config.allow_plaintext_wif` is set — see [\[dynamic_config\]](#dynamic_config).

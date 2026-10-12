@@ -91,6 +91,9 @@ pub fn test_config_with_keys(
         }]),
         dynamic_config: DynamicConfigConfig {
             filename: dynamic_filename.to_string(),
+            // Most tests add clients with a raw test WIF; the default, which
+            // refuses one, has its own tests (SR-SEC-021).
+            allow_plaintext_wif: true,
         },
         ..Default::default()
     }

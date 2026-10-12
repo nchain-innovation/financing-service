@@ -13,6 +13,7 @@ mod config;
 mod dynamic_config;
 mod idempotency;
 mod outbound_rate_limit;
+mod private_file;
 mod rate_limit;
 mod responses;
 mod rest_api;

@@ -493,6 +493,12 @@ impl MapiLiteConfig {
 #[derive(Debug, Default, Deserialize, Clone)]
 pub struct DynamicConfigConfig {
     pub filename: String,
+    /// Whether `POST /client` may store a raw `wif` (CS-526). Off by default:
+    /// the dynamic config file would then hold the key itself, a copy that
+    /// outlives the request on a volume often bind-mounted from the host.
+    /// Off, only `wif_env` is accepted, which stores an `env:VAR` reference.
+    #[serde(default)]
+    pub allow_plaintext_wif: bool,
 }
 
 /// Per-IP HTTP rate limiting configuration.
