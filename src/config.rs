@@ -513,6 +513,40 @@ impl MapiLiteConfig {
 #[derive(Debug, Default, Deserialize, Clone)]
 pub struct DynamicConfigConfig {
     pub filename: String,
+    /// The prefix every `wif_env` named on `POST /client` must start with
+    /// (CS-521, SR-SEC-018). Default [`DEFAULT_WIF_ENV_PREFIX`].
+    ///
+    /// Without it, `wif_env` could name any variable in the process
+    /// environment -- another client's `FS_CLIENT_<ID>_WIF` among them -- and
+    /// whoever could add a client could fund from that wallet under a key of
+    /// their own. With it, only variables the operator has set aside for
+    /// runtime clients can be named. It may not overlap `FS_CLIENT_`.
+    #[serde(default = "default_wif_env_prefix")]
+    pub wif_env_prefix: String,
+}
+
+/// See [`DynamicConfigConfig::wif_env_prefix`].
+pub const DEFAULT_WIF_ENV_PREFIX: &str = "FS_RUNTIME_WIF_";
+
+fn default_wif_env_prefix() -> String {
+    DEFAULT_WIF_ENV_PREFIX.to_string()
+}
+
+impl DynamicConfigConfig {
+    /// The prefix must be a usable variable-name start that no per-client
+    /// override (`FS_CLIENT_<ID>_WIF`) can begin with.
+    pub fn validate(&self) -> Result<(), String> {
+        let prefix = &self.wif_env_prefix;
+        crate::secrets::validate_env_var_name(prefix)
+            .map_err(|e| format!("dynamic_config.wif_env_prefix: {e}"))?;
+        if prefix.starts_with(CLIENT_ENV_PREFIX) || CLIENT_ENV_PREFIX.starts_with(prefix.as_str()) {
+            return Err(format!(
+                "dynamic_config.wif_env_prefix {prefix:?} overlaps {CLIENT_ENV_PREFIX:?}, the \
+                 prefix of every client's own key variable"
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Per-IP HTTP rate limiting configuration.
@@ -730,15 +764,24 @@ fn resolve_client_config(mut client: ClientConfig) -> Result<ClientConfig, Strin
     Ok(client)
 }
 
+/// What every per-client environment override starts with.
+const CLIENT_ENV_PREFIX: &str = "FS_CLIENT_";
+
 fn client_wif_env_var(client_id: &str) -> String {
-    format!("FS_CLIENT_{}_WIF", env_key_suffix(client_id))
+    format!("{CLIENT_ENV_PREFIX}{}_WIF", env_key_suffix(client_id))
 }
 
 fn client_api_key_env_var(client_id: &str) -> String {
-    format!("FS_CLIENT_{}_API_KEY", env_key_suffix(client_id))
+    format!("{CLIENT_ENV_PREFIX}{}_API_KEY", env_key_suffix(client_id))
 }
 
-fn env_key_suffix(client_id: &str) -> String {
+/// The part of a client's override variables that comes from its id.
+///
+/// Not one-to-one: case and punctuation fold, so `id.1` and `ID_1` share
+/// `FS_CLIENT_ID_1_WIF`. Two clients that fold together would both take
+/// whatever key that variable holds, so `POST /client` refuses an id that
+/// folds onto an existing client's (CS-521).
+pub(crate) fn env_key_suffix(client_id: &str) -> String {
     client_id
         .chars()
         .map(|ch| {
@@ -767,6 +810,7 @@ pub fn load_config(env_var: &str, filename: &str) -> Result<Config, String> {
     config.idempotency.validate()?;
     config.blockchain_interface.validate()?;
     config.fees.validate()?;
+    config.dynamic_config.validate()?;
     if let Some(mapi_lite) = &config.mapi_lite {
         mapi_lite.validate()?;
     }
@@ -1665,5 +1709,23 @@ filename = "./data/dynamic.toml"
         assert_eq!(service(10, None).ready_max_chain_read_age(), secs(60));
         assert_eq!(service(60, Some(45)).ready_max_chain_read_age(), secs(45));
         assert_eq!(service(60, Some(0)).ready_max_chain_read_age(), None);
+    }
+
+    /// The runtime-client prefix may not be one a client's own override
+    /// variable (`FS_CLIENT_<ID>_WIF`) could start with (CS-521).
+    #[test]
+    fn sr_sec_018_wif_env_prefix_may_not_overlap_client_variables() {
+        let check = |prefix: &str| {
+            DynamicConfigConfig {
+                filename: "x".to_string(),
+                wif_env_prefix: prefix.to_string(),
+            }
+            .validate()
+        };
+        assert!(check(DEFAULT_WIF_ENV_PREFIX).is_ok());
+        assert!(check("MY_RUNTIME_KEYS_").is_ok());
+        for bad in ["FS_CLIENT_", "FS_CLIENT_ID1_", "FS_CLIENT", "FS_", "F", ""] {
+            assert!(check(bad).is_err(), "{bad:?} was accepted");
+        }
     }
 }

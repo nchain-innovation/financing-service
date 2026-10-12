@@ -333,12 +333,14 @@ Request body (JSON):
 | Field | Type | Description |
 |-------|------|-------------|
 | `client_id` | string | Identifier for the new client |
-| `wif` | string | WIF private key for the client's funding wallet (use `wif` or `wif_env`) |
-| `wif_env` | string | Environment variable name containing the WIF; stored as `env:VAR` in dynamic config |
+| `wif` | string | WIF private key for the client's funding wallet (use `wif` or `wif_env`). Not an `env:` reference |
+| `wif_env` | string | Environment variable name containing the WIF; stored as `env:VAR` in dynamic config. Must start with `dynamic_config.wif_env_prefix` (default `FS_RUNTIME_WIF_`) |
 | `api_key` | string | Optional shared secret for this client's API endpoints |
 | `api_key_env` | string | Environment variable name containing the client API key; stored as `env:VAR` in dynamic config |
 
 Provide either `wif` or `wif_env`, and either `api_key` or `api_key_env` (not both pairs).
+
+Refused as `invalid_request` (CS-521): a `wif_env` outside the prefix, a `wif` that is an `env:` reference, a key that is already another client's funding key, and a `client_id` that folds onto an existing client's environment variables.
 
 ```bash
 curl -H "Authorization: Bearer your-admin-api-key" \
