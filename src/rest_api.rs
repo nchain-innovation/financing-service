@@ -1990,18 +1990,18 @@ mod tests {
         assert!(!saved.contains("raw"), "nothing may be stored: {saved}");
         assert!(service.get_balance("raw").await.is_none());
 
-        unsafe { std::env::set_var("FS_TEST_SR_SEC_021_WIF", TEST_WIF) };
+        unsafe { std::env::set_var("FS_RUNTIME_WIF_SR_SEC_021", TEST_WIF) };
         let resp = test::call_service(
             &app,
             test::TestRequest::post()
                 .uri("/client")
-                .set_json(json!({ "client_id": "by-env", "wif_env": "FS_TEST_SR_SEC_021_WIF" }))
+                .set_json(json!({ "client_id": "by-env", "wif_env": "FS_RUNTIME_WIF_SR_SEC_021" }))
                 .to_request(),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let saved = std::fs::read_to_string(&path).unwrap();
-        assert!(saved.contains("env:FS_TEST_SR_SEC_021_WIF"));
+        assert!(saved.contains("env:FS_RUNTIME_WIF_SR_SEC_021"));
         assert!(!saved.contains(TEST_WIF));
     }
 

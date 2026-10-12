@@ -140,6 +140,7 @@ mod tests {
             dynamic_config: DynamicConfigConfig {
                 filename: path.to_string(),
                 allow_plaintext_wif,
+                ..Default::default()
             },
             ..Default::default()
         }
