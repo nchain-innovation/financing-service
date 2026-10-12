@@ -135,6 +135,8 @@ mod tests {
         (path, DynamicConfig::new(&config).unwrap())
     }
 
+    // The struct update covers fields other changes add to the section.
+    #[allow(clippy::needless_update)]
     fn config_for(path: &str, allow_plaintext_wif: bool) -> Config {
         Config {
             dynamic_config: DynamicConfigConfig {
