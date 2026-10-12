@@ -155,6 +155,17 @@ pub struct ServiceConfig {
     /// request, which is what the service did before.
     #[serde(default)]
     pub chain_state_max_age_seconds: Option<u64>,
+    /// How old a client's chain read may be before `GET /ready` reports the
+    /// service unready, in seconds (CS-505, SR-BCHN-017).
+    ///
+    /// With `[mapi_lite]` a funding request does not wait for a refresh while
+    /// the cache is usable (SR-FUND-031), so if chain reads keep failing the
+    /// service goes on funding from an ever older view and nothing else says
+    /// so. Defaults to three refresh periods, and at least 60s: one failed
+    /// sweep is a blip, three is chain reads not working. `0` turns the check
+    /// off.
+    #[serde(default)]
+    pub ready_max_chain_read_age_seconds: Option<u64>,
     /// Where to keep what the service has broadcast but the chain may not have
     /// caught up with, so a restart does not forget it (CS-465).
     ///
@@ -171,6 +182,15 @@ impl ServiceConfig {
             self.chain_state_max_age_seconds
                 .unwrap_or(self.utxo_refresh_period),
         )
+    }
+
+    /// The bound `GET /ready` holds chain reads to, or `None` when the check
+    /// is off. See `ready_max_chain_read_age_seconds`.
+    pub fn ready_max_chain_read_age(&self) -> Option<std::time::Duration> {
+        let seconds = self
+            .ready_max_chain_read_age_seconds
+            .unwrap_or_else(|| (self.utxo_refresh_period.saturating_mul(3)).max(60));
+        (seconds > 0).then(|| std::time::Duration::from_secs(seconds))
     }
 }
 
@@ -1629,5 +1649,21 @@ filename = "./data/dynamic.toml"
             ..Default::default()
         };
         assert_eq!(limited_node.outbound_rate_limit(), Some(5));
+    }
+
+    /// CS-505, SR-BCHN-017: three refresh periods by default, never under a
+    /// minute, explicit when set, and off at zero.
+    #[test]
+    fn sr_bchn_017_ready_chain_read_bound_defaults_and_overrides() {
+        let service = |period, explicit| ServiceConfig {
+            utxo_refresh_period: period,
+            ready_max_chain_read_age_seconds: explicit,
+            ..Default::default()
+        };
+        let secs = |s| Some(std::time::Duration::from_secs(s));
+        assert_eq!(service(60, None).ready_max_chain_read_age(), secs(180));
+        assert_eq!(service(10, None).ready_max_chain_read_age(), secs(60));
+        assert_eq!(service(60, Some(45)).ready_max_chain_read_age(), secs(45));
+        assert_eq!(service(60, Some(0)).ready_max_chain_read_age(), None);
     }
 }

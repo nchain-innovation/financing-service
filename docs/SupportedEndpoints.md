@@ -75,19 +75,23 @@ Readiness: should traffic be sent here right now? Use this for a Kubernetes `rea
 curl http://127.0.0.1:8080/ready
 ```
 
-Without [`[mapi_lite]`](Configuration.md#mapi_lite) there is no upstream whose absence would stop funding, so the answer matches `/health`. With it configured, `/ready` probes mapi-lite — the service's only broadcast path in that mode — and reports the result:
+Two checks, and the answer is healthy only if both pass (CS-505):
+
+* **`chain`** — chain reads are working. Every client's UTXO set must have been read from the chain within `service.ready_max_chain_read_age_seconds` (default three refresh periods, at least 60s); with no clients, the blockchain interface must have answered within that time. A client never read at all fails too — a service that started while the chain was unreachable. The check reads nothing itself: it reports what the periodic refresh has managed. With [`[mapi_lite]`](Configuration.md#mapi_lite) this matters most, because funding then goes on from the cached state without waiting for a refresh, so failing chain reads would otherwise go unnoticed while the cache grew ever older.
+* **`mapi_lite`** — with `[mapi_lite]` configured, mapi-lite's own `GET /ready`, which fails when its node pool is unreachable, its block ingest has fallen behind, or it cannot sign. Until CS-505 this probed `GET /mapi/feeQuote`, which mapi-lite serves from its configuration and which kept answering with every node down.
 
 | Situation | HTTP | Body |
 |---|---|---|
-| mapi-lite not configured | 200 | `{"status": "ok"}` |
-| mapi-lite configured and reachable | 200 | `{"status": "ok", "mapi_lite": {"ok": true}}` |
-| mapi-lite configured but unreachable | 503 | `{"status": "unhealthy", "mapi_lite": {"ok": false, "detail": "mapi-lite probe failed"}}` |
+| chain reads current, mapi-lite not configured | 200 | `{"status": "ok", "chain": {"ok": true}}` |
+| chain reads current, mapi-lite ready | 200 | `{"status": "ok", "mapi_lite": {"ok": true}, "chain": {"ok": true}}` |
+| mapi-lite not ready or unreachable | 503 | `{"status": "unhealthy", "mapi_lite": {"ok": false, "detail": "mapi-lite probe failed"}, "chain": {"ok": true}}` |
+| chain reads too old | 503 | `{"status": "unhealthy", "chain": {"ok": false, "detail": "client event's chain state was last read 412s ago (limit 180s)"}}` |
 
 `/health` is unaffected by that 503 and stays 200, which is the point of the split. Sending a liveness probe to `/ready` puts the restart loop back.
 
 The probe is bounded by `mapi_lite.health_timeout_seconds` (default 2s), which must stay under the few seconds a readiness probe allows before it gives up.
 
-The `detail` is deliberately generic. This endpoint is unauthenticated and exempt from rate limiting, and the underlying transport error names the mapi-lite host and port; the full error is written to the service log instead.
+The `mapi_lite` `detail` is deliberately generic. This endpoint is unauthenticated and exempt from rate limiting, and the underlying transport error names the mapi-lite host and port; the full error — including the names of mapi-lite's failing checks — is written to the service log instead. The `chain` detail names only a client id and an age, which `GET /status` already shows.
 
 The verdict is **cached for `health_timeout_seconds`**, so repeated calls do not each reach mapi-lite. Without that cache an unauthenticated, unmetered endpoint could be used to flood the broadcast path. A readiness probe on a 5s interval therefore reaches mapi-lite at most every 2s.
 

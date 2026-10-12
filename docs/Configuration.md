@@ -110,7 +110,9 @@ INFO blockchain interface recovered after 7 consecutive failure(s)
 
 The recovery line matters as much as the warnings. Without it, warnings simply stop, and a service that has recovered looks exactly like one that has given up. `GET /status` reports `blockchain_status` and `blockchain_update_time` alongside, for the same question asked at a point in time rather than in the log.
 
-Note that `GET /health` stays `ok` throughout: it is a liveness check and deliberately depends on no upstream. `GET /ready` is the endpoint that reflects whether the service can do its job.
+Note that `GET /health` stays `ok` throughout: it is a liveness check and deliberately depends on no upstream. `GET /ready` is the endpoint that reflects whether the service can do its job: it fails once the last successful chain read is older than `service.ready_max_chain_read_age_seconds` (CS-505).
+
+**An unreachable blockchain interface at startup is a warning, not a fatal error** (CS-505). It used to stop the service — on a single WhatsOnChain 429 — and the restart that followed met the same rate limit. Now the service starts degraded, logs `Unable to reach the blockchain interface at startup`, and `GET /ready` answers 503 until the first chain read succeeds; `/health` and `/status` serve throughout.
 
 **`test` is a fixture, not a backend.** It is an in-process stub used by the unit tests, with a UTXO set injected directly by the test harness. It has no network of its own, so the `network_type` you set alongside it only affects address encoding. It will start and serve requests as a configured backend, but its UTXO set is empty, so balances read zero and funding is refused — useful for exercising the API surface, not for funding anything.
 
@@ -234,11 +236,13 @@ Then enable telemetry in config or set `OTEL_TRACES_EXPORTER=otlp` and `OTEL_EXP
 [service]
 utxo_refresh_period = 60
 # chain_state_max_age_seconds = 60   # defaults to utxo_refresh_period
+# ready_max_chain_read_age_seconds = 180   # defaults to 3 x utxo_refresh_period, at least 60; 0 = off
 # inflight_state_file = "./data/dynamic.inflight.json"   # defaults beside dynamic_config.filename
 ```
 
 * `utxo_refresh_period` — seconds between the periodic refresh of every client's chain state.
 * `chain_state_max_age_seconds` — how old that cached state may be before a request refreshes it again. Defaults to `utxo_refresh_period`.
+* `ready_max_chain_read_age_seconds` — how old a client's last successful chain read may be before `GET /ready` reports the service unready (CS-505). Defaults to three refresh periods and never under 60s: one failed sweep is a blip, three is chain reads not working. `0` turns the check off. See [Readiness check](SupportedEndpoints.md#readiness-check).
 * `inflight_state_file` — where the service keeps what it has broadcast but the chain may not have caught up with. Defaults to a file beside `dynamic_config.filename`, named after it: `./data/dynamic.toml` pairs with `./data/dynamic.inflight.json`. See [In-flight state survives a restart](#in-flight-state-survives-a-restart).
 
 ### In-flight state survives a restart
@@ -376,8 +380,8 @@ auth_token = "env:FS_MAPI_LITE_AUTH_TOKEN"
 When the section is present the service:
 
 * Logs at startup: `mapi-lite integration configured (base_url=...): funding transactions will be broadcast via mapi-lite`. Without the section the line reads `mapi-lite not configured: funding transactions will be broadcast via the 'woc' blockchain interface` (naming whichever `interface_type` is configured).
-* Probes mapi-lite at startup (`GET /mapi/feeQuote`) and **warns** if it is unreachable, without refusing to start. Funding will fail until mapi-lite is reachable, but the read paths — `/status`, balances, UTXO refreshes — do not depend on it and keep serving, and the service recovers on its own when mapi-lite returns. Refusing to start would instead put the container in a restart loop driven by its own health check, taking the read paths down with it.
-* Probes mapi-lite for `GET /ready` and returns HTTP 503 when the probe fails, reusing a verdict for up to `health_timeout_seconds`. `GET /health` is unaffected. See [Readiness check](SupportedEndpoints.md#readiness-check).
+* Probes mapi-lite at startup (its `GET /ready`) and **warns** if it is unreachable or not ready, without refusing to start. Funding will fail until mapi-lite is reachable, but the read paths — `/status`, balances, UTXO refreshes — do not depend on it and keep serving, and the service recovers on its own when mapi-lite returns. Refusing to start would instead put the container in a restart loop driven by its own health check, taking the read paths down with it.
+* Asks mapi-lite's own `GET /ready` for this service's `GET /ready`, and returns HTTP 503 when mapi-lite is unreachable or not ready, reusing a verdict for up to `health_timeout_seconds`. mapi-lite's readiness fails when its nodes are unreachable or its block ingest has fallen behind; the fee quote this used to probe is served from mapi-lite's configuration and answered with every node down (CS-505). `GET /health` is unaffected. See [Readiness check](SupportedEndpoints.md#readiness-check).
 * Reports `"broadcaster": "mapi-lite"` in `GET /status`.
 * Funds a request from cached chain state that has merely aged, rather than waiting for it to be refreshed through `[blockchain_interface]`, and refreshes it behind the request — see [How often the service reads the chain](#how-often-the-service-reads-the-chain).
 * Submits each funding transaction as a one-element batch to `POST /mapi/txs`, with the merkle proof declined (no callbacks are wanted). A rejection by mapi-lite or the node surfaces to the caller as `broadcast_failed` (HTTP 502), with the reason in the service log. An answer that never arrives, or one this client cannot read, surfaces as `broadcast_outcome_unknown` (HTTP 504) instead, because the transaction may have reached the network.

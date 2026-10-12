@@ -193,6 +193,22 @@ pub struct CheckResult {
     pub detail: Option<String>,
 }
 
+impl CheckResult {
+    pub fn passed() -> Self {
+        Self {
+            ok: true,
+            detail: None,
+        }
+    }
+
+    pub fn failed(detail: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            detail: Some(detail.into()),
+        }
+    }
+}
+
 /// Body of `GET /health` and `GET /ready`.
 ///
 /// `/health` is liveness and always answers `{"status":"ok"}`. `/ready`
@@ -204,6 +220,9 @@ pub struct HealthResponse {
     pub status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mapi_lite: Option<CheckResult>,
+    /// Chain-read health, on `GET /ready` (CS-505, SR-BCHN-017).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chain: Option<CheckResult>,
 }
 
 impl HealthResponse {
@@ -211,27 +230,26 @@ impl HealthResponse {
         Self {
             status: "ok",
             mapi_lite: None,
+            chain: None,
         }
     }
 
-    pub fn mapi_lite_ok() -> Self {
+    /// A readiness answer from its checks: healthy only if every check that
+    /// ran passed.
+    pub fn from_checks(mapi_lite: Option<CheckResult>, chain: Option<CheckResult>) -> Self {
+        let ok = [&mapi_lite, &chain]
+            .into_iter()
+            .flatten()
+            .all(|check| check.ok);
         Self {
-            status: "ok",
-            mapi_lite: Some(CheckResult {
-                ok: true,
-                detail: None,
-            }),
+            status: if ok { "ok" } else { "unhealthy" },
+            mapi_lite,
+            chain,
         }
     }
 
-    pub fn mapi_lite_unhealthy(detail: impl Into<String>) -> Self {
-        Self {
-            status: "unhealthy",
-            mapi_lite: Some(CheckResult {
-                ok: false,
-                detail: Some(detail.into()),
-            }),
-        }
+    pub fn is_ok(&self) -> bool {
+        self.status == "ok"
     }
 }
 
@@ -521,14 +539,40 @@ mod tests {
     #[test]
     fn health_response_with_mapi_lite_carries_the_check() {
         assert_eq!(
-            serde_json::to_value(HealthResponse::mapi_lite_ok()).unwrap(),
+            serde_json::to_value(HealthResponse::from_checks(
+                Some(CheckResult::passed()),
+                None
+            ))
+            .unwrap(),
             serde_json::json!({ "status": "ok", "mapi_lite": { "ok": true } })
         );
         assert_eq!(
-            serde_json::to_value(HealthResponse::mapi_lite_unhealthy("503")).unwrap(),
+            serde_json::to_value(HealthResponse::from_checks(
+                Some(CheckResult::failed("503")),
+                None
+            ))
+            .unwrap(),
             serde_json::json!({
                 "status": "unhealthy",
                 "mapi_lite": { "ok": false, "detail": "503" }
+            })
+        );
+    }
+
+    /// Any failing check makes the whole answer unhealthy (CS-505).
+    #[test]
+    fn a_failing_chain_check_alone_makes_readiness_unhealthy() {
+        let response = HealthResponse::from_checks(
+            Some(CheckResult::passed()),
+            Some(CheckResult::failed("old")),
+        );
+        assert!(!response.is_ok());
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            serde_json::json!({
+                "status": "unhealthy",
+                "mapi_lite": { "ok": true },
+                "chain": { "ok": false, "detail": "old" }
             })
         );
     }

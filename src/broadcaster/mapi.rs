@@ -54,7 +54,13 @@ pub struct MapiBroadcaster {
     /// Built with uls-client's own retries left off: the loop in
     /// [`MapiBroadcaster::broadcast_tx`] owns them.
     submit: MapiClient,
+    /// For the fee quote: a short timeout and no retries.
     probe: MapiClient,
+    /// `GET {base_url}/ready`, mapi-lite's own readiness, which is what the
+    /// health check asks (CS-505). Plain HTTP: the probe is unauthenticated and
+    /// unsigned on mapi-lite's side, so a typed client adds nothing.
+    ready_url: String,
+    ready_http: reqwest::Client,
     /// Ceiling on one attempt.
     attempt_timeout: Duration,
     /// Attempts after the first.
@@ -86,9 +92,15 @@ impl MapiBroadcaster {
         );
         // fee_quote does not retry, so the probe needs no retry settings.
         let probe = Self::client(config, config.health_timeout())?;
+        let ready_http = reqwest::Client::builder()
+            .timeout(config.health_timeout())
+            .build()
+            .map_err(|e| format!("mapi-lite readiness client: {e}"))?;
         Ok(Self {
             submit,
             probe,
+            ready_url: format!("{}/ready", config.base_url()),
+            ready_http,
             attempt_timeout: config.timeout(),
             max_retries: config.max_retries,
             submit_deadline: config.total_timeout(),
@@ -357,9 +369,55 @@ impl TxBroadcaster for MapiBroadcaster {
         }
     }
 
+    /// Asks mapi-lite's `GET /ready` (CS-505).
+    ///
+    /// This used to fetch the fee quote, which mapi-lite serves from its own
+    /// configuration without asking a node -- so it answered with every node
+    /// down, and this service went on reporting ready while every broadcast
+    /// would fail. mapi-lite's readiness fails when its node pool stops
+    /// answering, when block ingest falls behind, and when it cannot sign, which
+    /// is the question being asked here: can a broadcast through it work.
+    ///
+    /// A `503` carries the names of mapi-lite's failing checks into the error,
+    /// for the log line; the `/ready` body this service returns stays generic.
     async fn health_check(&self) -> Result<(), BroadcastError> {
-        self.probe.fee_quote().await?;
-        Ok(())
+        let response = self
+            .ready_http
+            .get(&self.ready_url)
+            .send()
+            .await
+            .map_err(|e| BroadcastError::Upstream(format!("mapi-lite /ready: {e}")))?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let failing = response
+            .bytes()
+            .await
+            .ok()
+            .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok())
+            .and_then(|body| {
+                body.get("checks")?.as_object().map(|checks| {
+                    checks
+                        .iter()
+                        .filter(|(_, check)| {
+                            check.get("ok") == Some(&serde_json::Value::Bool(false))
+                        })
+                        .map(
+                            |(name, check)| match check.get("detail").and_then(|d| d.as_str()) {
+                                Some(detail) => format!("{name}: {detail}"),
+                                None => name.clone(),
+                            },
+                        )
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                })
+            })
+            .filter(|failing| !failing.is_empty());
+        Err(BroadcastError::Upstream(match failing {
+            Some(failing) => format!("mapi-lite /ready answered {status}: {failing}"),
+            None => format!("mapi-lite /ready answered {status}"),
+        }))
     }
 
     /// The standard mining fee from mapi-lite's quote, converted to satoshis
@@ -858,25 +916,47 @@ mod tests {
         assert!(indeterminate_detail(error).contains("signature"));
     }
 
+    /// CS-505: the health check asks mapi-lite's own readiness, not the fee
+    /// quote -- which mapi-lite serves from configuration with every node down.
     #[tokio::test]
-    async fn sr_bchn_011_mapi_broadcaster_health_check_passes_on_a_fee_quote() {
+    async fn sr_bchn_011_mapi_broadcaster_health_check_passes_when_mapi_lite_is_ready() {
         let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ready"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ready": true})))
+            .expect(1)
+            .mount(&server)
+            .await;
         Mock::given(method("GET"))
             .and(path("/mapi/feeQuote"))
             .respond_with(ok(fee_quote_payload()))
-            .expect(1)
+            .expect(0)
             .mount(&server)
             .await;
 
         broadcaster(&server).health_check().await.expect("healthy");
     }
 
+    /// A quote that answers does not make mapi-lite healthy when its own
+    /// readiness says its nodes are gone.
     #[tokio::test]
-    async fn sr_bchn_011_mapi_broadcaster_health_check_fails_on_an_error_status() {
+    async fn sr_bchn_011_mapi_broadcaster_health_check_fails_when_mapi_lite_is_not_ready() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
+            .and(path("/ready"))
+            .respond_with(ResponseTemplate::new(503).set_body_json(json!({
+                "ready": false,
+                "checks": {
+                    "database": { "ok": true },
+                    "chainInfo": { "ok": false, "detail": "chain info is 120s old" },
+                    "ingest": { "ok": false }
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
             .and(path("/mapi/feeQuote"))
-            .respond_with(ResponseTemplate::new(503))
+            .respond_with(ok(fee_quote_payload()))
             .mount(&server)
             .await;
 
@@ -884,15 +964,24 @@ mod tests {
             .health_check()
             .await
             .expect_err("unhealthy");
-        assert!(upstream_detail(error).contains("503"));
+        let detail = upstream_detail(error);
+        assert!(detail.contains("503"), "{detail}");
+        assert!(
+            detail.contains("chainInfo: chain info is 120s old") && detail.contains("ingest"),
+            "names mapi-lite's failing checks for the log: {detail}"
+        );
+        assert!(
+            !detail.contains("database"),
+            "only the failing ones: {detail}"
+        );
     }
 
     #[tokio::test]
     async fn mapi_broadcaster_health_check_is_bounded_by_its_own_timeout() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/mapi/feeQuote"))
-            .respond_with(ok(fee_quote_payload()).set_delay(Duration::from_secs(3)))
+            .and(path("/ready"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(3)))
             .mount(&server)
             .await;
 
