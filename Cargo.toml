@@ -35,8 +35,10 @@ actix-governor = "0.10.0"
 # mapi-lite tagged v0.3.0, on chain-gang 0.13 -- pinned by rev, which unlike a
 # tag cannot move; teranode-event-rs is still on v0.2.0 and chain-gang 0.11.
 # See docs/Dependencies.md before changing it.
-uls-client = { git = "ssh://git@github.com/nchain-innovation/mapi-lite.git", rev = "d6aec86212b8d5bd310b247ec5fb6624c2c508d2" }
-uls-core = { git = "ssh://git@github.com/nchain-innovation/mapi-lite.git", rev = "d6aec86212b8d5bd310b247ec5fb6624c2c508d2" }
+# TEMPORARILY a branch revision (CS-523): MapiClient::with_trusted_miner_ids is
+# not in a mapi-lite release yet. Repin both lines to the release that has it.
+uls-client = { git = "ssh://git@github.com/nchain-innovation/mapi-lite.git", rev = "18965d39f69b4fbda30a6beb66bb7971df9dde80" }
+uls-core = { git = "ssh://git@github.com/nchain-innovation/mapi-lite.git", rev = "18965d39f69b4fbda30a6beb66bb7971df9dde80" }
 # Only to build the timeout-bearing HTTP clients handed to uls-client, which
 # has no timeout setting of its own. Same major.minor as mapi-lite's so one
 # reqwest resolves; its TLS backend is whatever uls-client enables.

@@ -76,6 +76,9 @@ impl MapiBroadcaster {
         if let Some(warning) = config.retry_budget_warning() {
             log::warn!("{warning}");
         }
+        if let Some(warning) = config.unpinned_warning() {
+            log::warn!("{warning}");
+        }
         // uls-client retries five times by default with a 60s back-off cap,
         // so the retries have to be turned *off* explicitly -- left alone they
         // would nest inside every attempt this module makes and blow through
@@ -238,7 +241,11 @@ impl MapiBroadcaster {
             .timeout(timeout)
             .build()
             .map_err(|e| format!("Unable to build the mapi-lite HTTP client: {e}"))?;
-        let mut client = MapiClient::new(config.base_url().to_string()).with_http(http);
+        // Only mapi-lite's own keys are believed (CS-523): otherwise any key
+        // that signs a response verifies, which proves nothing about who sent it.
+        let mut client = MapiClient::new(config.base_url().to_string())
+            .with_http(http)
+            .with_trusted_miner_ids(&config.miner_id_public_keys);
         if let Some(token) = &config.auth_token {
             // Sent verbatim as the Authorization header; the scheme is the
             // operator's to include (see MapiLiteConfig::auth_token).
@@ -263,9 +270,12 @@ impl From<ClientError> for BroadcastError {
             ClientError::Transport(e) if e.is_timeout() => BroadcastError::Indeterminate(detail),
             // The server answered and the answer is unreadable, so it took the
             // transaction and its verdict is lost to us.
-            ClientError::Decode(_) | ClientError::BadSignature => {
-                BroadcastError::Indeterminate(detail)
-            }
+            // A signature by a key that is not mapi-lite's is as good as no
+            // answer: whatever really happened to the submit is unknown
+            // (CS-523).
+            ClientError::Decode(_)
+            | ClientError::BadSignature
+            | ClientError::UntrustedSigner { .. } => BroadcastError::Indeterminate(detail),
             // A refused or unresolvable connection never delivered anything,
             // and an HTTP error status is the server declining to act. Both
             // leave the transaction where it was built.
@@ -604,6 +614,66 @@ mod tests {
         let broadcaster = MapiBroadcaster::new(&config).expect("broadcaster builds");
 
         broadcaster.broadcast_tx(&tx).await.expect("accepted");
+    }
+
+    // --- the server's miner ID (CS-523) ------------------------------------
+
+    /// The public key of `MAPI_TEST_SIGNER_WIF` (private key 1), which signs
+    /// every mock response here.
+    const MOCK_MINER_ID: &str =
+        "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+    /// Private key 2's public key: valid, and not the mock's.
+    const OTHER_MINER_ID: &str =
+        "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5";
+
+    fn pinned_to(server: &MockServer, key: &str) -> MapiBroadcaster {
+        let mut config = config(server);
+        config.miner_id_public_keys = vec![key.to_string()];
+        config.max_retries = 0;
+        MapiBroadcaster::new(&config).expect("broadcaster builds")
+    }
+
+    /// A response signed by mapi-lite's own key is believed.
+    #[tokio::test]
+    async fn sr_sec_019_a_response_from_the_pinned_miner_id_is_believed() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/mapi/feeQuote"))
+            .respond_with(ok(fee_quote_payload()))
+            .mount(&server)
+            .await;
+        assert!(pinned_to(&server, MOCK_MINER_ID)
+            .fee_satoshis_per_kb()
+            .await
+            .is_some());
+    }
+
+    /// A valid signature by any other key is not: the fee quote is ignored,
+    /// and a submit's outcome is unknown rather than "nothing sent", since
+    /// whatever the real server did is hidden behind the forged answer.
+    #[tokio::test]
+    async fn sr_sec_019_a_response_signed_by_another_key_is_not_believed() {
+        let server = MockServer::start().await;
+        let tx = sample_tx();
+        Mock::given(method("GET"))
+            .and(path("/mapi/feeQuote"))
+            .respond_with(ok(fee_quote_payload()))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/mapi/txs"))
+            .respond_with(ok(txs_payload(success(&tx.hash().encode(), ""))))
+            .mount(&server)
+            .await;
+
+        let broadcaster = pinned_to(&server, OTHER_MINER_ID);
+        assert_eq!(broadcaster.fee_satoshis_per_kb().await, None);
+        match broadcaster.broadcast_tx(&tx).await {
+            Err(BroadcastError::Indeterminate(detail)) => {
+                assert!(detail.contains("not a trusted miner ID"), "{detail}")
+            }
+            other => panic!("expected an unknown outcome, got {other:?}"),
+        }
     }
 
     #[tokio::test]
