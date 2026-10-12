@@ -129,7 +129,7 @@ port = 8080
 # admin_api_key = "your-admin-secret"
 ```
 
-When `APP_ENV=docker`, the service listens on `0.0.0.0` regardless of `address`.
+When `APP_ENV=docker` (set by the image) and `address` is a loopback address, the service listens on `0.0.0.0` instead: a container's own loopback cannot be reached from the host. Which host interfaces then see the port is set where it is published — `run.sh` publishes it on the host's loopback. Any other `address` is honoured, so a container run with `--network host` and a specific address binds only that one.
 
 Bind to `127.0.0.1` or place the service behind a reverse proxy on a private network when exposing funding endpoints.
 
