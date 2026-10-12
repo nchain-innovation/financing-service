@@ -123,6 +123,7 @@ pub struct Service {
     dynamic_config: Mutex<DynamicConfig>,
     admin_api_key: Option<String>,
     idempotency: Mutex<IdempotencyStore>,
+    funding_limits: crate::funding_limits::FundingLimits,
     /// Set only for backends that must be told which addresses to follow.
     address_watcher: Option<Arc<dyn AddressWatcher>>,
     /// The last mapi-lite probe verdict, reused by `GET /ready` until it
@@ -333,6 +334,9 @@ impl Service {
                 config.idempotency.ttl(),
                 config.idempotency.max_entries,
             )),
+            funding_limits: crate::funding_limits::FundingLimits::new(
+                config.funding_limits.clone(),
+            ),
             address_watcher,
             mapi_health: Mutex::new(None),
             chain_health: Mutex::new(ChainHealth::default()),
@@ -418,6 +422,21 @@ impl Service {
     /// retry the same key.
     pub async fn release_idempotency(&self, key: &RecordKey) {
         self.idempotency.lock().await.release(key);
+    }
+
+    /// Checks a payout against `[funding_limits]` and holds it against the
+    /// client's window (CS-530). See [`crate::funding_limits`].
+    pub fn hold_funding(
+        &self,
+        client_id: &str,
+        satoshis: u64,
+    ) -> Result<Option<crate::funding_limits::Hold>, crate::funding_limits::LimitExceeded> {
+        self.funding_limits.check_and_hold(client_id, satoshis)
+    }
+
+    /// Gives back a payout held for a request that broadcast nothing.
+    pub fn release_funding(&self, hold: &crate::funding_limits::Hold) {
+        self.funding_limits.release(hold);
     }
 
     /// Create a new Service from the provided config

@@ -190,6 +190,10 @@ pub struct FundingSpendPlan {
     spent_outpoints: Vec<UtxoEntry>,
 }
 
+/// Every satoshi there will ever be: 21 million BSV. No payout can exceed it,
+/// and `POST /fund` refuses one that would (CS-530).
+pub const MAX_SATOSHIS: u64 = 21_000_000 * 100_000_000;
+
 #[derive(Clone)]
 pub struct FundRequest {
     pub client_id: String,
@@ -810,12 +814,18 @@ impl Client {
             (0..fund_request.no_of_outpoints as usize)
                 .map(|index| {
                     let script = fund_request.script_at(index).len() as u64;
-                    fund_request.satoshi + self.estimate_fee(&[script], 1)
+                    fund_request
+                        .satoshi
+                        .saturating_add(self.estimate_fee(&[script], 1))
                 })
                 .sum()
         } else {
-            fund_request.satoshi * fund_request.no_of_outpoints as u64
-                + self.estimate_fee(&fund_request.script_lengths(), no_of_inputs)
+            // Saturating: `POST /fund` has already refused a payout over
+            // MAX_SATOSHIS, so this cannot overflow from there (CS-530).
+            fund_request
+                .satoshi
+                .saturating_mul(fund_request.no_of_outpoints as u64)
+                .saturating_add(self.estimate_fee(&fund_request.script_lengths(), no_of_inputs))
         }
     }
 
@@ -1070,7 +1080,12 @@ impl Client {
     /// requirement the caller cannot act on.
     fn single_tx_funding_error(&self, fund_request: &FundRequest) -> Option<CodedError> {
         // What the caller is asking the transaction to pay out, change aside.
-        let requested = (fund_request.satoshi * fund_request.no_of_outpoints as u64) as i64;
+        let requested = i64::try_from(
+            fund_request
+                .satoshi
+                .saturating_mul(fund_request.no_of_outpoints as u64),
+        )
+        .unwrap_or(i64::MAX);
         let scripts = fund_request.script_lengths();
         let total_available = self.total_unspent();
 

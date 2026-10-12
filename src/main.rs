@@ -11,6 +11,7 @@ mod broadcaster;
 mod client;
 mod config;
 mod dynamic_config;
+mod funding_limits;
 mod idempotency;
 mod outbound_rate_limit;
 mod rate_limit;

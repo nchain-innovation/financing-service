@@ -259,7 +259,7 @@ The status is derived from the code, so a caller that cannot read the body — a
 | `chain_unavailable` | 503 | The blockchain interface could not be reached | Retryable |
 | `internal` | 500 | Unexpected internal failure | Report it |
 | `unauthorized` | 401 | Authentication missing or invalid | Fix credentials |
-| `rate_limited` | 429 | Request rate exceeded | Retry after the interval in `description` |
+| `rate_limited` | 429 | Request rate exceeded, or (from `POST /fund`) the client's `funding_limits.max_satoshis_per_period` would be exceeded | Retry after the interval in `description` or `Retry-After` |
 | `key_in_progress` | 409 | A request with this `idempotency_key` is still being processed | Retry shortly |
 | `idempotency_key_reused` | 409 | This `idempotency_key` was used with a different request | Use a fresh `idempotency_key` |
 

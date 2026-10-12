@@ -7,8 +7,12 @@ use std::sync::Arc;
 use crate::{
     auth::{authorize_admin, authorize_client},
     client::FundRequest,
+    client::MAX_SATOSHIS,
     config::ClientConfig,
-    idempotency::{request_fingerprint, Outcome, RecordKey, Reservation},
+    funding_limits::{Hold, LimitExceeded},
+    idempotency::{
+        request_fingerprint, Outcome, RecordKey, Reservation, MAX_IDEMPOTENCY_KEY_BYTES,
+    },
     responses::{
         coded_error_response, error_response, error_response_with_status, json_ok,
         partial_funding_error_response, AddressResponse, BalanceResponse, CodedError, ErrorCode,
@@ -206,6 +210,31 @@ pub async fn get_funds(
         .clone()
         .unwrap_or_else(|| vec![info.locking_script.clone().unwrap_or_default()]);
 
+    // What this request pays out, fees aside. Checked rather than multiplied
+    // (CS-530): in a release build the product wrapped, past the balance
+    // check, into a transaction consensus then rejected.
+    let Some(payout) = satoshi
+        .checked_mul(u64::from(no_of_outpoints))
+        .filter(|payout| *payout <= MAX_SATOSHIS)
+    else {
+        return error_response(
+            ErrorCode::InvalidRequest,
+            format!(
+                "satoshi x no_of_outpoints is more than the {MAX_SATOSHIS} satoshis that exist"
+            ),
+        );
+    };
+    if info
+        .idempotency_key
+        .as_ref()
+        .is_some_and(|key| key.len() > MAX_IDEMPOTENCY_KEY_BYTES)
+    {
+        return error_response(
+            ErrorCode::InvalidRequest,
+            format!("idempotency_key is longer than {MAX_IDEMPOTENCY_KEY_BYTES} bytes"),
+        );
+    }
+
     let fund_request = FundRequest {
         client_id: client_id.to_string(),
         satoshi,
@@ -274,6 +303,34 @@ pub async fn get_funds(
         }
     }
 
+    // `[funding_limits]` (CS-530). After the idempotency check, so a replayed
+    // response is not counted again; the reservation is given back if the
+    // request is refused here.
+    let hold = match data.service.hold_funding(client_id, payout) {
+        Ok(hold) => hold,
+        Err(exceeded) => {
+            if let Some((key, _)) = &record {
+                data.service.release_idempotency(key).await;
+            }
+            log::warn!("funding limit for {client_id}: {}", exceeded.description());
+            return match exceeded {
+                LimitExceeded::PerRequest { .. } => {
+                    error_response(ErrorCode::InvalidRequest, exceeded.description())
+                }
+                LimitExceeded::PerPeriod { retry_after, .. } => {
+                    let mut response =
+                        error_response(ErrorCode::RateLimited, exceeded.description());
+                    response.headers_mut().insert(
+                        actix_web::http::header::RETRY_AFTER,
+                        actix_web::http::header::HeaderValue::from(retry_after.as_secs().max(1)),
+                    );
+                    response
+                }
+            };
+        }
+    };
+    let record_and_hold = (record.clone(), hold);
+
     if fund_request.no_of_outpoints > 1 && fund_request.multiple_tx {
         return match Service::fund_with_multiple_transactions(&data.service, &fund_request).await {
             Ok(funding_response) => match funding_response.to_response() {
@@ -316,7 +373,7 @@ pub async fn get_funds(
                         Err(description) => error_response(ErrorCode::Internal, description),
                     }
                 } else {
-                    release_if_nothing_was_spent(&data.service, &record, error.code).await;
+                    release_if_nothing_was_spent(&data.service, &record_and_hold, error.code).await;
                     error_response(error.code, error.description)
                 }
             }
@@ -325,7 +382,7 @@ pub async fn get_funds(
 
     if let Some(error) = data.service.funding_balance_error(&fund_request).await {
         log::info!("insufficient funds: {}", error.description);
-        release_if_nothing_was_spent(&data.service, &record, error.code).await;
+        release_if_nothing_was_spent(&data.service, &record_and_hold, error.code).await;
         return coded_error_response(error);
     }
 
@@ -347,7 +404,7 @@ pub async fn get_funds(
         },
         Err(error) => {
             debug!("execute_funding error = {:?}", error);
-            release_if_nothing_was_spent(&data.service, &record, error.code).await;
+            release_if_nothing_was_spent(&data.service, &record_and_hold, error.code).await;
             coded_error_response(error)
         }
     }
@@ -449,7 +506,7 @@ fn replay(outcome: Outcome) -> HttpResponse {
 /// whole mechanism exists to prevent.
 async fn release_if_nothing_was_spent(
     service: &Arc<Service>,
-    record: &Option<(RecordKey, String)>,
+    (record, hold): &(Option<(RecordKey, String)>, Option<Hold>),
     code: ErrorCode,
 ) {
     let certainly_pre_broadcast = matches!(
@@ -462,6 +519,11 @@ async fn release_if_nothing_was_spent(
     if certainly_pre_broadcast {
         if let Some((key, _)) = record {
             service.release_idempotency(key).await;
+        }
+        // Nothing was paid out, so it does not count against the client's
+        // `[funding_limits]` window (CS-530).
+        if let Some(hold) = hold {
+            service.release_funding(hold);
         }
     }
 }
@@ -636,6 +698,7 @@ mod tests {
             enabled: true,
             requests_per_second: 1,
             burst_size: Some(burst_size),
+            trusted_proxies: Vec::new(),
         };
         let governor_config = rate_limit::build_governor_config(&config.web_interface.rate_limit);
         let blockchain = test_blockchain_interface(&config).await;
@@ -1921,6 +1984,115 @@ mod tests {
             .await;
             assert_eq!(resp.status(), StatusCode::OK);
         }
+    }
+
+    async fn fund_with_headers(
+        app: &impl ActixService<Request, Response = ServiceResponse, Error = Error>,
+        body: Value,
+    ) -> (StatusCode, Option<String>, Value) {
+        let resp = test::call_service(
+            app,
+            test::TestRequest::post()
+                .uri("/fund")
+                .set_json(body)
+                .to_request(),
+        )
+        .await;
+        let http = resp.status();
+        let retry_after = resp
+            .headers()
+            .get(actix_web::http::header::RETRY_AFTER)
+            .map(|v| v.to_str().unwrap().to_string());
+        let body: Value = test::read_body_json(resp).await;
+        (http, retry_after, body)
+    }
+
+    /// CS-530: a payout that overflows, or exceeds every satoshi there is, is
+    /// refused rather than wrapped.
+    #[actix_web::test]
+    async fn sr_sec_030_a_payout_that_overflows_is_refused() {
+        let (app, _service) = build_app_with_service(test_config_with_keys(
+            &unique_dynamic_config_path(),
+            None,
+            None,
+        ))
+        .await;
+        for (satoshi, outpoints) in [(u64::MAX / 2 + 1, 2), (crate::client::MAX_SATOSHIS + 1, 1)] {
+            let (http, _, body) = fund_with_headers(
+                &app,
+                fund_body(TEST_CLIENT_ID, satoshi, outpoints, LOCKING_SCRIPT_HEX),
+            )
+            .await;
+            assert_eq!(http, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(body["code"], "invalid_request");
+        }
+    }
+
+    #[actix_web::test]
+    async fn sr_sec_029_an_overlong_idempotency_key_is_refused() {
+        let (app, _service) = build_app_with_service(test_config_with_keys(
+            &unique_dynamic_config_path(),
+            None,
+            None,
+        ))
+        .await;
+        let mut body = fund_body(TEST_CLIENT_ID, 100, 1, LOCKING_SCRIPT_HEX);
+        body["idempotency_key"] =
+            Value::String("k".repeat(crate::idempotency::MAX_IDEMPOTENCY_KEY_BYTES + 1));
+        let (http, _, body) = fund_with_headers(&app, body).await;
+        assert_eq!(http, StatusCode::BAD_REQUEST, "{body}");
+    }
+
+    /// CS-530: the per-request and per-period limits, end to end.
+    #[actix_web::test]
+    async fn sr_sec_030_funding_limits_refuse_over_limit_requests() {
+        let mut config = test_config_with_keys(&unique_dynamic_config_path(), None, None);
+        config.funding_limits.max_satoshis_per_request = Some(150);
+        config.funding_limits.max_satoshis_per_period = Some(200);
+        let (app, _service) = build_app_with_service(config).await;
+
+        let (http, _, body) =
+            fund_with_headers(&app, fund_body(TEST_CLIENT_ID, 151, 1, LOCKING_SCRIPT_HEX)).await;
+        assert_eq!(http, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body["description"]
+            .as_str()
+            .unwrap()
+            .contains("per request"));
+
+        let (http, _, body) =
+            fund_with_headers(&app, fund_body(TEST_CLIENT_ID, 120, 1, LOCKING_SCRIPT_HEX)).await;
+        assert_eq!(http, StatusCode::OK, "{body}");
+
+        // 120 paid this period; another 120 would make 240 of 200.
+        let (http, retry_after, body) =
+            fund_with_headers(&app, fund_body(TEST_CLIENT_ID, 120, 1, LOCKING_SCRIPT_HEX)).await;
+        assert_eq!(http, StatusCode::TOO_MANY_REQUESTS, "{body}");
+        assert_eq!(body["code"], "rate_limited");
+        let retry_after: u64 = retry_after.expect("Retry-After").parse().unwrap();
+        assert!((1..=3600).contains(&retry_after), "{retry_after}");
+    }
+
+    /// A request that broadcast nothing does not use up the client's window.
+    #[actix_web::test]
+    async fn sr_sec_030_a_request_that_spent_nothing_gives_its_amount_back() {
+        let mut config = test_config_with_keys(&unique_dynamic_config_path(), None, None);
+        config.funding_limits.max_satoshis_per_period = Some(15_000_000_000);
+        let (app, _service) = build_app_with_service(config).await;
+        // More than the test wallet holds: refused before any broadcast.
+        let (http, _, body) = fund_with_headers(
+            &app,
+            fund_body(TEST_CLIENT_ID, 10_000_000_000, 1, LOCKING_SCRIPT_HEX),
+        )
+        .await;
+        assert_ne!(http, StatusCode::OK, "{body}");
+        assert_ne!(http, StatusCode::TOO_MANY_REQUESTS, "{body}");
+        // Had it been kept, this would be over the limit.
+        let (http, _, body) = fund_with_headers(
+            &app,
+            fund_body(TEST_CLIENT_ID, 10_000_000_000, 1, LOCKING_SCRIPT_HEX),
+        )
+        .await;
+        assert_ne!(http, StatusCode::TOO_MANY_REQUESTS, "{body}");
     }
 
     #[actix_web::test]
