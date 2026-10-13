@@ -223,6 +223,24 @@ pub async fn get_funds(
         );
     }
 
+    // Who is asking is settled before anything sized by the request is
+    // built (CS-519). Expanding the scripts first let an anonymous caller ask
+    // for `no_of_outpoints` copies of a script -- 2^32 of them -- and the
+    // allocation killed the process before the API key was ever looked at.
+    if !data.service.is_client_id_valid(client_id).await {
+        // 400 rather than the code's default 404: the client_id arrives in the
+        // request body, so this is a malformed request, not a missing
+        // resource. A 404 here would read as "/fund does not exist".
+        return error_response_with_status(
+            StatusCode::BAD_REQUEST,
+            ErrorCode::UnknownClient,
+            format!("Unknown client_id {client_id}"),
+        );
+    }
+    if let Some(response) = authorize_client(&req, client_id, &data.service).await {
+        return response;
+    }
+
     // Normalise both request forms into one script per outpoint, so the rest
     // of the service never has to care which was used.
     let (no_of_outpoints, locking_scripts) = match resolve_locking_scripts(&info) {
@@ -241,20 +259,6 @@ pub async fn get_funds(
         multiple_tx,
         locking_scripts,
     };
-
-    if !data.service.is_client_id_valid(client_id).await {
-        // 400 rather than the code's default 404: the client_id arrives in the
-        // request body, so this is a malformed request, not a missing
-        // resource. A 404 here would read as "/fund does not exist".
-        return error_response_with_status(
-            StatusCode::BAD_REQUEST,
-            ErrorCode::UnknownClient,
-            format!("Unknown client_id {client_id}"),
-        );
-    }
-    if let Some(response) = authorize_client(&req, client_id, &data.service).await {
-        return response;
-    }
 
     // Refreshed only if the cache has gone stale, and with `[mapi_lite]` not
     // waited for unless the cache is unusable. See
@@ -381,13 +385,46 @@ pub async fn get_funds(
     }
 }
 
+/// The most outpoints one `/fund` may ask for (CS-519, SR-SEC-017).
+///
+/// Far above any real use -- Event asks for one, the documented examples for
+/// three -- and low enough that the funding transaction, or the transactions
+/// with `multiple_tx`, stay an ordinary size.
+pub const MAX_OUTPOINTS: u32 = 1000;
+
+/// The most locking-script bytes one `/fund` may ask to be paid to, summed
+/// over its outpoints (CS-519, SR-SEC-017).
+///
+/// Bounds what the one-script form expands to: a single script repeated
+/// `no_of_outpoints` times would otherwise be 1000 copies of whatever fits in
+/// the request body. A mebibyte is some forty thousand P2PKH scripts, so the
+/// outpoint limit is the one an ordinary request meets first.
+pub const MAX_LOCKING_SCRIPT_BYTES: usize = 1024 * 1024;
+
 /// Work out how many outpoints are wanted and the script for each.
 ///
 /// Accepts either `locking_script` with `no_of_outpoints` (one script applied
 /// to every outpoint, the original form) or `locking_scripts` (one per
 /// outpoint). Exactly one of the two must be given.
+///
+/// Both limits are checked from the hex lengths before anything is decoded or
+/// copied, so a request over them costs nothing to refuse (CS-519).
 fn resolve_locking_scripts(info: &FundingRequest) -> Result<(u32, Vec<Vec<u8>>), CodedError> {
     let invalid = |message: String| CodedError::new(ErrorCode::InvalidRequest, message);
+    let too_many = |count: usize| {
+        invalid(format!(
+            "no_of_outpoints is {count}; at most {MAX_OUTPOINTS} are allowed."
+        ))
+    };
+    let check_script_bytes = |hex_len: usize, copies: usize| -> Result<(), CodedError> {
+        // Hex is two characters a byte; a malformed odd length fails decoding.
+        match (hex_len / 2).checked_mul(copies) {
+            Some(total) if total <= MAX_LOCKING_SCRIPT_BYTES => Ok(()),
+            _ => Err(invalid(format!(
+                "the locking scripts total more than {MAX_LOCKING_SCRIPT_BYTES} bytes."
+            ))),
+        }
+    };
     let decode = |hex_script: &str| -> Result<Vec<u8>, CodedError> {
         hex::decode(hex_script).map_err(|_| {
             invalid(format!(
@@ -408,6 +445,10 @@ fn resolve_locking_scripts(info: &FundingRequest) -> Result<(u32, Vec<Vec<u8>>),
             if count == 0 {
                 return Err(invalid("Invalid no_of_outpoints value '0'".to_string()));
             }
+            if count > MAX_OUTPOINTS {
+                return Err(too_many(count as usize));
+            }
+            check_script_bytes(script.len(), count as usize)?;
             let bytes = decode(script)?;
             // The same script for every outpoint, as before. Note this makes
             // the outpoints spendable by one key, which is only what you want
@@ -420,6 +461,10 @@ fn resolve_locking_scripts(info: &FundingRequest) -> Result<(u32, Vec<Vec<u8>>),
                     "locking_scripts must contain at least one script.".to_string(),
                 ));
             }
+            if scripts.len() > MAX_OUTPOINTS as usize {
+                return Err(too_many(scripts.len()));
+            }
+            check_script_bytes(scripts.iter().map(String::len).sum(), 1)?;
             let count = scripts.len() as u32;
             if let Some(stated) = info.no_of_outpoints {
                 if stated != count {
@@ -2159,6 +2204,22 @@ mod tests {
         (http, body["code"].clone())
     }
 
+    /// One /fund, answered after `req`, as status and error code.
+    async fn fund_code(
+        app: &impl ActixService<Request, Response = ServiceResponse, Error = Error>,
+        body: Value,
+        api_key: Option<&str>,
+    ) -> (StatusCode, Value) {
+        let mut req = test::TestRequest::post().uri("/fund").set_json(body);
+        if let Some(key) = api_key {
+            req = req.insert_header(("X-API-Key", key));
+        }
+        let resp = test::call_service(app, req.to_request()).await;
+        let http = resp.status();
+        let body: Value = test::read_body_json(resp).await;
+        (http, body["code"].clone())
+    }
+
     /// The CS-521 attack, and each way around it. A new client may not take
     /// id1's key: not by naming id1's own override variable, not by an
     /// `env:` reference in `wif`, not through a permitted variable that holds
@@ -2219,6 +2280,98 @@ mod tests {
             add_client_code(json!({"client_id": "good", "wif_env": "FS_RUNTIME_WIF_GOOD"})).await;
         unsafe { std::env::remove_var("FS_RUNTIME_WIF_GOOD") };
         assert_eq!(http, StatusCode::OK);
+    }
+
+    /// The CS-519 attack: 2^32 copies of an empty script asked for about
+    /// 103 GB before the API key was looked at. Who is asking is now settled
+    /// first, so an unauthenticated or unknown caller costs nothing -- and if
+    /// the order regressed, this test would not finish.
+    #[actix_web::test]
+    async fn sr_sec_017_an_unauthenticated_fund_is_refused_before_its_scripts_are_built() {
+        let app = build_app_with_api_key(Some(TEST_API_KEY)).await;
+        let huge = |client: &str| {
+            json!({
+                "client_id": client,
+                "satoshi": 1,
+                "multiple_tx": false,
+                "locking_script": "",
+                "no_of_outpoints": u32::MAX,
+            })
+        };
+        let (http, code) = fund_code(&app, huge(TEST_CLIENT_ID), None).await;
+        assert_eq!(http, StatusCode::UNAUTHORIZED);
+        assert_eq!(code, "unauthorized");
+
+        let (http, code) = fund_code(&app, huge("no-such-client"), None).await;
+        assert_eq!(http, StatusCode::BAD_REQUEST);
+        assert_eq!(code, "unknown_client");
+
+        // And authenticated, the count is refused without being built.
+        let (http, code) = fund_code(&app, huge(TEST_CLIENT_ID), Some(TEST_API_KEY)).await;
+        assert_eq!(http, StatusCode::BAD_REQUEST);
+        assert_eq!(code, "invalid_request");
+    }
+
+    /// At most MAX_OUTPOINTS outpoints, in either request form.
+    #[actix_web::test]
+    async fn sr_sec_017_no_more_than_the_maximum_outpoints_are_accepted() {
+        use super::MAX_OUTPOINTS;
+        let app = build_app().await;
+
+        let (_, code) = fund_code(
+            &app,
+            fund_body(TEST_CLIENT_ID, 1, MAX_OUTPOINTS + 1, LOCKING_SCRIPT_HEX),
+            None,
+        )
+        .await;
+        assert_eq!(code, "invalid_request");
+        // At the limit it is not refused as invalid: whatever the wallet then
+        // says, the request itself was acceptable.
+        let (_, code) = fund_code(
+            &app,
+            fund_body(TEST_CLIENT_ID, 1, MAX_OUTPOINTS, LOCKING_SCRIPT_HEX),
+            None,
+        )
+        .await;
+        assert_ne!(code, "invalid_request");
+
+        let list = |n: u32| {
+            json!({
+                "client_id": TEST_CLIENT_ID,
+                "satoshi": 1,
+                "multiple_tx": false,
+                "locking_scripts": vec![LOCKING_SCRIPT_HEX; n as usize],
+            })
+        };
+        let (_, code) = fund_code(&app, list(MAX_OUTPOINTS + 1), None).await;
+        assert_eq!(code, "invalid_request");
+        let (_, code) = fund_code(&app, list(MAX_OUTPOINTS), None).await;
+        assert_ne!(code, "invalid_request");
+    }
+
+    /// The scripts a request asks to be paid to are bounded in total, so the
+    /// one-script form cannot expand a large script a thousand times.
+    #[actix_web::test]
+    async fn sr_sec_017_locking_scripts_are_bounded_in_total() {
+        use super::{MAX_LOCKING_SCRIPT_BYTES, MAX_OUTPOINTS};
+        let app = build_app().await;
+        // 2 KiB a script: 512 of them is the limit exactly, under the
+        // outpoint limit, so it is the byte limit being tested.
+        let script = "51".repeat(2048);
+        let at_limit = (MAX_LOCKING_SCRIPT_BYTES / 2048) as u32;
+        assert!(at_limit < MAX_OUTPOINTS);
+
+        let (_, code) = fund_code(
+            &app,
+            fund_body(TEST_CLIENT_ID, 1, at_limit + 1, &script),
+            None,
+        )
+        .await;
+        assert_eq!(code, "invalid_request", "one script over the byte limit");
+
+        let (_, code) =
+            fund_code(&app, fund_body(TEST_CLIENT_ID, 1, at_limit, &script), None).await;
+        assert_ne!(code, "invalid_request", "exactly the limit");
     }
 
     /// A chain read that fails names the address it could not reach -- a node
