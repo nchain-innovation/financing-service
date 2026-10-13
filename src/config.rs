@@ -40,7 +40,19 @@ pub struct BlockchainInterfaceConfig {
     /// `0` to turn the limit off.
     #[serde(default)]
     pub max_requests_per_second: Option<u32>,
+    /// Deadline on each call to the interface, in seconds (CS-502). Unset
+    /// means [`DEFAULT_INTERFACE_TIMEOUT_SECONDS`]; `0` turns it off.
+    ///
+    /// A call that outlives it fails as a chain failure, so a read that is
+    /// accepted and never answered cannot hold a client's refresh forever.
+    /// It bounds a whole call, which for WhatsOnChain's paged UTXO listing is
+    /// several paced requests, so leave room for the largest address.
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
 }
+
+/// The per-call deadline when `timeout_seconds` is unset (CS-502).
+pub const DEFAULT_INTERFACE_TIMEOUT_SECONDS: u64 = 30;
 
 fn default_rpc_import_addresses() -> bool {
     true
@@ -61,6 +73,7 @@ impl Default for BlockchainInterfaceConfig {
             rpc_password: None,
             rpc_import_addresses: default_rpc_import_addresses(),
             max_requests_per_second: None,
+            timeout_seconds: None,
         }
     }
 }
@@ -71,6 +84,18 @@ impl BlockchainInterfaceConfig {
     /// An explicit setting always wins, including an explicit `0` meaning
     /// unlimited. Otherwise only the interfaces that call somebody else's
     /// server are limited.
+    /// The deadline on each interface call, or `None` when it is turned off
+    /// (CS-502).
+    pub fn call_timeout(&self) -> Option<std::time::Duration> {
+        match self
+            .timeout_seconds
+            .unwrap_or(DEFAULT_INTERFACE_TIMEOUT_SECONDS)
+        {
+            0 => None,
+            seconds => Some(std::time::Duration::from_secs(seconds)),
+        }
+    }
+
     pub fn outbound_rate_limit(&self) -> Option<u32> {
         match self.max_requests_per_second {
             Some(0) => None,
@@ -155,6 +180,17 @@ pub struct ServiceConfig {
     /// request, which is what the service did before.
     #[serde(default)]
     pub chain_state_max_age_seconds: Option<u64>,
+    /// How old a client's chain read may be before `GET /ready` reports the
+    /// service unready, in seconds (CS-505, SR-BCHN-017).
+    ///
+    /// With `[mapi_lite]` a funding request does not wait for a refresh while
+    /// the cache is usable (SR-FUND-031), so if chain reads keep failing the
+    /// service goes on funding from an ever older view and nothing else says
+    /// so. Defaults to three refresh periods, and at least 60s: one failed
+    /// sweep is a blip, three is chain reads not working. `0` turns the check
+    /// off.
+    #[serde(default)]
+    pub ready_max_chain_read_age_seconds: Option<u64>,
     /// Where to keep what the service has broadcast but the chain may not have
     /// caught up with, so a restart does not forget it (CS-465).
     ///
@@ -171,6 +207,15 @@ impl ServiceConfig {
             self.chain_state_max_age_seconds
                 .unwrap_or(self.utxo_refresh_period),
         )
+    }
+
+    /// The bound `GET /ready` holds chain reads to, or `None` when the check
+    /// is off. See `ready_max_chain_read_age_seconds`.
+    pub fn ready_max_chain_read_age(&self) -> Option<std::time::Duration> {
+        let seconds = self
+            .ready_max_chain_read_age_seconds
+            .unwrap_or_else(|| (self.utxo_refresh_period.saturating_mul(3)).max(60));
+        (seconds > 0).then(|| std::time::Duration::from_secs(seconds))
     }
 }
 
@@ -1069,6 +1114,25 @@ filename = "./data/dynamic.toml"
     }
 
     #[test]
+    fn cs_502_the_interface_deadline_defaults_to_30s_and_0_turns_it_off() {
+        let unset = BlockchainInterfaceConfig::default();
+        assert_eq!(
+            unset.call_timeout(),
+            Some(std::time::Duration::from_secs(30))
+        );
+        let off = BlockchainInterfaceConfig {
+            timeout_seconds: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(off.call_timeout(), None);
+        let set = BlockchainInterfaceConfig {
+            timeout_seconds: Some(7),
+            ..Default::default()
+        };
+        assert_eq!(set.call_timeout(), Some(std::time::Duration::from_secs(7)));
+    }
+
+    #[test]
     fn woc_and_test_interfaces_need_no_url() {
         for interface_type in ["woc", "test"] {
             let config = BlockchainInterfaceConfig {
@@ -1710,5 +1774,21 @@ filename = "./data/dynamic.toml"
         assert!(policy_config("regtest", None, false, true)
             .check_auth_policy()
             .is_ok());
+    }
+
+    /// CS-505, SR-BCHN-017: three refresh periods by default, never under a
+    /// minute, explicit when set, and off at zero.
+    #[test]
+    fn sr_bchn_017_ready_chain_read_bound_defaults_and_overrides() {
+        let service = |period, explicit| ServiceConfig {
+            utxo_refresh_period: period,
+            ready_max_chain_read_age_seconds: explicit,
+            ..Default::default()
+        };
+        let secs = |s| Some(std::time::Duration::from_secs(s));
+        assert_eq!(service(60, None).ready_max_chain_read_age(), secs(180));
+        assert_eq!(service(10, None).ready_max_chain_read_age(), secs(60));
+        assert_eq!(service(60, Some(45)).ready_max_chain_read_age(), secs(45));
+        assert_eq!(service(60, Some(0)).ready_max_chain_read_age(), None);
     }
 }

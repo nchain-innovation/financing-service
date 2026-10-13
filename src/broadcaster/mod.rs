@@ -53,6 +53,26 @@ pub enum BroadcastError {
     Indeterminate(String),
 }
 
+impl BroadcastError {
+    /// Whether the upstream refused the transaction because an input does not
+    /// exist (CS-506).
+    ///
+    /// Matched on the node's reject reason as mapi-lite passes it through --
+    /// `16 missing-inputs` from SV Node, `bad-txns-inputs-missingorspent` from
+    /// its consensus check -- since neither the node nor mapi-lite gives it a
+    /// code of its own. Only a definite refusal says this: an error that never
+    /// reached the node says nothing about the inputs.
+    pub fn inputs_missing(&self) -> bool {
+        let BroadcastError::Rejected { description, .. } = self else {
+            return false;
+        };
+        let description = description.to_ascii_lowercase();
+        description.contains("missing-inputs")
+            || description.contains("missing inputs")
+            || description.contains("missingorspent")
+    }
+}
+
 impl std::fmt::Display for BroadcastError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -110,6 +130,27 @@ mod tests {
     /// only place an operator learns *why* the upstream refused a transaction
     /// and whether it thought a retry could help. `Service` logs the error
     /// through it on every broadcast failure.
+    /// CS-506: the node's missing-inputs refusal, in the forms it reaches
+    /// this service, and nothing else.
+    #[test]
+    fn inputs_missing_is_read_off_a_refusal_only() {
+        let rejected = |description: &str| BroadcastError::Rejected {
+            description: description.to_string(),
+            retryable: false,
+        };
+        // Verbatim from mapi-lite v0.3.0 over an SV Node regtest, 2026-10-09.
+        assert!(
+            rejected("Mempool error, retry again later. (details: 16 missing-inputs)")
+                .inputs_missing()
+        );
+        assert!(rejected("16 missing-inputs").inputs_missing());
+        assert!(rejected("Missing inputs").inputs_missing());
+        assert!(rejected("bad-txns-inputs-missingorspent").inputs_missing());
+        assert!(!rejected("258 txn-mempool-conflict").inputs_missing());
+        assert!(!BroadcastError::Upstream("missing-inputs".to_string()).inputs_missing());
+        assert!(!BroadcastError::Indeterminate("missing-inputs".to_string()).inputs_missing());
+    }
+
     #[test]
     fn broadcast_error_display_names_the_kind_of_failure() {
         let rejected = BroadcastError::Rejected {
