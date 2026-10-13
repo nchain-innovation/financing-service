@@ -416,7 +416,19 @@ Path to the file used to persist clients added at runtime via `POST /client`. Dy
 ```toml
 [dynamic_config]
 filename = "./data/dynamic.toml"
+# wif_env_prefix = "FS_RUNTIME_WIF_"
 ```
+
+* `wif_env_prefix` — the only environment variables a client added through `POST /client` may take its key from with `wif_env`. Default `FS_RUNTIME_WIF_`. It is rejected at startup if it overlaps `FS_CLIENT_`, which every client's own override variable (`FS_CLIENT_<ID>_WIF`) starts with (CS-521).
+
+**Runtime clients cannot take another client's wallet (CS-521, SR-SEC-018).** Before this, `wif_env` could name any variable in the service's environment, another client's `FS_CLIENT_<ID>_WIF` included. Whoever could call `POST /client` (anyone, with no `admin_api_key`) could then fund from that client's wallet under an API key of their own. Now:
+
+* `wif_env` must start with `wif_env_prefix`. **This is a breaking change:** a deployment that names other variables has to rename them, or set the prefix to match.
+* A `wif` beginning `env:` is refused; name a variable with `wif_env` instead.
+* A client whose key is the funding key of an existing client is refused, however the key was supplied. Two clients funding from one wallet would spend the same coins.
+* A `client_id` that folds onto an existing client's override variables (case and punctuation fold, so `ID.1` and `id_1` share `FS_CLIENT_ID_1_*`) is refused.
+
+Clients that already share a wallet when the service starts are reported as an error in the log, naming them. The service still starts. Remove the one that should not be there from the dynamic config.
 
 ## [[client]]
 
