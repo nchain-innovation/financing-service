@@ -70,9 +70,9 @@ An import that fails is logged as a warning and does not stop the service — th
 
 #### Outbound rate limiting
 
-The service reads chain state often: twice per client per refresh — once for the balance, once for the UTXOs — from the periodic timer, from `GET /balance`, and from `POST /fund` both before building a transaction and again on the error path. Several clients, or one client and a little traffic, and those bursts overlap.
+The service reads chain state often: once per client per refresh — the UTXOs, from which the balance is derived — from the periodic timer, from `GET /balance`, and from `POST /fund` both before building a transaction and again on the error path. Several clients, or one client and a little traffic, and those bursts overlap.
 
-**Those are two *calls*, which are no longer two requests.** Since chain-gang 0.11.3 (CS-456) a balance read is two HTTP requests and a UTXO read is one per 1000 UTXOs — 21 for the busy mainnet address that change was measured against. See the limit's scope below.
+**That is one *call*, which is not one request.** Since chain-gang 0.11.3 (CS-456) a UTXO read is one HTTP request per 1000 UTXOs — 21 for the busy mainnet address that change was measured against. See the limit's scope below.
 
 WhatsOnChain documents **"up to 3 requests/sec is free"** and answers `429 Too Many Requests` above it. A failed refresh is the mild consequence; sustained violation risks a ban, which no amount of retrying recovers from. So outbound calls are spaced:
 
@@ -116,9 +116,21 @@ Note that `GET /health` stays `ok` throughout: it is a liveness check and delibe
 
 **`test` is a fixture, not a backend.** It is an in-process stub used by the unit tests, with a UTXO set injected directly by the test harness. It has no network of its own, so the `network_type` you set alongside it only affects address encoding. It will start and serve requests as a configured backend, but its UTXO set is empty, so balances read zero and funding is refused — useful for exercising the API surface, not for funding anything.
 
-### A note on the default port
+### A note on the port
 
-`[web_interface] port` defaults to `8080`, which several other nChain services also default to — mapi-lite among them. If you are running this alongside one of those, change the port here or there; nothing will respond on a port that another process already holds.
+`[web_interface] port` has no default and must be set. The sample config uses `8080`, which several other nChain services also default to — mapi-lite among them. If you are running this alongside one of those, change the port here or there; nothing will respond on a port that another process already holds.
+
+### Required keys
+
+Most keys have defaults, and most sections can be left out. These cannot, and the service refuses to start without them:
+
+* `blockchain_interface.interface_type` and `blockchain_interface.network_type`
+* `web_interface.address` and `web_interface.port`
+* `logging.level`
+* `service.utxo_refresh_period`
+* `dynamic_config.filename`
+
+Within an optional section, `mapi_lite.base_url` is required when `[mapi_lite]` is present, and `client_id` and `wif_key` in each `[[client]]`.
 
 ## [web_interface]
 
@@ -156,7 +168,7 @@ burst_size = 20
 ```
 
 * `enabled` — turn rate limiting on or off (default: `false`)
-* `requests_per_second` — sustained request rate allowed per client IP
+* `requests_per_second` — sustained request rate allowed per client IP (default: `10`)
 * `burst_size` — maximum burst before limiting (defaults to `requests_per_second`)
 
 When enabled, excess requests receive HTTP 429 with a JSON error body. `/health` and `/ready` are exempt so container orchestration probes are not throttled.
@@ -381,10 +393,10 @@ When the section is present the service:
 
 * Logs at startup: `mapi-lite integration configured (base_url=...): funding transactions will be broadcast via mapi-lite`. Without the section the line reads `mapi-lite not configured: funding transactions will be broadcast via the 'woc' blockchain interface` (naming whichever `interface_type` is configured).
 * Probes mapi-lite at startup (its `GET /ready`) and **warns** if it is unreachable or not ready, without refusing to start. Funding will fail until mapi-lite is reachable, but the read paths — `/status`, balances, UTXO refreshes — do not depend on it and keep serving, and the service recovers on its own when mapi-lite returns. Refusing to start would instead put the container in a restart loop driven by its own health check, taking the read paths down with it.
-* Asks mapi-lite's own `GET /ready` for this service's `GET /ready`, and returns HTTP 503 when mapi-lite is unreachable or not ready, reusing a verdict for up to `health_timeout_seconds`. mapi-lite's readiness fails when its nodes are unreachable or its block ingest has fallen behind; the fee quote this used to probe is served from mapi-lite's configuration and answered with every node down (CS-505). `GET /health` is unaffected. See [Readiness check](SupportedEndpoints.md#readiness-check).
+* Asks mapi-lite's own `GET /ready` for this service's `GET /ready`, and returns HTTP 503 when mapi-lite is unreachable or not ready, reusing a verdict for up to `health_timeout_seconds`. mapi-lite's readiness fails when it cannot do its work: its nodes are unreachable, its block ingest has fallen behind, or it cannot sign or reach its database; the fee quote this used to probe is served from mapi-lite's configuration and answered with every node down (CS-505). `GET /health` is unaffected. See [Readiness check](SupportedEndpoints.md#readiness-check).
 * Reports `"broadcaster": "mapi-lite"` in `GET /status`.
 * Funds a request from cached chain state that has merely aged, rather than waiting for it to be refreshed through `[blockchain_interface]`, and refreshes it behind the request — see [How often the service reads the chain](#how-often-the-service-reads-the-chain).
-* Submits each funding transaction as a one-element batch to `POST /mapi/txs`, with the merkle proof declined (no callbacks are wanted). A rejection by mapi-lite or the node surfaces to the caller as `broadcast_failed` (HTTP 502), with the reason in the service log. An answer that never arrives, or one this client cannot read, surfaces as `broadcast_outcome_unknown` (HTTP 504) instead, because the transaction may have reached the network.
+* Submits each funding transaction as a one-element batch to `POST /mapi/txs`, with the merkle proof declined (no callbacks are wanted). A rejection by mapi-lite or the node surfaces to the caller as `broadcast_rejected` (HTTP 409) when the upstream calls it final or names a conflicting transaction, since retrying cannot help, and otherwise as `broadcast_failed` (HTTP 502); either way the reason is in the service log. An answer that never arrives, or one this client cannot read, surfaces as `broadcast_outcome_unknown` (HTTP 504) instead, because the transaction may have reached the network.
 
 The mapi-lite server must be pointed at the same network as `network_type`, since the funding transactions are signed for that network. Because mapi-lite talks to a node directly, this is also a way to broadcast on regtest while still reading chain state through another interface.
 

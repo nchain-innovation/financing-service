@@ -1,7 +1,7 @@
 # Locking scripts
 This document contains information on generating locking scripts for the `fund` call.
 
-A pay to public key hash (P2PKH) unlocking script has the following form
+A pay to public key hash (P2PKH) locking script has the following form
 ```
 OP_DUP OP_HASH160 ddc574807c3035ab43553a22c0b9df1f55737fae OP_EQUALVERIFY OP_CHECKSIG
 ```
@@ -13,15 +13,15 @@ So the fund call is expecting the script as a hex string, in this case `76a914dd
 
 ## Locking scripts - Python 
 In the `tx-engine` code we have:
-* `p2pkh_script()` - this creates a P2PKH unlocking script for the given public key hash
+* `p2pkh_script()` - this creates a P2PKH locking script for the given public key hash
 * `script.raw_serialize()` method returns the script as bytes, without the prepended length.
 * There is a `bytes.hex()` method which converts bytes to hex string.
 
 
-So the call to setup the unlocking script is 
+So the call to setup the locking script is 
 ```Python
 from tx_engine import p2pkh_script
-unlocking_script = p2pkh_script(public_key_hash).raw_serialize().hex()`
+locking_script = p2pkh_script(public_key_hash).raw_serialize().hex()
 ```
 
 ## Locking scripts - Rust

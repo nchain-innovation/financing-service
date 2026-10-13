@@ -1,6 +1,6 @@
 # Supported endpoints
 
-The service listens on the port configured in `data/financing-service.toml` (default `8080`).
+The service listens on the port configured in `data/financing-service.toml` (`[web_interface] port`, which is required; the sample config and the examples below use `8080`).
 
 When a client has an `api_key` configured, that client's endpoints require authentication via either:
 
@@ -78,7 +78,7 @@ curl http://127.0.0.1:8080/ready
 Two checks, and the answer is healthy only if both pass (CS-505):
 
 * **`chain`** — chain reads are working. Every client's UTXO set must have been read from the chain within `service.ready_max_chain_read_age_seconds` (default three refresh periods, at least 60s); with no clients, the blockchain interface must have answered within that time. A client never read at all fails too — a service that started while the chain was unreachable. The check reads nothing itself: it reports what the periodic refresh has managed. With [`[mapi_lite]`](Configuration.md#mapi_lite) this matters most, because funding then goes on from the cached state without waiting for a refresh, so failing chain reads would otherwise go unnoticed while the cache grew ever older.
-* **`mapi_lite`** — with `[mapi_lite]` configured, mapi-lite's own `GET /ready`, which fails when its node pool is unreachable, its block ingest has fallen behind, or it cannot sign. Until CS-505 this probed `GET /mapi/feeQuote`, which mapi-lite serves from its configuration and which kept answering with every node down.
+* **`mapi_lite`** — with `[mapi_lite]` configured, mapi-lite's own `GET /ready`, which fails when mapi-lite cannot do its work: its nodes are unreachable, its block ingest has fallen behind, or it cannot sign or reach its database. Until CS-505 this probed `GET /mapi/feeQuote`, which mapi-lite serves from its configuration and which kept answering with every node down.
 
 | Situation | HTTP | Body |
 |---|---|---|
@@ -212,8 +212,8 @@ The first call reserves the key and, once the transaction is broadcast, retains 
 |---|---|
 | New key | Funds normally, and the response is retained |
 | Same key, same request, already funded | Replays the first response with `"replayed": true`; nothing is broadcast |
-| Same key, still being processed | `422` `key_in_progress` — retry shortly |
-| Same key, materially different request | `422` `idempotency_key_reused` — use a fresh `idempotency_key` |
+| Same key, still being processed | `409` `key_in_progress` — retry shortly |
+| Same key, materially different request | `409` `idempotency_key_reused` — use a fresh `idempotency_key` |
 | Refused before anything was built (`insufficient_balance`, `no_suitable_utxo`, `funds_in_flight`) | The key is freed, so it can be retried |
 
 **A replayed response is marked.** It carries `"replayed": true`; an ordinary funding response omits the field entirely, so read its absence as false.
@@ -394,7 +394,7 @@ curl -H "Authorization: Bearer your-client-api-key" \
 
 Return the satoshi balance for a client. Requires the target client's `api_key` when configured.
 
-The service refreshes balance and UTXO state from the blockchain on each request before responding.
+The service refreshes balance and UTXO state from the blockchain before responding when its cached state is older than `service.chain_state_max_age_seconds` (by default the refresh period); otherwise it answers from the cache. See [How often the service reads the chain](Configuration.md#how-often-the-service-reads-the-chain).
 
 ```bash
 curl -H "Authorization: Bearer your-client-api-key" \

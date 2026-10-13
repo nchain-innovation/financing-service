@@ -16,7 +16,7 @@ database FundingUTXO {
 
 json FundingTx {
     "inputs": ["0", "FundingUTXO_0"],
-    "outputs": ["0", "Satoshi: 500" , "1", "Satoshi: 999_450"]
+    "outputs": ["0", "Satoshi: 999_450" , "1", "Satoshi: 500"]
 }
 
 
@@ -27,11 +27,11 @@ json ApplicationTx {
     "outputs": ""
 }
 
-ApplicationTx -left-> FundingTx: ApplicationTx::input[0]\n Spends 500 Satoshi from FundingTx::output[0]
+ApplicationTx -left-> FundingTx: ApplicationTx::input[0]\n Spends 500 Satoshi from FundingTx::output[1]
 
 
 
-FundingUTXO_1 -up-> FundingTx: FundingTx::output[1]\n Creates 999_450 Satoshi change
+FundingUTXO_1 -up-> FundingTx: FundingTx::output[0]\n Creates 999_450 Satoshi change
 
 FundingUTXO_0 .right.> FundingUTXO_1
 

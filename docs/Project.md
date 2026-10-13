@@ -1,6 +1,6 @@
 # Project status
 
-High-level status and known limitations for the Financing Service Rust implementation (v4.5.0).
+High-level status and known limitations for the Financing Service Rust implementation (v4.5.0, plus the unreleased changes listed at the end of [Releases](Releases)).
 
 For API details see [SupportedEndpoints.md](SupportedEndpoints.md). For configuration see [Configuration.md](Configuration.md). For build and test instructions see [Development.md](Development.md).
 
@@ -52,11 +52,13 @@ Admin       ──REST──▶       │                │
 | `blockchain_factory.rs` | Pluggable blockchain backends (chain reads, and broadcast by default) |
 | `broadcaster/mod.rs` | `TxBroadcaster` seam for sending funding transactions |
 | `broadcaster/woc.rs` | Broadcast through the configured `BlockchainInterface` (WoC in production) |
-| `broadcaster/mapi.rs` | Broadcast through mapi-lite with `uls-client`; fee-quote health probe |
+| `broadcaster/mapi.rs` | Broadcast through mapi-lite with `uls-client`; health probe against mapi-lite's `GET /ready`; fee quote |
 | `broadcaster/factory.rs` | Select the broadcaster from `[mapi_lite]`; the startup log line |
 | `address_watcher.rs` | Tell a node-backed interface which addresses to track |
 | `dynamic_config.rs` | Persist runtime-added clients |
+| `idempotency.rs` | `POST /fund` idempotency records: reserve a key, replay the retained response |
 | `rate_limit.rs` | Per-IP HTTP rate limiting middleware |
+| `outbound_rate_limit.rs` | Keep outbound calls inside the blockchain interface's rate limit |
 | `telemetry.rs` | Tracing subscriber and OpenTelemetry OTLP export |
 
 ## Implemented
@@ -69,12 +71,12 @@ Admin       ──REST──▶       │                │
 * Secret references via `env:VAR`, environment overrides, and `wif_env` / `api_key_env` on `POST /client`
 * Optional OpenTelemetry trace export via OTLP (configurable, disabled by default)
 * Configurable per-IP HTTP rate limiting with `/health` and `/ready` exempt
-* Balance checks against total wallet balance; funding combines multiple UTXOs when needed; balance endpoint refreshes from chain on each request; `multiple_tx` partial failures return structured successful transaction data; concurrent fund requests for the same client use read-only planning and commit UTXO updates only after broadcast
+* Balance checks against total wallet balance; funding combines multiple UTXOs when needed; balance endpoint refreshes from chain when the cached state is older than `service.chain_state_max_age_seconds`; `multiple_tx` partial failures return structured successful transaction data; concurrent fund requests for the same client each claim their inputs under an exclusive per-client lock and commit the claim only after a successful broadcast
 * Optional mapi-lite transaction broadcaster (`[mapi_lite]`): broadcasts go to mapi-lite, reads stay on the blockchain interface, `/ready` probes mapi-lite's own `/ready` and returns 503 when it is down or not ready while `/health` stays up, `/status` names the broadcaster, startup logs the selection
 * Docker image with `/health` liveness check
 * CI: build, test, `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo audit`
 * `chain-gang` from crates.io at an exact release, with a committed `Cargo.lock`, for reproducible builds
-* 144 automated tests (unit, integration, REST API, system requirements)
+* Automated test suite (unit, integration, REST API, system requirements), run by `cargo test`
 
 ## Known limitations
 
@@ -94,6 +96,5 @@ None at present.
 * [LockingScripts.md](LockingScripts.md) — generating locking scripts for `/fund`
 * [Development.md](Development.md) — build, test, and CI
 * [Dependencies.md](Dependencies.md) — the private `uls-client` dependency and the single-`chain-gang` invariant
-* [MapiLiteBroadcaster.md](MapiLiteBroadcaster.md) — design record for the mapi-lite broadcaster
 * [SystemRequirements.md](SystemRequirements.md) — system requirements and verification methods
 * [README.md](../README.md) — overview and getting started

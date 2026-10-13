@@ -1,6 +1,6 @@
 # System requirements
 
-System requirements for the Financing Service Rust implementation (v4.5.0), with verification methods for each requirement.
+System requirements for the Financing Service Rust implementation (v4.5.0, plus the unreleased changes listed at the end of [Releases](Releases)), with verification methods for each requirement.
 
 For API behaviour see [SupportedEndpoints.md](SupportedEndpoints.md). For configuration see [Configuration.md](Configuration.md). For implementation status see [Project.md](Project.md).
 
@@ -161,8 +161,9 @@ Requirement IDs appear in test function names (for example `sr_fund_008_*`) or a
 | SR-NFR-003 | Dependencies SHALL pass `cargo audit` without known vulnerabilities (or with documented exceptions). | Must | **AT:** `system_requirements::tests::sr_nfr_003_ci_runs_cargo_audit` |
 | SR-NFR-004 | All automated tests SHALL pass on supported platforms in CI. | Must | **AT:** `system_requirements::tests::sr_nfr_004_ci_runs_cargo_test` |
 | SR-NFR-005 | `Cargo.lock` SHALL be committed for reproducible builds. | Must | **AT:** `system_requirements::tests::sr_nfr_005_cargo_lock_is_committed` |
+| SR-NFR-006 | *Withdrawn in 3.0.0.* Required `chain-gang` to be pinned to a git revision; it now comes from crates.io at an exact release. | — | — |
 | SR-NFR-007 | Startup configuration or secret resolution errors SHALL return an error from `main` rather than panic. | Must | **AT:** `system_requirements::tests::sr_nfr_007_main_returns_error_instead_of_panicking_on_config_failure`, `config::tests::sr_nfr_007_load_config_returns_error_for_invalid_file` |
-| SR-NFR-008 | The service SHALL maintain an in-memory UTXO cache per client and persist runtime-added clients to the dynamic config file. | Must | **AT:** `dynamic_config::tests::sr_clnt_004_and_sr_nfr_008_add_client_persists_to_dynamic_config_file`, `sr_nfr_008_remove_client_updates_dynamic_config_file`, `client::tests::sr_fund_010_plan_funding_tx_leaves_utxo_cache_unchanged_until_commit` |
+| SR-NFR-008 | The service SHALL maintain an in-memory UTXO cache per client and persist runtime-added clients to the dynamic config file. | Must | **AT:** `dynamic_config::tests::sr_clnt_004_and_sr_nfr_008_add_client_persists_to_dynamic_config_file`, `sr_nfr_008_remove_client_updates_dynamic_config_file`, `client::tests::sr_fund_010_planning_is_pure_and_a_claim_keeps_the_next_plan_off_its_inputs` |
 | SR-NFR-009 | The `uls-client`/`uls-core` dependencies SHALL be git+SSH pins to one mapi-lite revision, fetched by the system git (`.cargo/config.toml`), with the deploy key loaded in CI and the SSH agent forwarded into the Docker build; `chain-gang` and `reqwest` SHALL each resolve to exactly one package in `Cargo.lock`. | Must | **AT:** `system_requirements::tests::sr_nfr_009_cargo_fetches_git_dependencies_with_the_system_git`, `sr_nfr_009_ci_loads_the_mapi_lite_deploy_key_before_building`, `sr_nfr_009_docker_build_mounts_ssh_for_the_dependency_fetch`, `dependency_graph::tests::chain_gang_resolves_to_exactly_one_package`, `reqwest_resolves_to_exactly_one_package`, `the_two_uls_crates_come_from_one_mapi_lite_revision` |
 
 ## Constraints and known limitations
@@ -187,7 +188,7 @@ cargo audit
 cargo test
 ```
 
-These commands mirror the GitHub Actions workflow (`.github/workflows/rust.yml`). The `cargo test` step executes all requirement tests above (currently **114** tests).
+These commands mirror the GitHub Actions workflow (`.github/workflows/rust.yml`). The `cargo test` step executes all requirement tests above, along with the rest of the test suite.
 
 ## Related documentation
 

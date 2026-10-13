@@ -33,7 +33,8 @@ actix-governor = "0.10.0"
 # requirement must be satisfiable by the chain-gang line above, or the graph
 # carries two chain-gangs and their types stop unifying. This is the commit
 # mapi-lite tagged v0.3.0, on chain-gang 0.13 -- pinned by rev, which unlike a
-# tag cannot move; teranode-event-rs is still on v0.2.0 and chain-gang 0.11.
+# tag cannot move; teranode-event-rs takes the same release by tag v0.3.0, on
+# chain-gang 0.13.0.
 # See docs/Dependencies.md before changing it.
 uls-client = { git = "ssh://git@github.com/nchain-innovation/mapi-lite.git", rev = "d6aec86212b8d5bd310b247ec5fb6624c2c508d2" }
 uls-core = { git = "ssh://git@github.com/nchain-innovation/mapi-lite.git", rev = "d6aec86212b8d5bd310b247ec5fb6624c2c508d2" }

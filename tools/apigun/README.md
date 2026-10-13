@@ -29,8 +29,9 @@ k6 run -e LOCKING_SCRIPT=<hex> tools/apigun/smoke.js
 k6 run -e LOCKING_SCRIPT=<hex> tools/apigun/breakpoint.js
 ```
 
-Other defaults point at `http://127.0.0.1:9080` and the `event-rs` client from
-`data/financing-service.toml`. Override with `-e`:
+Other defaults, set in `lib/config.js`, point at `http://127.0.0.1:9080` and a
+client named `event-rs`. They are not taken from `data/financing-service.toml`,
+which listens on `8080` and configures no clients. Override with `-e`:
 
 ```sh
 k6 run \

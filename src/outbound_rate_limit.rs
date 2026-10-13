@@ -1,14 +1,14 @@
 //! Keeping the service inside the blockchain interface's rate limit.
 //!
 //! WhatsOnChain publishes "up to 3 requests/sec is free" and answers 429 above
-//! it. Nothing in the service spaced its calls, and it makes two interface
-//! calls per client per refresh -- one for the balance, one for the UTXOs --
-//! from a periodic timer, from `GET /balance`, and from `POST /fund` both
-//! before building and again on the error path. Several clients, or one client
-//! and a little traffic, and the bursts overlap. The reported symptom was a run
-//! of 429s within the same second, and the real risk is not the failed refresh:
-//! it is being banned for sustained violation, which no amount of retrying
-//! recovers from.
+//! it. Nothing in the service spaced its calls, and it makes an interface call
+//! per client per refresh -- the UTXOs, from which the balance is derived;
+//! there used to be a second, for the balance -- from a periodic timer, from
+//! `GET /balance`, and from `POST /fund` both before building and again on the
+//! error path. Several clients, or one client and a little traffic, and the
+//! bursts overlap. The reported symptom was a run of 429s within the same
+//! second, and the real risk is not the failed refresh: it is being banned for
+//! sustained violation, which no amount of retrying recovers from.
 //!
 //! So the limit is honoured here rather than at each call site. A decorator
 //! around [`BlockchainInterface`] sees every outbound *call* whatever asked for

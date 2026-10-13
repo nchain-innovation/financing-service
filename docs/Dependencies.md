@@ -15,7 +15,7 @@ They exist for the optional mapi-lite transaction broadcaster (`src/broadcaster/
 
 mapi-lite is not published to crates.io. The pin names the commit tagged `v0.3.0`, mapi-lite's first release on chain-gang 0.13. It names the commit rather than the tag because a tag can be moved and a commit cannot; `Cargo.lock` would record the commit either way, but a `rev` pin also keeps `Cargo.toml` honest about it, and `sr_bchn_009_uls_client_and_uls_core_are_pinned_to_one_mapi_lite_revision` relies on that form.
 
-`teranode-event-rs`, the other consumer, pins tag `v0.2.0` and is on chain-gang 0.11.6 until it makes the same move. The two pins differ, but the wire contract does not: between `v0.2.0`'s line and this commit, `uls-client` is unchanged and `uls-core` changed only its server-side configuration and metrics, not the wire types. When event-rs moves, it should take this commit or `v0.3.0`. The parent `uls-rs` repo's `scripts/preflight.sh` warns when a pin falls behind the mapi-lite checkout it is about to run.
+`teranode-event-rs`, the other consumer, pins tag `v0.3.0` — the same commit, named by tag rather than by `rev` — and is on chain-gang 0.13.0, as this crate is. The parent `uls-rs` repo's `scripts/preflight.sh` warns when a pin falls behind the mapi-lite checkout it is about to run.
 
 ### Why the `ssh://` URL form
 
