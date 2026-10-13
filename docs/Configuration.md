@@ -19,6 +19,7 @@ network_type = "testnet"
 # rpc_password = "env:FS_RPC_PASSWORD"    # required for rpc
 # rpc_import_addresses = true             # rpc only; default true
 # max_requests_per_second = 3             # default 3 for woc, unset otherwise
+# timeout_seconds = 30                    # deadline on each interface call; 0 turns it off
 ```
 
 Supported `network_type` values: `mainnet`, `testnet`, `stn`, `regtest`.
@@ -110,9 +111,19 @@ INFO blockchain interface recovered after 7 consecutive failure(s)
 
 The recovery line matters as much as the warnings. Without it, warnings simply stop, and a service that has recovered looks exactly like one that has given up. `GET /status` reports `blockchain_status` and `blockchain_update_time` alongside, for the same question asked at a point in time rather than in the log.
 
-Note that `GET /health` stays `ok` throughout: it is a liveness check and deliberately depends on no upstream. `GET /ready` is the endpoint that reflects whether the service can do its job.
+Note that `GET /health` stays `ok` throughout: it is a liveness check and deliberately depends on no upstream. `GET /ready` is the endpoint that reflects whether the service can do its job: it fails once the last successful chain read is older than `service.ready_max_chain_read_age_seconds` (CS-505).
+
+**An unreachable blockchain interface at startup is a warning, not a fatal error** (CS-505). It used to stop the service — on a single WhatsOnChain 429 — and the restart that followed met the same rate limit. Now the service starts degraded, logs `Unable to reach the blockchain interface at startup`, and `GET /ready` answers 503 until the first chain read succeeds; `/health` and `/status` serve throughout.
 
 **`test` is a fixture, not a backend.** It is an in-process stub used by the unit tests, with a UTXO set injected directly by the test harness. It has no network of its own, so the `network_type` you set alongside it only affects address encoding. It will start and serve requests as a configured backend, but its UTXO set is empty, so balances read zero and funding is refused — useful for exercising the API surface, not for funding anything.
+
+### Every interface call has a deadline
+
+`timeout_seconds` (default `30`) bounds each call to the blockchain interface — a chain refresh, the startup status check, a broadcast when `[mapi_lite]` is not configured — including any wait for a rate-limit slot. A call that outlives it fails like any other chain failure, and is logged and counted the same way (CS-502).
+
+It exists because WhatsOnChain's client has no timeout of its own, and a read that is accepted and never answered would otherwise wait forever. Chain refreshes are one at a time per client, so that one read would hold the client's refresh: every request needing a fresh read would queue behind it and the periodic refresh would skip the client, with nothing logged. A broadcast that runs out of time is reported as `broadcast_outcome_unknown`, since it may have reached the network.
+
+It bounds a whole call, and WhatsOnChain's UTXO listing is one call made of several paced page requests, so leave room for the largest address the service funds from. `0` turns the deadline off and logs a warning at startup.
 
 ### A note on the default port
 
@@ -234,11 +245,13 @@ Then enable telemetry in config or set `OTEL_TRACES_EXPORTER=otlp` and `OTEL_EXP
 [service]
 utxo_refresh_period = 60
 # chain_state_max_age_seconds = 60   # defaults to utxo_refresh_period
+# ready_max_chain_read_age_seconds = 180   # defaults to 3 x utxo_refresh_period, at least 60; 0 = off
 # inflight_state_file = "./data/dynamic.inflight.json"   # defaults beside dynamic_config.filename
 ```
 
 * `utxo_refresh_period` — seconds between the periodic refresh of every client's chain state.
 * `chain_state_max_age_seconds` — how old that cached state may be before a request refreshes it again. Defaults to `utxo_refresh_period`.
+* `ready_max_chain_read_age_seconds` — how old a client's last successful chain read may be before `GET /ready` reports the service unready (CS-505). Defaults to three refresh periods and never under 60s: one failed sweep is a blip, three is chain reads not working. `0` turns the check off. See [Readiness check](SupportedEndpoints.md#readiness-check).
 * `inflight_state_file` — where the service keeps what it has broadcast but the chain may not have caught up with. Defaults to a file beside `dynamic_config.filename`, named after it: `./data/dynamic.toml` pairs with `./data/dynamic.inflight.json`. See [In-flight state survives a restart](#in-flight-state-survives-a-restart).
 
 ### In-flight state survives a restart
@@ -373,11 +386,21 @@ auth_token = "env:FS_MAPI_LITE_AUTH_TOKEN"
 
 **The three interact.** The worst case is `timeout_seconds × (max_retries + 1)` plus back-off, and `total_timeout_seconds` cuts it off there. Set the deadline to the longest a `/fund` call may take, then choose the other two to fit inside it; the startup warning tells you when they do not.
 
+**`timeout_seconds` has to outlast mapi-lite's own ceiling (CS-510).** mapi-lite answers a submission it cannot finish within its `submit_timeout_sec` (default 10s) with HTTP 504, outcome unknown. An attempt that gives up first reports a hung node as *this* service's timeout instead: the same unknown outcome, from the wrong layer, with mapi-lite still working on a request nobody is waiting for. The budget, outermost first:
+
+| Layer | Gives up after (defaults) |
+|---|---|
+| Event → `POST /fund` | 90s, above this service's 45s submit deadline plus a chain read |
+| this service → mapi-lite, per attempt | `timeout_seconds` = 13s |
+| mapi-lite → node, whole submit | `submit_timeout_sec` = 10s, answered 504 |
+
+mapi-lite publishes its ceiling in `GET /ready` as `submitTimeoutSecs`. The service reads it whenever it probes mapi-lite, at startup included, and **warns** when `timeout_seconds` does not exceed it by at least a second, naming both values (SR-CFG-010). It still starts and funds: the combination works, it just reports a hung node less well. Fix it by raising `timeout_seconds` (and `total_timeout_seconds` with it), or by lowering mapi-lite's ceiling.
+
 When the section is present the service:
 
 * Logs at startup: `mapi-lite integration configured (base_url=...): funding transactions will be broadcast via mapi-lite`. Without the section the line reads `mapi-lite not configured: funding transactions will be broadcast via the 'woc' blockchain interface` (naming whichever `interface_type` is configured).
-* Probes mapi-lite at startup (`GET /mapi/feeQuote`) and **warns** if it is unreachable, without refusing to start. Funding will fail until mapi-lite is reachable, but the read paths — `/status`, balances, UTXO refreshes — do not depend on it and keep serving, and the service recovers on its own when mapi-lite returns. Refusing to start would instead put the container in a restart loop driven by its own health check, taking the read paths down with it.
-* Probes mapi-lite for `GET /ready` and returns HTTP 503 when the probe fails, reusing a verdict for up to `health_timeout_seconds`. `GET /health` is unaffected. See [Readiness check](SupportedEndpoints.md#readiness-check).
+* Probes mapi-lite at startup (its `GET /ready`) and **warns** if it is unreachable or not ready, without refusing to start. Funding will fail until mapi-lite is reachable, but the read paths — `/status`, balances, UTXO refreshes — do not depend on it and keep serving, and the service recovers on its own when mapi-lite returns. Refusing to start would instead put the container in a restart loop driven by its own health check, taking the read paths down with it.
+* Asks mapi-lite's own `GET /ready` for this service's `GET /ready`, and returns HTTP 503 when mapi-lite is unreachable or not ready, reusing a verdict for up to `health_timeout_seconds`. mapi-lite's readiness fails when its nodes are unreachable or its block ingest has fallen behind; the fee quote this used to probe is served from mapi-lite's configuration and answered with every node down (CS-505). `GET /health` is unaffected. See [Readiness check](SupportedEndpoints.md#readiness-check).
 * Reports `"broadcaster": "mapi-lite"` in `GET /status`.
 * Funds a request from cached chain state that has merely aged, rather than waiting for it to be refreshed through `[blockchain_interface]`, and refreshes it behind the request — see [How often the service reads the chain](#how-often-the-service-reads-the-chain).
 * Submits each funding transaction as a one-element batch to `POST /mapi/txs`, with the merkle proof declined (no callbacks are wanted). A rejection by mapi-lite or the node surfaces to the caller as `broadcast_failed` (HTTP 502) or `broadcast_rejected` (409), with the reason in the service log, as does a mapi-lite `503` (no node can have received it). Anything that may have reached the network surfaces as `broadcast_outcome_unknown` (HTTP 504) instead, and the inputs are reserved: an answer that never arrives or cannot be read, a mapi-lite `500`/`502`/`504` (from mapi-lite v0.4.0 a `504` means a node may have received it), and mapi-lite's "accepted by the node but could not be recorded", which is resubmitted first since the resubmission records it (CS-501).
@@ -393,7 +416,19 @@ Path to the file used to persist clients added at runtime via `POST /client`. Dy
 ```toml
 [dynamic_config]
 filename = "./data/dynamic.toml"
+# wif_env_prefix = "FS_RUNTIME_WIF_"
 ```
+
+* `wif_env_prefix` — the only environment variables a client added through `POST /client` may take its key from with `wif_env`. Default `FS_RUNTIME_WIF_`. It is rejected at startup if it overlaps `FS_CLIENT_`, which every client's own override variable (`FS_CLIENT_<ID>_WIF`) starts with (CS-521).
+
+**Runtime clients cannot take another client's wallet (CS-521, SR-SEC-018).** Before this, `wif_env` could name any variable in the service's environment, another client's `FS_CLIENT_<ID>_WIF` included. Whoever could call `POST /client` (anyone, with no `admin_api_key`) could then fund from that client's wallet under an API key of their own. Now:
+
+* `wif_env` must start with `wif_env_prefix`. **This is a breaking change:** a deployment that names other variables has to rename them, or set the prefix to match.
+* A `wif` beginning `env:` is refused; name a variable with `wif_env` instead.
+* A client whose key is the funding key of an existing client is refused, however the key was supplied. Two clients funding from one wallet would spend the same coins.
+* A `client_id` that folds onto an existing client's override variables (case and punctuation fold, so `ID.1` and `id_1` share `FS_CLIENT_ID_1_*`) is refused.
+
+Clients that already share a wallet when the service starts are reported as an error in the log, naming them. The service still starts. Remove the one that should not be there from the dynamic config.
 
 ## [[client]]
 

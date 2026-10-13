@@ -11,8 +11,8 @@ use crate::{
     idempotency::{request_fingerprint, Outcome, RecordKey, Reservation},
     responses::{
         coded_error_response, error_response, error_response_with_status, json_ok,
-        partial_funding_error_response, AddressResponse, BalanceResponse, CodedError, ErrorCode,
-        HealthResponse, SuccessResponse,
+        partial_funding_error_response, AddressResponse, BalanceResponse, CheckResult, CodedError,
+        ErrorCode, HealthResponse, SuccessResponse, CHAIN_UNAVAILABLE,
     },
     secrets::{secret_reference, validate_env_var_name},
     service::Service,
@@ -61,11 +61,26 @@ pub struct ClientAddRequest {
 }
 
 impl ClientAddRequest {
-    fn into_client_config(self) -> Result<ClientConfig, String> {
+    /// `wif_env_prefix` is `dynamic_config.wif_env_prefix`: the only variables
+    /// a runtime client may take its key from (CS-521).
+    fn into_client_config(self, wif_env_prefix: &str) -> Result<ClientConfig, String> {
         let wif_key = match (self.wif, self.wif_env) {
+            // A literal WIF is stored as given, so an `env:` one would be read
+            // as a reference to any variable at all -- the check below,
+            // skipped.
+            (Some(wif), None) if wif.starts_with(crate::secrets::ENV_PREFIX) => {
+                return Err(
+                    "wif is a key, not a reference; name a variable with wif_env".to_string(),
+                )
+            }
             (Some(wif), None) => wif,
             (None, Some(env_var)) => {
                 validate_env_var_name(&env_var)?;
+                if env_var.len() <= wif_env_prefix.len() || !env_var.starts_with(wif_env_prefix) {
+                    return Err(format!(
+                        "wif_env must name a variable starting with {wif_env_prefix:?}"
+                    ));
+                }
                 secret_reference(&env_var)
             }
             (Some(_), Some(_)) => {
@@ -141,15 +156,28 @@ pub async fn health() -> impl Responder {
 /// mapi-lite URL that a public 503 body has no business disclosing.
 #[get("/ready")]
 pub async fn ready(data: web::Data<AppState>) -> impl Responder {
-    match data.service.mapi_lite_health().await {
-        None => json_ok(&HealthResponse::ok()),
-        Some(Ok(())) => json_ok(&HealthResponse::mapi_lite_ok()),
+    let mapi_lite = match data.service.mapi_lite_health().await {
+        None => None,
+        Some(Ok(())) => Some(CheckResult::passed()),
         Some(Err(error)) => {
             log::warn!("mapi-lite readiness probe failed: {error}");
-            HttpResponse::ServiceUnavailable().json(HealthResponse::mapi_lite_unhealthy(
-                "mapi-lite probe failed",
-            ))
+            Some(CheckResult::failed("mapi-lite probe failed"))
         }
+    };
+    // Its detail is an age and a client id, which a caller of /status can
+    // already see; nothing in it names an upstream.
+    let chain = match data.service.chain_readiness().await {
+        Ok(()) => CheckResult::passed(),
+        Err(detail) => {
+            log::warn!("chain readiness failed: {detail}");
+            CheckResult::failed(detail)
+        }
+    };
+    let response = HealthResponse::from_checks(mapi_lite, Some(chain));
+    if response.is_ok() {
+        json_ok(&response)
+    } else {
+        HttpResponse::ServiceUnavailable().json(response)
     }
 }
 
@@ -195,6 +223,24 @@ pub async fn get_funds(
         );
     }
 
+    // Who is asking is settled before anything sized by the request is
+    // built (CS-519). Expanding the scripts first let an anonymous caller ask
+    // for `no_of_outpoints` copies of a script -- 2^32 of them -- and the
+    // allocation killed the process before the API key was ever looked at.
+    if !data.service.is_client_id_valid(client_id).await {
+        // 400 rather than the code's default 404: the client_id arrives in the
+        // request body, so this is a malformed request, not a missing
+        // resource. A 404 here would read as "/fund does not exist".
+        return error_response_with_status(
+            StatusCode::BAD_REQUEST,
+            ErrorCode::UnknownClient,
+            format!("Unknown client_id {client_id}"),
+        );
+    }
+    if let Some(response) = authorize_client(&req, client_id, &data.service).await {
+        return response;
+    }
+
     // Normalise both request forms into one script per outpoint, so the rest
     // of the service never has to care which was used.
     let (no_of_outpoints, locking_scripts) = match resolve_locking_scripts(&info) {
@@ -214,20 +260,6 @@ pub async fn get_funds(
         locking_scripts,
     };
 
-    if !data.service.is_client_id_valid(client_id).await {
-        // 400 rather than the code's default 404: the client_id arrives in the
-        // request body, so this is a malformed request, not a missing
-        // resource. A 404 here would read as "/fund does not exist".
-        return error_response_with_status(
-            StatusCode::BAD_REQUEST,
-            ErrorCode::UnknownClient,
-            format!("Unknown client_id {client_id}"),
-        );
-    }
-    if let Some(response) = authorize_client(&req, client_id, &data.service).await {
-        return response;
-    }
-
     // Refreshed only if the cache has gone stale, and with `[mapi_lite]` not
     // waited for unless the cache is unusable. See
     // `Service::prepare_chain_state_for_funding` for why, and
@@ -236,7 +268,7 @@ pub async fn get_funds(
         Service::prepare_chain_state_for_funding(&data.service, client_id).await
     {
         log::warn!("refresh_client_chain_state failed: {}", description);
-        return error_response(ErrorCode::ChainUnavailable, description);
+        return error_response(ErrorCode::ChainUnavailable, CHAIN_UNAVAILABLE);
     }
 
     // Claim the `idempotency_key`, if the client supplied one, before anything
@@ -353,13 +385,46 @@ pub async fn get_funds(
     }
 }
 
+/// The most outpoints one `/fund` may ask for (CS-519, SR-SEC-017).
+///
+/// Far above any real use -- Event asks for one, the documented examples for
+/// three -- and low enough that the funding transaction, or the transactions
+/// with `multiple_tx`, stay an ordinary size.
+pub const MAX_OUTPOINTS: u32 = 1000;
+
+/// The most locking-script bytes one `/fund` may ask to be paid to, summed
+/// over its outpoints (CS-519, SR-SEC-017).
+///
+/// Bounds what the one-script form expands to: a single script repeated
+/// `no_of_outpoints` times would otherwise be 1000 copies of whatever fits in
+/// the request body. A mebibyte is some forty thousand P2PKH scripts, so the
+/// outpoint limit is the one an ordinary request meets first.
+pub const MAX_LOCKING_SCRIPT_BYTES: usize = 1024 * 1024;
+
 /// Work out how many outpoints are wanted and the script for each.
 ///
 /// Accepts either `locking_script` with `no_of_outpoints` (one script applied
 /// to every outpoint, the original form) or `locking_scripts` (one per
 /// outpoint). Exactly one of the two must be given.
+///
+/// Both limits are checked from the hex lengths before anything is decoded or
+/// copied, so a request over them costs nothing to refuse (CS-519).
 fn resolve_locking_scripts(info: &FundingRequest) -> Result<(u32, Vec<Vec<u8>>), CodedError> {
     let invalid = |message: String| CodedError::new(ErrorCode::InvalidRequest, message);
+    let too_many = |count: usize| {
+        invalid(format!(
+            "no_of_outpoints is {count}; at most {MAX_OUTPOINTS} are allowed."
+        ))
+    };
+    let check_script_bytes = |hex_len: usize, copies: usize| -> Result<(), CodedError> {
+        // Hex is two characters a byte; a malformed odd length fails decoding.
+        match (hex_len / 2).checked_mul(copies) {
+            Some(total) if total <= MAX_LOCKING_SCRIPT_BYTES => Ok(()),
+            _ => Err(invalid(format!(
+                "the locking scripts total more than {MAX_LOCKING_SCRIPT_BYTES} bytes."
+            ))),
+        }
+    };
     let decode = |hex_script: &str| -> Result<Vec<u8>, CodedError> {
         hex::decode(hex_script).map_err(|_| {
             invalid(format!(
@@ -380,6 +445,10 @@ fn resolve_locking_scripts(info: &FundingRequest) -> Result<(u32, Vec<Vec<u8>>),
             if count == 0 {
                 return Err(invalid("Invalid no_of_outpoints value '0'".to_string()));
             }
+            if count > MAX_OUTPOINTS {
+                return Err(too_many(count as usize));
+            }
+            check_script_bytes(script.len(), count as usize)?;
             let bytes = decode(script)?;
             // The same script for every outpoint, as before. Note this makes
             // the outpoints spendable by one key, which is only what you want
@@ -392,6 +461,10 @@ fn resolve_locking_scripts(info: &FundingRequest) -> Result<(u32, Vec<Vec<u8>>),
                     "locking_scripts must contain at least one script.".to_string(),
                 ));
             }
+            if scripts.len() > MAX_OUTPOINTS as usize {
+                return Err(too_many(scripts.len()));
+            }
+            check_script_bytes(scripts.iter().map(String::len).sum(), 1)?;
             let count = scripts.len() as u32;
             if let Some(stated) = info.no_of_outpoints {
                 if stated != count {
@@ -487,7 +560,10 @@ pub async fn add_client(
     if let Some(response) = authorize_admin(&req, &data.service) {
         return response;
     }
-    let client_config = match info.into_inner().into_client_config() {
+    let client_config = match info
+        .into_inner()
+        .into_client_config(data.service.wif_env_prefix())
+    {
         Ok(client_config) => client_config,
         Err(description) => return error_response(ErrorCode::InvalidRequest, description),
     };
@@ -588,7 +664,7 @@ pub async fn balance(
         Service::refresh_client_chain_state_if_stale(&data.service, &client_id).await
     {
         log::warn!("refresh_client_chain_state failed: {}", description);
-        return error_response(ErrorCode::ChainUnavailable, description);
+        return error_response(ErrorCode::ChainUnavailable, CHAIN_UNAVAILABLE);
     }
 
     match data.service.get_balance_and_max_fundable(&client_id).await {
@@ -617,6 +693,7 @@ mod tests {
     use crate::{
         config::{ClientConfig, Config, RateLimitConfig},
         rate_limit,
+        responses::CHAIN_UNAVAILABLE,
         rest_api::{
             add_client, balance, delete_client, get_address, get_funds, health, index, ready,
             status, AppState,
@@ -625,7 +702,7 @@ mod tests {
         test_support::{
             test_blockchain_interface, test_config, test_config_with_keys,
             unique_dynamic_config_path, CountingBlockchain, StubMapiBroadcaster,
-            LOCKING_SCRIPT_HEX, TEST_ADDRESS, TEST_CLIENT_ID, TEST_WIF,
+            LOCKING_SCRIPT_HEX, OTHER_TEST_WIF, TEST_ADDRESS, TEST_CLIENT_ID, TEST_WIF,
         },
     };
 
@@ -949,16 +1026,44 @@ mod tests {
         assert_eq!(body, json!({ "status": "ok" }));
     }
 
-    /// Without `[mapi_lite]` there is no upstream to probe, so readiness is
-    /// the same answer as liveness rather than a different shape.
+    /// Without `[mapi_lite]` there is no mapi-lite to probe, so readiness
+    /// reports chain reads alone (CS-505). It used to be the same answer as
+    /// liveness, which said nothing a liveness probe did not.
     #[actix_web::test]
-    async fn sr_bchn_012_ready_matches_health_without_mapi_lite() {
+    async fn sr_bchn_012_ready_reports_chain_reads_without_mapi_lite() {
         let app = build_app().await;
         let resp =
             test::call_service(&app, test::TestRequest::get().uri("/ready").to_request()).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body: Value = test::read_body_json(resp).await;
-        assert_eq!(body, json!({ "status": "ok" }));
+        assert_eq!(body, json!({ "status": "ok", "chain": { "ok": true } }));
+    }
+
+    /// SR-BCHN-017: chain reads older than the bound take the service out of
+    /// rotation -- with `[mapi_lite]` it would otherwise go on funding from an
+    /// ever older cache -- and liveness is untouched (SR-BCHN-004).
+    #[actix_web::test]
+    async fn sr_bchn_017_ready_returns_503_when_chain_reads_are_stale() {
+        let config = test_config(&unique_dynamic_config_path());
+        let (app, service) = build_app_with_service(config).await;
+        service
+            .backdate_chain_reads(std::time::Duration::from_secs(61))
+            .await;
+
+        let resp =
+            test::call_service(&app, test::TestRequest::get().uri("/ready").to_request()).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["status"], "unhealthy");
+        assert_eq!(body["chain"]["ok"], false);
+        assert!(body["chain"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("last read"));
+
+        let resp =
+            test::call_service(&app, test::TestRequest::get().uri("/health").to_request()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[actix_web::test]
@@ -1060,7 +1165,7 @@ mod tests {
 
     #[actix_web::test]
     async fn test_add_client_with_wif_env() {
-        unsafe { std::env::set_var("FS_TEST_ADD_CLIENT_WIF", TEST_WIF) };
+        unsafe { std::env::set_var("FS_RUNTIME_WIF_TEST_ADD_CLIENT", OTHER_TEST_WIF) };
         let app = build_app().await;
         let resp = test::call_service(
             &app,
@@ -1068,7 +1173,7 @@ mod tests {
                 .uri("/client")
                 .set_json(json!({
                     "client_id": "client_env",
-                    "wif_env": "FS_TEST_ADD_CLIENT_WIF",
+                    "wif_env": "FS_RUNTIME_WIF_TEST_ADD_CLIENT",
                 }))
                 .to_request(),
         )
@@ -1087,7 +1192,7 @@ mod tests {
                 .uri("/client")
                 .set_json(json!({
                     "client_id": "client2",
-                    "wif": TEST_WIF,
+                    "wif": OTHER_TEST_WIF,
                 }))
                 .to_request(),
         )
@@ -1106,7 +1211,7 @@ mod tests {
                 .uri("/client")
                 .set_json(json!({
                     "client_id": TEST_CLIENT_ID,
-                    "wif": TEST_WIF,
+                    "wif": OTHER_TEST_WIF,
                 }))
                 .to_request(),
         )
@@ -1781,7 +1886,7 @@ mod tests {
                 .uri("/client")
                 .set_json(json!({
                     "client_id": "client2",
-                    "wif": TEST_WIF,
+                    "wif": OTHER_TEST_WIF,
                 }))
                 .to_request(),
         )
@@ -1799,7 +1904,7 @@ mod tests {
                 .insert_header(("Authorization", format!("Bearer {TEST_ADMIN_API_KEY}")))
                 .set_json(json!({
                     "client_id": "client2",
-                    "wif": TEST_WIF,
+                    "wif": OTHER_TEST_WIF,
                     "api_key": "new-client-key",
                 }))
                 .to_request(),
@@ -1818,7 +1923,7 @@ mod tests {
                 .insert_header(("X-API-Key", "wrong-admin-key"))
                 .set_json(json!({
                     "client_id": "client2",
-                    "wif": TEST_WIF,
+                    "wif": OTHER_TEST_WIF,
                 }))
                 .to_request(),
         )
@@ -1973,7 +2078,7 @@ mod tests {
 
     #[actix_web::test]
     async fn sr_func_007_add_client_persists_to_dynamic_config_file() {
-        unsafe { std::env::set_var("FS_TEST_ADD_CLIENT_WIF", TEST_WIF) };
+        unsafe { std::env::set_var("FS_RUNTIME_WIF_TEST_ADD_CLIENT", OTHER_TEST_WIF) };
         let path = unique_dynamic_config_path();
         let config = test_config_with_keys(&path, None, None);
         let (app, _service) = build_app_with_service(config).await;
@@ -1983,7 +2088,7 @@ mod tests {
                 .uri("/client")
                 .set_json(json!({
                     "client_id": "client_env",
-                    "wif_env": "FS_TEST_ADD_CLIENT_WIF",
+                    "wif_env": "FS_RUNTIME_WIF_TEST_ADD_CLIENT",
                 }))
                 .to_request(),
         )
@@ -1991,7 +2096,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let saved = std::fs::read_to_string(&path).unwrap();
         assert!(saved.contains("client_env"));
-        assert!(saved.contains("env:FS_TEST_ADD_CLIENT_WIF"));
+        assert!(saved.contains("env:FS_RUNTIME_WIF_TEST_ADD_CLIENT"));
     }
 
     #[actix_web::test]
@@ -2006,7 +2111,7 @@ mod tests {
             },
             ClientConfig {
                 client_id: "client2".to_string(),
-                wif_key: TEST_WIF.to_string(),
+                wif_key: OTHER_TEST_WIF.to_string(),
                 api_key: None,
             },
         ]);
@@ -2033,7 +2138,7 @@ mod tests {
         service
             .add_client(&ClientConfig {
                 client_id: "deletable".to_string(),
-                wif_key: TEST_WIF.to_string(),
+                wif_key: OTHER_TEST_WIF.to_string(),
                 api_key: Some(TEST_API_KEY.to_string()),
             })
             .await
@@ -2086,6 +2191,245 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body = String::from_utf8(test::read_body(resp).await.to_vec()).unwrap();
         assert!(!body.contains(secret_wif));
+    }
+
+    /// POST /client with `body`: the status, and the error code if any.
+    async fn add_client_code(body: Value) -> (StatusCode, Value) {
+        let app = build_app().await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/client")
+                .set_json(body)
+                .to_request(),
+        )
+        .await;
+        let http = resp.status();
+        let body: Value = test::read_body_json(resp).await;
+        (http, body["code"].clone())
+    }
+
+    /// One /fund, answered after `req`, as status and error code.
+    async fn fund_code(
+        app: &impl ActixService<Request, Response = ServiceResponse, Error = Error>,
+        body: Value,
+        api_key: Option<&str>,
+    ) -> (StatusCode, Value) {
+        let mut req = test::TestRequest::post().uri("/fund").set_json(body);
+        if let Some(key) = api_key {
+            req = req.insert_header(("X-API-Key", key));
+        }
+        let resp = test::call_service(app, req.to_request()).await;
+        let http = resp.status();
+        let body: Value = test::read_body_json(resp).await;
+        (http, body["code"].clone())
+    }
+
+    /// The CS-521 attack, and each way around it. A new client may not take
+    /// id1's key: not by naming id1's own override variable, not by an
+    /// `env:` reference in `wif`, not through a permitted variable that holds
+    /// the same key, and not by supplying the key itself.
+    #[actix_web::test]
+    // The environment lock is held across the requests on purpose: these set
+    // FS_CLIENT_ID1_WIF, which config tests also set under the lock, and any
+    // service built for id1 reads it. No async test takes the lock, so holding
+    // it here cannot deadlock.
+    #[allow(clippy::await_holding_lock)]
+    async fn sr_sec_018_a_runtime_client_cannot_take_another_client_s_key() {
+        let _env = crate::test_support::env_lock();
+        unsafe {
+            std::env::set_var("FS_CLIENT_ID1_WIF", TEST_WIF);
+            std::env::set_var("FS_RUNTIME_WIF_STOLEN", TEST_WIF);
+            // A key no client holds -- another service's, say -- that the
+            // operator never set aside for runtime clients.
+            std::env::set_var("UNRELATED_SERVICE_KEY", OTHER_TEST_WIF);
+        }
+        let attempts = [
+            json!({"client_id": "evil", "wif_env": "FS_CLIENT_ID1_WIF", "api_key": "mine"}),
+            json!({"client_id": "evil", "wif_env": "FS_RUNTIME_WIF_", "api_key": "mine"}),
+            json!({"client_id": "evil", "wif": "env:FS_CLIENT_ID1_WIF", "api_key": "mine"}),
+            json!({"client_id": "evil", "wif": "env:FS_RUNTIME_WIF_STOLEN", "api_key": "mine"}),
+            json!({"client_id": "evil", "wif_env": "FS_RUNTIME_WIF_STOLEN", "api_key": "mine"}),
+            json!({"client_id": "evil", "wif": TEST_WIF, "api_key": "mine"}),
+            // Only the prefix rule stops this one, and only the env: rule the
+            // next: neither key belongs to a client.
+            json!({"client_id": "evil", "wif_env": "UNRELATED_SERVICE_KEY", "api_key": "mine"}),
+            json!({"client_id": "evil", "wif": "env:UNRELATED_SERVICE_KEY", "api_key": "mine"}),
+        ];
+        let mut outcomes = Vec::new();
+        for body in attempts {
+            outcomes.push(add_client_code(body.clone()).await);
+        }
+        unsafe {
+            std::env::remove_var("FS_CLIENT_ID1_WIF");
+            std::env::remove_var("FS_RUNTIME_WIF_STOLEN");
+            std::env::remove_var("UNRELATED_SERVICE_KEY");
+        }
+        for (i, (http, code)) in outcomes.into_iter().enumerate() {
+            assert_eq!(http, StatusCode::BAD_REQUEST, "attempt {i}");
+            assert_eq!(code, "invalid_request", "attempt {i}");
+        }
+    }
+
+    /// A permitted variable holding a key of its own is the intended use.
+    #[actix_web::test]
+    // The environment lock is held across the requests on purpose: these set
+    // FS_CLIENT_ID1_WIF, which config tests also set under the lock, and any
+    // service built for id1 reads it. No async test takes the lock, so holding
+    // it here cannot deadlock.
+    #[allow(clippy::await_holding_lock)]
+    async fn sr_sec_018_a_prefixed_variable_with_its_own_key_is_accepted() {
+        let _env = crate::test_support::env_lock();
+        unsafe { std::env::set_var("FS_RUNTIME_WIF_GOOD", OTHER_TEST_WIF) };
+        let (http, _) =
+            add_client_code(json!({"client_id": "good", "wif_env": "FS_RUNTIME_WIF_GOOD"})).await;
+        unsafe { std::env::remove_var("FS_RUNTIME_WIF_GOOD") };
+        assert_eq!(http, StatusCode::OK);
+    }
+
+    /// The CS-519 attack: 2^32 copies of an empty script asked for about
+    /// 103 GB before the API key was looked at. Who is asking is now settled
+    /// first, so an unauthenticated or unknown caller costs nothing -- and if
+    /// the order regressed, this test would not finish.
+    #[actix_web::test]
+    async fn sr_sec_017_an_unauthenticated_fund_is_refused_before_its_scripts_are_built() {
+        let app = build_app_with_api_key(Some(TEST_API_KEY)).await;
+        let huge = |client: &str| {
+            json!({
+                "client_id": client,
+                "satoshi": 1,
+                "multiple_tx": false,
+                "locking_script": "",
+                "no_of_outpoints": u32::MAX,
+            })
+        };
+        let (http, code) = fund_code(&app, huge(TEST_CLIENT_ID), None).await;
+        assert_eq!(http, StatusCode::UNAUTHORIZED);
+        assert_eq!(code, "unauthorized");
+
+        let (http, code) = fund_code(&app, huge("no-such-client"), None).await;
+        assert_eq!(http, StatusCode::BAD_REQUEST);
+        assert_eq!(code, "unknown_client");
+
+        // And authenticated, the count is refused without being built.
+        let (http, code) = fund_code(&app, huge(TEST_CLIENT_ID), Some(TEST_API_KEY)).await;
+        assert_eq!(http, StatusCode::BAD_REQUEST);
+        assert_eq!(code, "invalid_request");
+    }
+
+    /// At most MAX_OUTPOINTS outpoints, in either request form.
+    #[actix_web::test]
+    async fn sr_sec_017_no_more_than_the_maximum_outpoints_are_accepted() {
+        use super::MAX_OUTPOINTS;
+        let app = build_app().await;
+
+        let (_, code) = fund_code(
+            &app,
+            fund_body(TEST_CLIENT_ID, 1, MAX_OUTPOINTS + 1, LOCKING_SCRIPT_HEX),
+            None,
+        )
+        .await;
+        assert_eq!(code, "invalid_request");
+        // At the limit it is not refused as invalid: whatever the wallet then
+        // says, the request itself was acceptable.
+        let (_, code) = fund_code(
+            &app,
+            fund_body(TEST_CLIENT_ID, 1, MAX_OUTPOINTS, LOCKING_SCRIPT_HEX),
+            None,
+        )
+        .await;
+        assert_ne!(code, "invalid_request");
+
+        let list = |n: u32| {
+            json!({
+                "client_id": TEST_CLIENT_ID,
+                "satoshi": 1,
+                "multiple_tx": false,
+                "locking_scripts": vec![LOCKING_SCRIPT_HEX; n as usize],
+            })
+        };
+        let (_, code) = fund_code(&app, list(MAX_OUTPOINTS + 1), None).await;
+        assert_eq!(code, "invalid_request");
+        let (_, code) = fund_code(&app, list(MAX_OUTPOINTS), None).await;
+        assert_ne!(code, "invalid_request");
+    }
+
+    /// The scripts a request asks to be paid to are bounded in total, so the
+    /// one-script form cannot expand a large script a thousand times.
+    #[actix_web::test]
+    async fn sr_sec_017_locking_scripts_are_bounded_in_total() {
+        use super::{MAX_LOCKING_SCRIPT_BYTES, MAX_OUTPOINTS};
+        let app = build_app().await;
+        // 2 KiB a script: 512 of them is the limit exactly, under the
+        // outpoint limit, so it is the byte limit being tested.
+        let script = "51".repeat(2048);
+        let at_limit = (MAX_LOCKING_SCRIPT_BYTES / 2048) as u32;
+        assert!(at_limit < MAX_OUTPOINTS);
+
+        let (_, code) = fund_code(
+            &app,
+            fund_body(TEST_CLIENT_ID, 1, at_limit + 1, &script),
+            None,
+        )
+        .await;
+        assert_eq!(code, "invalid_request", "one script over the byte limit");
+
+        let (_, code) =
+            fund_code(&app, fund_body(TEST_CLIENT_ID, 1, at_limit, &script), None).await;
+        assert_ne!(code, "invalid_request", "exactly the limit");
+    }
+
+    /// A chain read that fails names the address it could not reach -- a node
+    /// inside the network, or WhatsOnChain's URL. That is for the log: the
+    /// caller is told the chain is unavailable and nothing about where it
+    /// lives (CS-512). Event used to pass this description on to its own
+    /// callers word for word.
+    #[actix_web::test]
+    async fn sr_sec_016_chain_unavailable_does_not_disclose_the_chain_address() {
+        use crate::test_support::{
+            CountingBroadcaster, UnreadableBlockchain, UNREADABLE_CHAIN_URL,
+        };
+
+        let config = test_config(&unique_dynamic_config_path());
+        let blockchain = UnreadableBlockchain::new(&config).await;
+        let (app, _service) = build_app_over(&config, blockchain, CountingBroadcaster::new()).await;
+
+        let requests = [
+            (
+                "POST /fund",
+                test::TestRequest::post().uri("/fund").set_json(fund_body(
+                    TEST_CLIENT_ID,
+                    123,
+                    1,
+                    LOCKING_SCRIPT_HEX,
+                )),
+            ),
+            (
+                "POST /fund multiple_tx",
+                test::TestRequest::post().uri("/fund").set_json(json!({
+                    "client_id": TEST_CLIENT_ID,
+                    "satoshi": 123,
+                    "no_of_outpoints": 2,
+                    "multiple_tx": true,
+                    "locking_script": LOCKING_SCRIPT_HEX,
+                })),
+            ),
+            (
+                "GET balance",
+                test::TestRequest::get().uri(&format!("/client/{TEST_CLIENT_ID}/balance")),
+            ),
+        ];
+        for (name, request) in requests {
+            let resp = test::call_service(&app, request.to_request()).await;
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{name}");
+            let body: Value = test::read_body_json(resp).await;
+            assert_eq!(body["code"], "chain_unavailable", "{name}");
+            assert_eq!(body["description"], CHAIN_UNAVAILABLE, "{name}");
+            let text = body.to_string();
+            for leak in [UNREADABLE_CHAIN_URL, "10.20.30.40", "url", "get_utxo"] {
+                assert!(!text.contains(leak), "{name} disclosed {leak:?}: {text}");
+            }
+        }
     }
 
     #[actix_web::test]

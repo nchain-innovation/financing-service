@@ -28,6 +28,7 @@
 //! interactive: a wedged mapi-lite must not hold the caller, and the actix
 //! worker serving it, for `timeout * (max_retries + 1)`.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -54,7 +55,13 @@ pub struct MapiBroadcaster {
     /// Built with uls-client's own retries left off: the loop in
     /// [`MapiBroadcaster::broadcast_tx`] owns them.
     submit: MapiClient,
+    /// For the fee quote: a short timeout and no retries.
     probe: MapiClient,
+    /// `GET {base_url}/ready`, mapi-lite's own readiness, which is what the
+    /// health check asks (CS-505). Plain HTTP: the probe is unauthenticated and
+    /// unsigned on mapi-lite's side, so a typed client adds nothing.
+    ready_url: String,
+    ready_http: reqwest::Client,
     /// Ceiling on one attempt.
     attempt_timeout: Duration,
     /// Attempts after the first.
@@ -62,6 +69,41 @@ pub struct MapiBroadcaster {
     /// Ceiling on a whole submit, retries and back-off included, so a `/fund`
     /// caller cannot be held for `timeout * (max_retries + 1)`.
     submit_deadline: Duration,
+    /// mapi-lite's own submit ceiling as last published in its `/ready`,
+    /// plus one, so 0 means "not seen" (CS-510). Kept so a misaligned budget
+    /// is warned about once per value rather than on every probe.
+    seen_ceiling: AtomicU64,
+}
+
+/// How far a submit attempt has to outlast mapi-lite's own ceiling for
+/// mapi-lite's `504` to arrive before this side gives up: the answer still has
+/// to cross the network after the ceiling fires.
+const CEILING_MARGIN: Duration = Duration::from_secs(1);
+
+/// The warning for an attempt timeout that does not clear mapi-lite's submit
+/// ceiling, or `None` when it does (CS-510, SR-CFG-010).
+///
+/// mapi-lite answers a submission it cannot finish in `ceiling` with `504`,
+/// outcome unknown. An attempt that gives up first turns a hung node into
+/// this service's own timeout instead: the same unknown outcome, reported by
+/// the wrong layer, and with mapi-lite still working on a request nobody is
+/// waiting for. Nothing is refused: the funding still works, just reported
+/// less well.
+pub(crate) fn submit_budget_warning(
+    attempt_timeout: Duration,
+    ceiling: Duration,
+) -> Option<String> {
+    (attempt_timeout < ceiling + CEILING_MARGIN).then(|| {
+        format!(
+            "[mapi_lite] timeout_seconds is {}s, but mapi-lite answers a submit it cannot \
+             finish at {}s (its submit_timeout_sec). An attempt has to outlast that by at \
+             least {}s, or a hung node is reported as this service's own timeout instead of \
+             mapi-lite's answer. Raise timeout_seconds, or lower mapi-lite's ceiling.",
+            attempt_timeout.as_secs(),
+            ceiling.as_secs(),
+            CEILING_MARGIN.as_secs(),
+        )
+    })
 }
 
 impl MapiBroadcaster {
@@ -86,13 +128,49 @@ impl MapiBroadcaster {
         );
         // fee_quote does not retry, so the probe needs no retry settings.
         let probe = Self::client(config, config.health_timeout())?;
+        let ready_http = reqwest::Client::builder()
+            .timeout(config.health_timeout())
+            .build()
+            .map_err(|e| format!("mapi-lite readiness client: {e}"))?;
         Ok(Self {
             submit,
             probe,
+            ready_url: format!("{}/ready", config.base_url()),
+            ready_http,
             attempt_timeout: config.timeout(),
             max_retries: config.max_retries,
             submit_deadline: config.total_timeout(),
+            seen_ceiling: AtomicU64::new(0),
         })
+    }
+
+    /// mapi-lite's submit ceiling, as its last `/ready` published it.
+    #[cfg(test)]
+    fn mapi_lite_submit_ceiling(&self) -> Option<Duration> {
+        match self.seen_ceiling.load(Ordering::Relaxed) {
+            0 => None,
+            plus_one => Some(Duration::from_secs(plus_one - 1)),
+        }
+    }
+
+    /// Records the ceiling a `/ready` answer published, and warns when this
+    /// side's attempt timeout does not clear it. Once per distinct value: the
+    /// probe runs every few seconds, and the configuration it is checking
+    /// changes only on a restart of one side or the other.
+    fn note_ceiling(&self, body: &serde_json::Value) {
+        let Some(ceiling) = body.get("submitTimeoutSecs").and_then(|v| v.as_u64()) else {
+            return;
+        };
+        if self.seen_ceiling.swap(ceiling + 1, Ordering::Relaxed) == ceiling + 1 {
+            return;
+        }
+        match submit_budget_warning(self.attempt_timeout, Duration::from_secs(ceiling)) {
+            Some(warning) => log::warn!("{warning}"),
+            None => log::info!(
+                "mapi-lite answers a slow submit at {ceiling}s, inside this service's {}s attempt",
+                self.attempt_timeout.as_secs()
+            ),
+        }
     }
 
     /// Wait before attempt `attempt + 1`, matching uls-client's linear
@@ -361,9 +439,61 @@ impl TxBroadcaster for MapiBroadcaster {
         }
     }
 
+    /// Asks mapi-lite's `GET /ready` (CS-505).
+    ///
+    /// This used to fetch the fee quote, which mapi-lite serves from its own
+    /// configuration without asking a node -- so it answered with every node
+    /// down, and this service went on reporting ready while every broadcast
+    /// would fail. mapi-lite's readiness fails when its node pool stops
+    /// answering, when block ingest falls behind, and when it cannot sign, which
+    /// is the question being asked here: can a broadcast through it work.
+    ///
+    /// A `503` carries the names of mapi-lite's failing checks into the error,
+    /// for the log line; the `/ready` body this service returns stays generic.
     async fn health_check(&self) -> Result<(), BroadcastError> {
-        self.probe.fee_quote().await?;
-        Ok(())
+        let response = self
+            .ready_http
+            .get(&self.ready_url)
+            .send()
+            .await
+            .map_err(|e| BroadcastError::Upstream(format!("mapi-lite /ready: {e}")))?;
+        let status = response.status();
+        // Read whatever the answer, ready or not: it is also where mapi-lite
+        // publishes its submit ceiling (CS-510).
+        let body = response
+            .bytes()
+            .await
+            .ok()
+            .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok());
+        if let Some(body) = &body {
+            self.note_ceiling(body);
+        }
+        if status.is_success() {
+            return Ok(());
+        }
+        let failing = body
+            .and_then(|body| {
+                body.get("checks")?.as_object().map(|checks| {
+                    checks
+                        .iter()
+                        .filter(|(_, check)| {
+                            check.get("ok") == Some(&serde_json::Value::Bool(false))
+                        })
+                        .map(
+                            |(name, check)| match check.get("detail").and_then(|d| d.as_str()) {
+                                Some(detail) => format!("{name}: {detail}"),
+                                None => name.clone(),
+                            },
+                        )
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                })
+            })
+            .filter(|failing| !failing.is_empty());
+        Err(BroadcastError::Upstream(match failing {
+            Some(failing) => format!("mapi-lite /ready answered {status}: {failing}"),
+            None => format!("mapi-lite /ready answered {status}"),
+        }))
     }
 
     /// The standard mining fee from mapi-lite's quote, converted to satoshis
@@ -957,25 +1087,100 @@ mod tests {
         assert!(indeterminate_detail(error).contains("signature"));
     }
 
+    /// CS-505: the health check asks mapi-lite's own readiness, not the fee
+    /// quote -- which mapi-lite serves from configuration with every node down.
     #[tokio::test]
-    async fn sr_bchn_011_mapi_broadcaster_health_check_passes_on_a_fee_quote() {
+    async fn sr_bchn_011_mapi_broadcaster_health_check_passes_when_mapi_lite_is_ready() {
         let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ready"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ready": true})))
+            .expect(1)
+            .mount(&server)
+            .await;
         Mock::given(method("GET"))
             .and(path("/mapi/feeQuote"))
             .respond_with(ok(fee_quote_payload()))
-            .expect(1)
+            .expect(0)
             .mount(&server)
             .await;
 
         broadcaster(&server).health_check().await.expect("healthy");
     }
 
+    /// mapi-lite's ceiling, ready or not, is read off `/ready` (CS-510).
     #[tokio::test]
-    async fn sr_bchn_011_mapi_broadcaster_health_check_fails_on_an_error_status() {
+    async fn sr_cfg_010_health_check_reads_mapi_lite_s_submit_ceiling() {
+        for (status, ready) in [(200, true), (503, false)] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/ready"))
+                .respond_with(ResponseTemplate::new(status).set_body_json(json!({
+                    "ready": ready,
+                    "submitTimeoutSecs": 10,
+                    "checks": {}
+                })))
+                .mount(&server)
+                .await;
+            let broadcaster = broadcaster(&server);
+            assert_eq!(broadcaster.mapi_lite_submit_ceiling(), None);
+            let _ = broadcaster.health_check().await;
+            assert_eq!(
+                broadcaster.mapi_lite_submit_ceiling(),
+                Some(Duration::from_secs(10)),
+                "HTTP {status}"
+            );
+        }
+    }
+
+    /// An attempt has to outlast mapi-lite's ceiling, with a second to spare
+    /// for the 504 to arrive, or a hung node is reported as this side's own
+    /// timeout (CS-510).
+    #[test]
+    fn sr_cfg_010_an_attempt_shorter_than_mapi_lite_s_ceiling_is_warned_about() {
+        let secs = Duration::from_secs;
+        for (attempt, ceiling) in [(10, 10), (5, 10), (10, 20)] {
+            let warning = submit_budget_warning(secs(attempt), secs(ceiling))
+                .unwrap_or_else(|| panic!("{attempt}s against {ceiling}s was not warned about"));
+            assert!(warning.contains(&format!("{attempt}s")), "{warning}");
+            assert!(warning.contains(&format!("{ceiling}s")), "{warning}");
+        }
+        for (attempt, ceiling) in [(11, 10), (13, 10), (30, 10)] {
+            assert_eq!(submit_budget_warning(secs(attempt), secs(ceiling)), None);
+        }
+    }
+
+    /// The shipped defaults are aligned: FS's 13s attempt against mapi-lite's
+    /// 10s ceiling (CS-510).
+    #[test]
+    fn sr_cfg_010_the_default_attempt_clears_mapi_lite_s_default_ceiling() {
+        let config = MapiLiteConfig::for_base_url("http://mapi-lite".to_string());
+        assert_eq!(
+            submit_budget_warning(config.timeout(), Duration::from_secs(10)),
+            None
+        );
+    }
+
+    /// A quote that answers does not make mapi-lite healthy when its own
+    /// readiness says its nodes are gone.
+    #[tokio::test]
+    async fn sr_bchn_011_mapi_broadcaster_health_check_fails_when_mapi_lite_is_not_ready() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
+            .and(path("/ready"))
+            .respond_with(ResponseTemplate::new(503).set_body_json(json!({
+                "ready": false,
+                "checks": {
+                    "database": { "ok": true },
+                    "chainInfo": { "ok": false, "detail": "chain info is 120s old" },
+                    "ingest": { "ok": false }
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
             .and(path("/mapi/feeQuote"))
-            .respond_with(ResponseTemplate::new(503))
+            .respond_with(ok(fee_quote_payload()))
             .mount(&server)
             .await;
 
@@ -983,15 +1188,24 @@ mod tests {
             .health_check()
             .await
             .expect_err("unhealthy");
-        assert!(upstream_detail(error).contains("503"));
+        let detail = upstream_detail(error);
+        assert!(detail.contains("503"), "{detail}");
+        assert!(
+            detail.contains("chainInfo: chain info is 120s old") && detail.contains("ingest"),
+            "names mapi-lite's failing checks for the log: {detail}"
+        );
+        assert!(
+            !detail.contains("database"),
+            "only the failing ones: {detail}"
+        );
     }
 
     #[tokio::test]
     async fn mapi_broadcaster_health_check_is_bounded_by_its_own_timeout() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/mapi/feeQuote"))
-            .respond_with(ok(fee_quote_payload()).set_delay(Duration::from_secs(3)))
+            .and(path("/ready"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(3)))
             .mount(&server)
             .await;
 

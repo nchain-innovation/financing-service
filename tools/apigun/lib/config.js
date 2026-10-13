@@ -20,6 +20,14 @@ function bool(name, fallback) {
   return raw === 'true' || raw === '1';
 }
 
+function required(name) {
+  const raw = __ENV[name];
+  if (raw === undefined || raw === '') {
+    throw new Error(`${name} is required: pass it with -e ${name}=<value>`);
+  }
+  return raw.trim();
+}
+
 export const config = {
   baseUrl: (__ENV.BASE_URL || 'http://127.0.0.1:9080').replace(/\/$/, ''),
   clientId: __ENV.CLIENT_ID || 'event-rs',
@@ -30,9 +38,10 @@ export const config = {
   noOfOutpoints: num('NO_OF_OUTPOINTS', 1),
   // One transaction per outpoint (true) or one carrying all of them (false).
   multipleTx: bool('MULTIPLE_TX', false),
-  // P2PKH to a throwaway address. See docs/LockingScripts.md.
-  lockingScript:
-    __ENV.LOCKING_SCRIPT || '76a91426cd80ab48361ac4edb92ba341229ad9c97212d588ac',
+  // Hex locking script the funded outputs pay to. Required, with no default:
+  // every request spends real coins and sends them to whatever this names, so
+  // the caller has to say where. See docs/LockingScripts.md.
+  lockingScript: required('LOCKING_SCRIPT'),
 
   // 'off' sends no idempotency_key; 'unique' sends a fresh one per iteration;
   // 'replay' reuses one key for the whole run, exercising the replay path

@@ -40,7 +40,19 @@ pub struct BlockchainInterfaceConfig {
     /// `0` to turn the limit off.
     #[serde(default)]
     pub max_requests_per_second: Option<u32>,
+    /// Deadline on each call to the interface, in seconds (CS-502). Unset
+    /// means [`DEFAULT_INTERFACE_TIMEOUT_SECONDS`]; `0` turns it off.
+    ///
+    /// A call that outlives it fails as a chain failure, so a read that is
+    /// accepted and never answered cannot hold a client's refresh forever.
+    /// It bounds a whole call, which for WhatsOnChain's paged UTXO listing is
+    /// several paced requests, so leave room for the largest address.
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
 }
+
+/// The per-call deadline when `timeout_seconds` is unset (CS-502).
+pub const DEFAULT_INTERFACE_TIMEOUT_SECONDS: u64 = 30;
 
 fn default_rpc_import_addresses() -> bool {
     true
@@ -61,6 +73,7 @@ impl Default for BlockchainInterfaceConfig {
             rpc_password: None,
             rpc_import_addresses: default_rpc_import_addresses(),
             max_requests_per_second: None,
+            timeout_seconds: None,
         }
     }
 }
@@ -71,6 +84,18 @@ impl BlockchainInterfaceConfig {
     /// An explicit setting always wins, including an explicit `0` meaning
     /// unlimited. Otherwise only the interfaces that call somebody else's
     /// server are limited.
+    /// The deadline on each interface call, or `None` when it is turned off
+    /// (CS-502).
+    pub fn call_timeout(&self) -> Option<std::time::Duration> {
+        match self
+            .timeout_seconds
+            .unwrap_or(DEFAULT_INTERFACE_TIMEOUT_SECONDS)
+        {
+            0 => None,
+            seconds => Some(std::time::Duration::from_secs(seconds)),
+        }
+    }
+
     pub fn outbound_rate_limit(&self) -> Option<u32> {
         match self.max_requests_per_second {
             Some(0) => None,
@@ -155,6 +180,17 @@ pub struct ServiceConfig {
     /// request, which is what the service did before.
     #[serde(default)]
     pub chain_state_max_age_seconds: Option<u64>,
+    /// How old a client's chain read may be before `GET /ready` reports the
+    /// service unready, in seconds (CS-505, SR-BCHN-017).
+    ///
+    /// With `[mapi_lite]` a funding request does not wait for a refresh while
+    /// the cache is usable (SR-FUND-031), so if chain reads keep failing the
+    /// service goes on funding from an ever older view and nothing else says
+    /// so. Defaults to three refresh periods, and at least 60s: one failed
+    /// sweep is a blip, three is chain reads not working. `0` turns the check
+    /// off.
+    #[serde(default)]
+    pub ready_max_chain_read_age_seconds: Option<u64>,
     /// Where to keep what the service has broadcast but the chain may not have
     /// caught up with, so a restart does not forget it (CS-465).
     ///
@@ -171,6 +207,15 @@ impl ServiceConfig {
             self.chain_state_max_age_seconds
                 .unwrap_or(self.utxo_refresh_period),
         )
+    }
+
+    /// The bound `GET /ready` holds chain reads to, or `None` when the check
+    /// is off. See `ready_max_chain_read_age_seconds`.
+    pub fn ready_max_chain_read_age(&self) -> Option<std::time::Duration> {
+        let seconds = self
+            .ready_max_chain_read_age_seconds
+            .unwrap_or_else(|| (self.utxo_refresh_period.saturating_mul(3)).max(60));
+        (seconds > 0).then(|| std::time::Duration::from_secs(seconds))
     }
 }
 
@@ -493,6 +538,40 @@ impl MapiLiteConfig {
 #[derive(Debug, Default, Deserialize, Clone)]
 pub struct DynamicConfigConfig {
     pub filename: String,
+    /// The prefix every `wif_env` named on `POST /client` must start with
+    /// (CS-521, SR-SEC-018). Default [`DEFAULT_WIF_ENV_PREFIX`].
+    ///
+    /// Without it, `wif_env` could name any variable in the process
+    /// environment -- another client's `FS_CLIENT_<ID>_WIF` among them -- and
+    /// whoever could add a client could fund from that wallet under a key of
+    /// their own. With it, only variables the operator has set aside for
+    /// runtime clients can be named. It may not overlap `FS_CLIENT_`.
+    #[serde(default = "default_wif_env_prefix")]
+    pub wif_env_prefix: String,
+}
+
+/// See [`DynamicConfigConfig::wif_env_prefix`].
+pub const DEFAULT_WIF_ENV_PREFIX: &str = "FS_RUNTIME_WIF_";
+
+fn default_wif_env_prefix() -> String {
+    DEFAULT_WIF_ENV_PREFIX.to_string()
+}
+
+impl DynamicConfigConfig {
+    /// The prefix must be a usable variable-name start that no per-client
+    /// override (`FS_CLIENT_<ID>_WIF`) can begin with.
+    pub fn validate(&self) -> Result<(), String> {
+        let prefix = &self.wif_env_prefix;
+        crate::secrets::validate_env_var_name(prefix)
+            .map_err(|e| format!("dynamic_config.wif_env_prefix: {e}"))?;
+        if prefix.starts_with(CLIENT_ENV_PREFIX) || CLIENT_ENV_PREFIX.starts_with(prefix.as_str()) {
+            return Err(format!(
+                "dynamic_config.wif_env_prefix {prefix:?} overlaps {CLIENT_ENV_PREFIX:?}, the \
+                 prefix of every client's own key variable"
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Per-IP HTTP rate limiting configuration.
@@ -710,15 +789,24 @@ fn resolve_client_config(mut client: ClientConfig) -> Result<ClientConfig, Strin
     Ok(client)
 }
 
+/// What every per-client environment override starts with.
+const CLIENT_ENV_PREFIX: &str = "FS_CLIENT_";
+
 fn client_wif_env_var(client_id: &str) -> String {
-    format!("FS_CLIENT_{}_WIF", env_key_suffix(client_id))
+    format!("{CLIENT_ENV_PREFIX}{}_WIF", env_key_suffix(client_id))
 }
 
 fn client_api_key_env_var(client_id: &str) -> String {
-    format!("FS_CLIENT_{}_API_KEY", env_key_suffix(client_id))
+    format!("{CLIENT_ENV_PREFIX}{}_API_KEY", env_key_suffix(client_id))
 }
 
-fn env_key_suffix(client_id: &str) -> String {
+/// The part of a client's override variables that comes from its id.
+///
+/// Not one-to-one: case and punctuation fold, so `id.1` and `ID_1` share
+/// `FS_CLIENT_ID_1_WIF`. Two clients that fold together would both take
+/// whatever key that variable holds, so `POST /client` refuses an id that
+/// folds onto an existing client's (CS-521).
+pub(crate) fn env_key_suffix(client_id: &str) -> String {
     client_id
         .chars()
         .map(|ch| {
@@ -747,6 +835,7 @@ pub fn load_config(env_var: &str, filename: &str) -> Result<Config, String> {
     config.idempotency.validate()?;
     config.blockchain_interface.validate()?;
     config.fees.validate()?;
+    config.dynamic_config.validate()?;
     if let Some(mapi_lite) = &config.mapi_lite {
         mapi_lite.validate()?;
     }
@@ -1024,6 +1113,25 @@ filename = "./data/dynamic.toml"
         )
         .unwrap();
         assert!(config.rpc_import_addresses);
+    }
+
+    #[test]
+    fn cs_502_the_interface_deadline_defaults_to_30s_and_0_turns_it_off() {
+        let unset = BlockchainInterfaceConfig::default();
+        assert_eq!(
+            unset.call_timeout(),
+            Some(std::time::Duration::from_secs(30))
+        );
+        let off = BlockchainInterfaceConfig {
+            timeout_seconds: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(off.call_timeout(), None);
+        let set = BlockchainInterfaceConfig {
+            timeout_seconds: Some(7),
+            ..Default::default()
+        };
+        assert_eq!(set.call_timeout(), Some(std::time::Duration::from_secs(7)));
     }
 
     #[test]
@@ -1629,5 +1737,39 @@ filename = "./data/dynamic.toml"
             ..Default::default()
         };
         assert_eq!(limited_node.outbound_rate_limit(), Some(5));
+    }
+
+    /// CS-505, SR-BCHN-017: three refresh periods by default, never under a
+    /// minute, explicit when set, and off at zero.
+    #[test]
+    fn sr_bchn_017_ready_chain_read_bound_defaults_and_overrides() {
+        let service = |period, explicit| ServiceConfig {
+            utxo_refresh_period: period,
+            ready_max_chain_read_age_seconds: explicit,
+            ..Default::default()
+        };
+        let secs = |s| Some(std::time::Duration::from_secs(s));
+        assert_eq!(service(60, None).ready_max_chain_read_age(), secs(180));
+        assert_eq!(service(10, None).ready_max_chain_read_age(), secs(60));
+        assert_eq!(service(60, Some(45)).ready_max_chain_read_age(), secs(45));
+        assert_eq!(service(60, Some(0)).ready_max_chain_read_age(), None);
+    }
+
+    /// The runtime-client prefix may not be one a client's own override
+    /// variable (`FS_CLIENT_<ID>_WIF`) could start with (CS-521).
+    #[test]
+    fn sr_sec_018_wif_env_prefix_may_not_overlap_client_variables() {
+        let check = |prefix: &str| {
+            DynamicConfigConfig {
+                filename: "x".to_string(),
+                wif_env_prefix: prefix.to_string(),
+            }
+            .validate()
+        };
+        assert!(check(DEFAULT_WIF_ENV_PREFIX).is_ok());
+        assert!(check("MY_RUNTIME_KEYS_").is_ok());
+        for bad in ["FS_CLIENT_", "FS_CLIENT_ID1_", "FS_CLIENT", "FS_", "F", ""] {
+            assert!(check(bad).is_err(), "{bad:?} was accepted");
+        }
     }
 }
