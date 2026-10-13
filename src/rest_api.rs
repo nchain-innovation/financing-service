@@ -15,8 +15,8 @@ use crate::{
     },
     responses::{
         coded_error_response, error_response, error_response_with_status, json_ok,
-        partial_funding_error_response, AddressResponse, BalanceResponse, CodedError, ErrorCode,
-        HealthResponse, SuccessResponse,
+        partial_funding_error_response, AddressResponse, BalanceResponse, CheckResult, CodedError,
+        ErrorCode, HealthResponse, SuccessResponse, CHAIN_UNAVAILABLE,
     },
     secrets::{secret_reference, validate_env_var_name},
     service::Service,
@@ -145,15 +145,28 @@ pub async fn health() -> impl Responder {
 /// mapi-lite URL that a public 503 body has no business disclosing.
 #[get("/ready")]
 pub async fn ready(data: web::Data<AppState>) -> impl Responder {
-    match data.service.mapi_lite_health().await {
-        None => json_ok(&HealthResponse::ok()),
-        Some(Ok(())) => json_ok(&HealthResponse::mapi_lite_ok()),
+    let mapi_lite = match data.service.mapi_lite_health().await {
+        None => None,
+        Some(Ok(())) => Some(CheckResult::passed()),
         Some(Err(error)) => {
             log::warn!("mapi-lite readiness probe failed: {error}");
-            HttpResponse::ServiceUnavailable().json(HealthResponse::mapi_lite_unhealthy(
-                "mapi-lite probe failed",
-            ))
+            Some(CheckResult::failed("mapi-lite probe failed"))
         }
+    };
+    // Its detail is an age and a client id, which a caller of /status can
+    // already see; nothing in it names an upstream.
+    let chain = match data.service.chain_readiness().await {
+        Ok(()) => CheckResult::passed(),
+        Err(detail) => {
+            log::warn!("chain readiness failed: {detail}");
+            CheckResult::failed(detail)
+        }
+    };
+    let response = HealthResponse::from_checks(mapi_lite, Some(chain));
+    if response.is_ok() {
+        json_ok(&response)
+    } else {
+        HttpResponse::ServiceUnavailable().json(response)
     }
 }
 
@@ -265,7 +278,7 @@ pub async fn get_funds(
         Service::prepare_chain_state_for_funding(&data.service, client_id).await
     {
         log::warn!("refresh_client_chain_state failed: {}", description);
-        return error_response(ErrorCode::ChainUnavailable, description);
+        return error_response(ErrorCode::ChainUnavailable, CHAIN_UNAVAILABLE);
     }
 
     // Claim the `idempotency_key`, if the client supplied one, before anything
@@ -645,7 +658,7 @@ pub async fn balance(
         Service::refresh_client_chain_state_if_stale(&data.service, &client_id).await
     {
         log::warn!("refresh_client_chain_state failed: {}", description);
-        return error_response(ErrorCode::ChainUnavailable, description);
+        return error_response(ErrorCode::ChainUnavailable, CHAIN_UNAVAILABLE);
     }
 
     match data.service.get_balance_and_max_fundable(&client_id).await {
@@ -674,6 +687,7 @@ mod tests {
     use crate::{
         config::{ClientConfig, Config, RateLimitConfig},
         rate_limit,
+        responses::CHAIN_UNAVAILABLE,
         rest_api::{
             add_client, balance, delete_client, get_address, get_funds, health, index, ready,
             status, AppState,
@@ -1007,16 +1021,44 @@ mod tests {
         assert_eq!(body, json!({ "status": "ok" }));
     }
 
-    /// Without `[mapi_lite]` there is no upstream to probe, so readiness is
-    /// the same answer as liveness rather than a different shape.
+    /// Without `[mapi_lite]` there is no mapi-lite to probe, so readiness
+    /// reports chain reads alone (CS-505). It used to be the same answer as
+    /// liveness, which said nothing a liveness probe did not.
     #[actix_web::test]
-    async fn sr_bchn_012_ready_matches_health_without_mapi_lite() {
+    async fn sr_bchn_012_ready_reports_chain_reads_without_mapi_lite() {
         let app = build_app().await;
         let resp =
             test::call_service(&app, test::TestRequest::get().uri("/ready").to_request()).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body: Value = test::read_body_json(resp).await;
-        assert_eq!(body, json!({ "status": "ok" }));
+        assert_eq!(body, json!({ "status": "ok", "chain": { "ok": true } }));
+    }
+
+    /// SR-BCHN-017: chain reads older than the bound take the service out of
+    /// rotation -- with `[mapi_lite]` it would otherwise go on funding from an
+    /// ever older cache -- and liveness is untouched (SR-BCHN-004).
+    #[actix_web::test]
+    async fn sr_bchn_017_ready_returns_503_when_chain_reads_are_stale() {
+        let config = test_config(&unique_dynamic_config_path());
+        let (app, service) = build_app_with_service(config).await;
+        service
+            .backdate_chain_reads(std::time::Duration::from_secs(61))
+            .await;
+
+        let resp =
+            test::call_service(&app, test::TestRequest::get().uri("/ready").to_request()).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["status"], "unhealthy");
+        assert_eq!(body["chain"]["ok"], false);
+        assert!(body["chain"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("last read"));
+
+        let resp =
+            test::call_service(&app, test::TestRequest::get().uri("/health").to_request()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[actix_web::test]
@@ -2253,6 +2295,59 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body = String::from_utf8(test::read_body(resp).await.to_vec()).unwrap();
         assert!(!body.contains(secret_wif));
+    }
+
+    /// A chain read that fails names the address it could not reach -- a node
+    /// inside the network, or WhatsOnChain's URL. That is for the log: the
+    /// caller is told the chain is unavailable and nothing about where it
+    /// lives (CS-512). Event used to pass this description on to its own
+    /// callers word for word.
+    #[actix_web::test]
+    async fn sr_sec_016_chain_unavailable_does_not_disclose_the_chain_address() {
+        use crate::test_support::{
+            CountingBroadcaster, UnreadableBlockchain, UNREADABLE_CHAIN_URL,
+        };
+
+        let config = test_config(&unique_dynamic_config_path());
+        let blockchain = UnreadableBlockchain::new(&config).await;
+        let (app, _service) = build_app_over(&config, blockchain, CountingBroadcaster::new()).await;
+
+        let requests = [
+            (
+                "POST /fund",
+                test::TestRequest::post().uri("/fund").set_json(fund_body(
+                    TEST_CLIENT_ID,
+                    123,
+                    1,
+                    LOCKING_SCRIPT_HEX,
+                )),
+            ),
+            (
+                "POST /fund multiple_tx",
+                test::TestRequest::post().uri("/fund").set_json(json!({
+                    "client_id": TEST_CLIENT_ID,
+                    "satoshi": 123,
+                    "no_of_outpoints": 2,
+                    "multiple_tx": true,
+                    "locking_script": LOCKING_SCRIPT_HEX,
+                })),
+            ),
+            (
+                "GET balance",
+                test::TestRequest::get().uri(&format!("/client/{TEST_CLIENT_ID}/balance")),
+            ),
+        ];
+        for (name, request) in requests {
+            let resp = test::call_service(&app, request.to_request()).await;
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{name}");
+            let body: Value = test::read_body_json(resp).await;
+            assert_eq!(body["code"], "chain_unavailable", "{name}");
+            assert_eq!(body["description"], CHAIN_UNAVAILABLE, "{name}");
+            let text = body.to_string();
+            for leak in [UNREADABLE_CHAIN_URL, "10.20.30.40", "url", "get_utxo"] {
+                assert!(!text.contains(leak), "{name} disclosed {leak:?}: {text}");
+            }
+        }
     }
 
     #[actix_web::test]

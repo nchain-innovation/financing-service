@@ -75,19 +75,23 @@ Readiness: should traffic be sent here right now? Use this for a Kubernetes `rea
 curl http://127.0.0.1:8080/ready
 ```
 
-Without [`[mapi_lite]`](Configuration.md#mapi_lite) there is no upstream whose absence would stop funding, so the answer matches `/health`. With it configured, `/ready` probes mapi-lite — the service's only broadcast path in that mode — and reports the result:
+Two checks, and the answer is healthy only if both pass (CS-505):
+
+* **`chain`** — chain reads are working. Every client's UTXO set must have been read from the chain within `service.ready_max_chain_read_age_seconds` (default three refresh periods, at least 60s); with no clients, the blockchain interface must have answered within that time. A client never read at all fails too — a service that started while the chain was unreachable. The check reads nothing itself: it reports what the periodic refresh has managed. With [`[mapi_lite]`](Configuration.md#mapi_lite) this matters most, because funding then goes on from the cached state without waiting for a refresh, so failing chain reads would otherwise go unnoticed while the cache grew ever older.
+* **`mapi_lite`** — with `[mapi_lite]` configured, mapi-lite's own `GET /ready`, which fails when its node pool is unreachable, its block ingest has fallen behind, or it cannot sign. Until CS-505 this probed `GET /mapi/feeQuote`, which mapi-lite serves from its configuration and which kept answering with every node down.
 
 | Situation | HTTP | Body |
 |---|---|---|
-| mapi-lite not configured | 200 | `{"status": "ok"}` |
-| mapi-lite configured and reachable | 200 | `{"status": "ok", "mapi_lite": {"ok": true}}` |
-| mapi-lite configured but unreachable | 503 | `{"status": "unhealthy", "mapi_lite": {"ok": false, "detail": "mapi-lite probe failed"}}` |
+| chain reads current, mapi-lite not configured | 200 | `{"status": "ok", "chain": {"ok": true}}` |
+| chain reads current, mapi-lite ready | 200 | `{"status": "ok", "mapi_lite": {"ok": true}, "chain": {"ok": true}}` |
+| mapi-lite not ready or unreachable | 503 | `{"status": "unhealthy", "mapi_lite": {"ok": false, "detail": "mapi-lite probe failed"}, "chain": {"ok": true}}` |
+| chain reads too old | 503 | `{"status": "unhealthy", "chain": {"ok": false, "detail": "client event's chain state was last read 412s ago (limit 180s)"}}` |
 
 `/health` is unaffected by that 503 and stays 200, which is the point of the split. Sending a liveness probe to `/ready` puts the restart loop back.
 
 The probe is bounded by `mapi_lite.health_timeout_seconds` (default 2s), which must stay under the few seconds a readiness probe allows before it gives up.
 
-The `detail` is deliberately generic. This endpoint is unauthenticated and exempt from rate limiting, and the underlying transport error names the mapi-lite host and port; the full error is written to the service log instead.
+The `mapi_lite` `detail` is deliberately generic. This endpoint is unauthenticated and exempt from rate limiting, and the underlying transport error names the mapi-lite host and port; the full error — including the names of mapi-lite's failing checks — is written to the service log instead. The `chain` detail names only a client id and an age, which `GET /status` already shows.
 
 The verdict is **cached for `health_timeout_seconds`**, so repeated calls do not each reach mapi-lite. Without that cache an unauthenticated, unmetered endpoint could be used to flood the broadcast path. A readiness probe on a 5s interval therefore reaches mapi-lite at most every 2s.
 
@@ -256,7 +260,7 @@ The status is derived from the code, so a caller that cannot read the body — a
 | `broadcast_rejected` | 409 | The upstream looked at the transaction and refused it finally — either because it said so, or because it named a conflicting transaction | Nothing was spent, and **retrying will not help** — see below |
 | `broadcast_outcome_unknown` | 504 | The transaction was handed over and its fate is unknown — it may be on the network | **Do not retry with a new `idempotency_key`**; see below |
 | `partial_broadcast` | 422 | Some of the requested transactions broadcast, some did not | **Read the body** — the successful ones are in it |
-| `chain_unavailable` | 503 | The blockchain interface could not be reached | Retryable |
+| `chain_unavailable` | 503 | The blockchain interface could not be reached. The description is fixed; the read's own error, which names the interface's address, is in the service log | Retryable |
 | `internal` | 500 | Unexpected internal failure | Report it |
 | `unauthorized` | 401 | Authentication missing or invalid | Fix credentials |
 | `rate_limited` | 429 | Request rate exceeded, or (from `POST /fund`) the client's `funding_limits.max_satoshis_per_period` would be exceeded | Retry after the interval in `description` or `Retry-After` |
@@ -406,6 +410,8 @@ curl -H "Authorization: Bearer your-client-api-key" \
 ```
 
 **Unconfirmed outputs are spendable.** `POST /fund` draws on the whole unspent set, so `max_fundable` counts `unconfirmed` as well as `confirmed`, and a funding request can be satisfied entirely from outputs that are still in the mempool. That is deliberate — a funding service that waited for confirmation would be unusable on a chain where its own change output is the next input — but it does mean a funded outpoint can depend on a parent transaction that has not been mined. Callers that need confirmed inputs specifically should check `confirmed` before requesting.
+
+If such a parent never makes it — a conflict, an eviction or a reorg drops it — the node refuses the next spend of its change as missing inputs. That request fails (`broadcast_failed` or `broadcast_rejected`, as the upstream judged it retryable or not), and the service forgets the change (and any change built on it) instead of offering it again, so the request after it funds from another input (CS-506).
 
 Both figures are **derived from the unspent set**, not asked for separately. A separate balance query can disagree with the UTXOs it is meant to describe — WhatsOnChain's `/address/{address}/balance` is deprecated and was reporting `unconfirmed: 0` for addresses whose unspent set plainly held unconfirmed outputs — and when they disagree, the unspent set is the one that decides what can be funded. Deriving means `confirmed`, `unconfirmed` and `max_fundable` always describe the same set of coins, and that the balance reflects a funding transaction the moment it spends from them rather than at the next refresh.
 
