@@ -121,6 +121,8 @@ pub struct Service {
     broadcaster: Arc<dyn TxBroadcaster>,
     clients: RwLock<HashMap<String, Arc<RwLock<Client>>>>,
     dynamic_config: Mutex<DynamicConfig>,
+    /// `dynamic_config.wif_env_prefix` (CS-521).
+    wif_env_prefix: String,
     admin_api_key: Option<String>,
     idempotency: Mutex<IdempotencyStore>,
     /// Set only for backends that must be told which addresses to follow.
@@ -269,6 +271,31 @@ struct CachedHealth {
     verdict: Result<(), String>,
 }
 
+/// Funding wallets held by more than one client, each with the clients that
+/// hold it, sorted (CS-521). Read at startup, when nothing else holds the
+/// locks; a client whose lock is taken is left out rather than waited for.
+fn wallets_shared_by(clients: &HashMap<String, Arc<RwLock<Client>>>) -> Vec<(String, Vec<String>)> {
+    let mut by_address: HashMap<String, Vec<String>> = HashMap::new();
+    for (id, client) in clients {
+        if let Ok(client) = client.try_read() {
+            by_address
+                .entry(client.get_address())
+                .or_default()
+                .push(id.clone());
+        }
+    }
+    let mut shared: Vec<_> = by_address
+        .into_iter()
+        .filter(|(_, ids)| ids.len() > 1)
+        .map(|(address, mut ids)| {
+            ids.sort();
+            (address, ids)
+        })
+        .collect();
+    shared.sort();
+    shared
+}
+
 impl Service {
     fn build(
         config: &Config,
@@ -324,6 +351,19 @@ impl Service {
             );
         }
 
+        // Clients that share a wallet cannot be told apart by the service and
+        // will spend each other's coins. `POST /client` now refuses them
+        // (CS-521), but a pair added before that is still in the dynamic
+        // config: say so loudly, without refusing to start a deployment that
+        // may be serving.
+        for (address, ids) in wallets_shared_by(&clients) {
+            log::error!(
+                "clients {ids:?} share one funding wallet ({address}): they will spend each \
+                 other's coins, and one may have been added to take over the other's. Remove \
+                 the one that should not be there from the dynamic config."
+            );
+        }
+
         Ok(Service {
             blockchain_status: RwLock::new(BlockchainConnectionStatus::Unknown),
             blockchain_update_time: RwLock::new(None),
@@ -331,6 +371,7 @@ impl Service {
             broadcaster,
             clients: RwLock::new(clients),
             dynamic_config: Mutex::new(dynamic_config),
+            wif_env_prefix: config.dynamic_config.wif_env_prefix.clone(),
             admin_api_key: config
                 .web_interface
                 .admin_api_key
@@ -674,6 +715,48 @@ impl Service {
         self.clients.read().await.values().cloned().collect()
     }
 
+    /// `dynamic_config.wif_env_prefix`: what a runtime client's `wif_env` must
+    /// start with (CS-521).
+    pub fn wif_env_prefix(&self) -> &str {
+        &self.wif_env_prefix
+    }
+
+    /// Why a new client may not join `clients`, if it may not (CS-521).
+    ///
+    /// * **The same wallet.** Two clients funding from one key is never
+    ///   meaningful -- each tracks its own UTXOs, so they would spend the same
+    ///   coins -- and it is exactly what taking over another client's wallet
+    ///   looks like, however the key was supplied: a `wif_env` naming that
+    ///   client's variable, the literal key, or an id that folds onto that
+    ///   client's override variable. Comparing addresses catches all three.
+    /// * **An id that folds onto another's.** `id.1` and `ID_1` share every
+    ///   `FS_CLIENT_ID_1_*` override, so whichever is set would apply to both.
+    async fn conflict_with_existing(
+        clients: &HashMap<String, Arc<RwLock<Client>>>,
+        client_id: &str,
+        address: &str,
+    ) -> Option<CodedError> {
+        let suffix = crate::config::env_key_suffix(client_id);
+        for (existing_id, existing) in clients {
+            if crate::config::env_key_suffix(existing_id) == suffix {
+                return Some(CodedError::new(
+                    ErrorCode::InvalidRequest,
+                    format!(
+                        "client_id {client_id:?} shares the environment variables of existing \
+                         client {existing_id:?} (FS_CLIENT_{suffix}_*); choose a distinct id"
+                    ),
+                ));
+            }
+            if existing.read().await.get_address() == address {
+                return Some(CodedError::new(
+                    ErrorCode::InvalidRequest,
+                    "this key is already the funding key of another client".to_string(),
+                ));
+            }
+        }
+        None
+    }
+
     pub async fn add_client(&self, client_config: &ClientConfig) -> Result<(), CodedError> {
         crate::secrets::warn_plaintext_client_secrets(
             &client_config.client_id,
@@ -692,6 +775,7 @@ impl Service {
         // config file says, so a client added now costs its transactions the
         // same as one that has been here since startup.
         client.set_fee_satoshis_per_kb(*self.fee_satoshis_per_kb.lock().await);
+        let address = client.get_address();
         let new_client = Arc::new(RwLock::new(client));
         {
             let mut clients = self.clients.write().await;
@@ -700,6 +784,12 @@ impl Service {
                     ErrorCode::ClientExists,
                     format!("Client already exists: {}", client_config.client_id),
                 ));
+            }
+            // Checked under the write lock, so two requests cannot both pass.
+            if let Some(error) =
+                Self::conflict_with_existing(&clients, &client_config.client_id, &address).await
+            {
+                return Err(error);
             }
             clients.insert(client_config.client_id.clone(), Arc::clone(&new_client));
         }
@@ -1745,7 +1835,7 @@ mod tests {
         service
             .add_client(&ClientConfig {
                 client_id: "id2".to_string(),
-                wif_key: TEST_WIF.to_string(),
+                wif_key: crate::test_support::OTHER_TEST_WIF.to_string(),
                 api_key: None,
             })
             .await
@@ -1753,7 +1843,10 @@ mod tests {
 
         // the startup import, then the new client's
         assert_eq!(watcher.watched().len(), 2);
-        assert_eq!(watcher.watched()[1], TEST_ADDRESS);
+        assert_eq!(
+            watcher.watched()[1],
+            crate::test_support::OTHER_TEST_ADDRESS
+        );
     }
 
     /// An import failure is reported but must not stop the service: the node
@@ -1918,7 +2011,7 @@ mod tests {
         service
             .add_client(&ClientConfig {
                 client_id: "client2".to_string(),
-                wif_key: TEST_WIF.to_string(),
+                wif_key: crate::test_support::OTHER_TEST_WIF.to_string(),
                 api_key: None,
             })
             .await
@@ -2868,7 +2961,7 @@ mod tests {
         service
             .add_client(&ClientConfig {
                 client_id: "added-later".to_string(),
-                wif_key: crate::test_support::TEST_WIF.to_string(),
+                wif_key: crate::test_support::OTHER_TEST_WIF.to_string(),
                 api_key: None,
             })
             .await
@@ -3641,5 +3734,87 @@ mod tests {
                 "quote of {quoted}"
             );
         }
+    }
+
+    // --- CS-521: one wallet, one client -----------------------------------
+
+    /// A new client funding from a wallet an existing client already uses is
+    /// refused, however the key arrived -- here, as the literal key.
+    #[tokio::test]
+    async fn sr_sec_018_a_client_sharing_another_s_wallet_is_refused() {
+        let config = test_config(&unique_dynamic_config_path());
+        let blockchain = test_blockchain_interface(&config).await;
+        let service = Service::new_for_test(&config, blockchain).await;
+
+        let error = service
+            .add_client(&ClientConfig {
+                client_id: "thief".to_string(),
+                wif_key: TEST_WIF.to_string(),
+                api_key: Some("mine".to_string()),
+            })
+            .await
+            .expect_err("the wallet is id1's");
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+        assert!(
+            error.description.contains("already the funding key"),
+            "{}",
+            error.description
+        );
+        assert!(service.client_handle("thief").await.is_none());
+    }
+
+    /// `ID1` and `id.1`-style ids fold onto an existing client's override
+    /// variables, so whatever key those hold would fund both.
+    #[tokio::test]
+    async fn sr_sec_018_an_id_that_folds_onto_another_s_is_refused() {
+        let config = test_config(&unique_dynamic_config_path());
+        let blockchain = test_blockchain_interface(&config).await;
+        let service = Service::new_for_test(&config, blockchain).await;
+
+        let folded = TEST_CLIENT_ID.to_uppercase();
+        assert_ne!(folded, TEST_CLIENT_ID);
+        let error = service
+            .add_client(&ClientConfig {
+                client_id: folded,
+                wif_key: crate::test_support::OTHER_TEST_WIF.to_string(),
+                api_key: None,
+            })
+            .await
+            .expect_err("folds onto id1");
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+        assert!(
+            error.description.contains("FS_CLIENT_ID1_"),
+            "{}",
+            error.description
+        );
+    }
+
+    /// A pair added before the check existed is still found, at startup.
+    #[tokio::test]
+    async fn sr_sec_018_clients_sharing_a_wallet_are_found_at_startup() {
+        let mut config = test_config(&unique_dynamic_config_path());
+        config.client = Some(vec![
+            ClientConfig {
+                client_id: TEST_CLIENT_ID.to_string(),
+                wif_key: TEST_WIF.to_string(),
+                api_key: None,
+            },
+            ClientConfig {
+                client_id: "twin".to_string(),
+                wif_key: TEST_WIF.to_string(),
+                api_key: None,
+            },
+        ]);
+        let blockchain = test_blockchain_interface(&config).await;
+        let service = Service::new_for_test(&config, blockchain).await;
+
+        let shared = super::wallets_shared_by(&*service.clients.read().await);
+        assert_eq!(
+            shared,
+            vec![(
+                TEST_ADDRESS.to_string(),
+                vec![TEST_CLIENT_ID.to_string(), "twin".to_string()]
+            )]
+        );
     }
 }
