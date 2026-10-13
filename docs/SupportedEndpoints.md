@@ -136,7 +136,7 @@ Creates one or more funding transactions. Request body (JSON):
 |-------|------|-------------|
 | `client_id` | string | Client whose wallet funds the transaction |
 | `satoshi` | number | Value in satoshis for each funding output |
-| `no_of_outpoints` | number | Number of funding outpoints to provide |
+| `no_of_outpoints` | number | Number of funding outpoints to provide, at most **1000**. The locking scripts across all of them may total at most **1 MiB** (SR-SEC-017) |
 | `multiple_tx` | boolean | If true and `no_of_outpoints` > 1, create separate transactions |
 | `locking_script` | string | Hex-encoded locking script for the funding outputs |
 
@@ -193,7 +193,7 @@ This matters when each funded output is spent by a different transaction. Output
 
 With `multiple_tx: true` the scripts are paid one per transaction rather than one per output of a single transaction.
 
-Rejected as `invalid_request`: supplying both fields, supplying neither, an empty `locking_scripts` list, and a `no_of_outpoints` that disagrees with the list length.
+Rejected as `invalid_request`: supplying both fields, supplying neither, an empty `locking_scripts` list, a `no_of_outpoints` that disagrees with the list length, more than 1000 outpoints, and locking scripts totalling more than 1 MiB (a single `locking_script` counts once per outpoint). The client and its API key are checked first, so an unknown or unauthenticated caller is refused before any of this is looked at (CS-519).
 
 ### Idempotency
 
