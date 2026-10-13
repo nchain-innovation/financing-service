@@ -19,6 +19,7 @@ network_type = "testnet"
 # rpc_password = "env:FS_RPC_PASSWORD"    # required for rpc
 # rpc_import_addresses = true             # rpc only; default true
 # max_requests_per_second = 3             # default 3 for woc, unset otherwise
+# timeout_seconds = 30                    # deadline on each interface call; 0 turns it off
 ```
 
 Supported `network_type` values: `mainnet`, `testnet`, `stn`, `regtest`.
@@ -115,6 +116,14 @@ Note that `GET /health` stays `ok` throughout: it is a liveness check and delibe
 **An unreachable blockchain interface at startup is a warning, not a fatal error** (CS-505). It used to stop the service — on a single WhatsOnChain 429 — and the restart that followed met the same rate limit. Now the service starts degraded, logs `Unable to reach the blockchain interface at startup`, and `GET /ready` answers 503 until the first chain read succeeds; `/health` and `/status` serve throughout.
 
 **`test` is a fixture, not a backend.** It is an in-process stub used by the unit tests, with a UTXO set injected directly by the test harness. It has no network of its own, so the `network_type` you set alongside it only affects address encoding. It will start and serve requests as a configured backend, but its UTXO set is empty, so balances read zero and funding is refused — useful for exercising the API surface, not for funding anything.
+
+### Every interface call has a deadline
+
+`timeout_seconds` (default `30`) bounds each call to the blockchain interface — a chain refresh, the startup status check, a broadcast when `[mapi_lite]` is not configured — including any wait for a rate-limit slot. A call that outlives it fails like any other chain failure, and is logged and counted the same way (CS-502).
+
+It exists because WhatsOnChain's client has no timeout of its own, and a read that is accepted and never answered would otherwise wait forever. Chain refreshes are one at a time per client, so that one read would hold the client's refresh: every request needing a fresh read would queue behind it and the periodic refresh would skip the client, with nothing logged. A broadcast that runs out of time is reported as `broadcast_outcome_unknown`, since it may have reached the network.
+
+It bounds a whole call, and WhatsOnChain's UTXO listing is one call made of several paced page requests, so leave room for the largest address the service funds from. `0` turns the deadline off and logs a warning at startup.
 
 ### A note on the default port
 
@@ -376,6 +385,16 @@ auth_token = "env:FS_MAPI_LITE_AUTH_TOKEN"
   On expiry the caller gets `broadcast_outcome_unknown` (HTTP 504) if an attempt was still in flight, because cancelling a request says nothing about what the server did with it and the transaction may be on the network; the service reserves that transaction's inputs in response — see [When the outcome is unknown](SupportedEndpoints.md#when-the-outcome-is-unknown). If instead the deadline was consumed by back-off between attempts that were all refused outright, nothing was ever delivered and the caller gets `broadcast_failed` (HTTP 502) with no reservation.
 
 **The three interact.** The worst case is `timeout_seconds × (max_retries + 1)` plus back-off, and `total_timeout_seconds` cuts it off there. Set the deadline to the longest a `/fund` call may take, then choose the other two to fit inside it; the startup warning tells you when they do not.
+
+**`timeout_seconds` has to outlast mapi-lite's own ceiling (CS-510).** mapi-lite answers a submission it cannot finish within its `submit_timeout_sec` (default 10s) with HTTP 504, outcome unknown. An attempt that gives up first reports a hung node as *this* service's timeout instead: the same unknown outcome, from the wrong layer, with mapi-lite still working on a request nobody is waiting for. The budget, outermost first:
+
+| Layer | Gives up after (defaults) |
+|---|---|
+| Event → `POST /fund` | 90s, above this service's 45s submit deadline plus a chain read |
+| this service → mapi-lite, per attempt | `timeout_seconds` = 13s |
+| mapi-lite → node, whole submit | `submit_timeout_sec` = 10s, answered 504 |
+
+mapi-lite publishes its ceiling in `GET /ready` as `submitTimeoutSecs`. The service reads it whenever it probes mapi-lite, at startup included, and **warns** when `timeout_seconds` does not exceed it by at least a second, naming both values (SR-CFG-010). It still starts and funds: the combination works, it just reports a hung node less well. Fix it by raising `timeout_seconds` (and `total_timeout_seconds` with it), or by lowering mapi-lite's ceiling.
 
 When the section is present the service:
 

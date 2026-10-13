@@ -12,6 +12,7 @@ mod client;
 mod config;
 mod dynamic_config;
 mod idempotency;
+mod interface_timeout;
 mod outbound_rate_limit;
 mod rate_limit;
 mod responses;
