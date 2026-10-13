@@ -36,7 +36,7 @@ Admin       ──REST──▶       │                │
                             │                └── dynamic.inflight.json (in-flight funding state, survives restarts)
                             ├── rate_limit (per-IP, /health and /ready exempt)
                             ├── /health (liveness, no auth; no upstream checks)
-                            └── /ready  (readiness, no auth; probes mapi-lite when configured)
+                            └── /ready  (readiness, no auth; chain-read age, and mapi-lite's /ready when configured)
 ```
 
 | Module | Role |
@@ -70,7 +70,7 @@ Admin       ──REST──▶       │                │
 * Optional OpenTelemetry trace export via OTLP (configurable, disabled by default)
 * Configurable per-IP HTTP rate limiting with `/health` and `/ready` exempt
 * Balance checks against total wallet balance; funding combines multiple UTXOs when needed; balance endpoint refreshes from chain on each request; `multiple_tx` partial failures return structured successful transaction data; concurrent fund requests for the same client use read-only planning and commit UTXO updates only after broadcast
-* Optional mapi-lite transaction broadcaster (`[mapi_lite]`): broadcasts go to mapi-lite, reads stay on the blockchain interface, `/ready` probes mapi-lite and returns 503 when it is down while `/health` stays up, `/status` names the broadcaster, startup logs the selection
+* Optional mapi-lite transaction broadcaster (`[mapi_lite]`): broadcasts go to mapi-lite, reads stay on the blockchain interface, `/ready` probes mapi-lite's own `/ready` and returns 503 when it is down or not ready while `/health` stays up, `/status` names the broadcaster, startup logs the selection
 * Docker image with `/health` liveness check
 * CI: build, test, `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo audit`
 * `chain-gang` from crates.io at an exact release, with a committed `Cargo.lock`, for reproducible builds
