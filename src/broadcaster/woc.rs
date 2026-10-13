@@ -38,11 +38,17 @@ impl TxBroadcaster for WocBroadcaster {
 
     async fn broadcast_tx(&self, tx: &Tx) -> Result<String, BroadcastError> {
         // chain-gang's interfaces do not distinguish a rejection from a
-        // transport failure in their error type, so everything is upstream.
-        self.inner
-            .broadcast_tx(tx)
-            .await
-            .map_err(|e| BroadcastError::Upstream(e.to_string()))?;
+        // transport failure in their error type, so most things are upstream.
+        // Not a call that ran out of time or lost its answer after sending,
+        // though (CS-502): the transaction may be on the network, and
+        // reporting it as failed would release inputs it spent (CS-501).
+        self.inner.broadcast_tx(tx).await.map_err(|e| {
+            if crate::interface_timeout::may_have_been_delivered(&e) {
+                BroadcastError::Indeterminate(e.to_string())
+            } else {
+                BroadcastError::Upstream(e.to_string())
+            }
+        })?;
         Ok(tx.hash().encode())
     }
 
@@ -61,6 +67,35 @@ mod tests {
         sample_tx, test_config, unique_dynamic_config_path, CountingBlockchain,
         FailingBroadcastBlockchain,
     };
+
+    /// CS-502. A broadcast the interface never answers fails at the deadline,
+    /// and as an unknown outcome: the transaction may be on the network, so
+    /// its inputs must be reserved, not released (CS-501).
+    #[tokio::test]
+    async fn a_broadcast_that_runs_out_of_time_is_an_unknown_outcome() {
+        use crate::interface_timeout::Bounded;
+        use crate::test_support::GatedBlockchain;
+        use std::time::Duration;
+
+        let config = test_config(&unique_dynamic_config_path());
+        let gated = GatedBlockchain::new(&config).await;
+        gated.close();
+        let bounded = Arc::new(Bounded::new(gated.clone(), Duration::from_millis(50)));
+        let broadcaster = WocBroadcaster::new(bounded, "woc");
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            broadcaster.broadcast_tx(&sample_tx()),
+        )
+        .await
+        .expect("the broadcast was not bounded")
+        .unwrap_err();
+        assert!(
+            matches!(error, BroadcastError::Indeterminate(_)),
+            "{error:?}"
+        );
+        gated.open();
+    }
 
     #[tokio::test]
     async fn woc_broadcaster_delegates_to_the_blockchain_interface() {

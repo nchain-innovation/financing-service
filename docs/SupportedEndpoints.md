@@ -260,7 +260,7 @@ The status is derived from the code, so a caller that cannot read the body — a
 | `broadcast_rejected` | 409 | The upstream looked at the transaction and refused it finally — either because it said so, or because it named a conflicting transaction | Nothing was spent, and **retrying will not help** — see below |
 | `broadcast_outcome_unknown` | 504 | The transaction was handed over and its fate is unknown — it may be on the network | **Do not retry with a new `idempotency_key`**; see below |
 | `partial_broadcast` | 422 | Some of the requested transactions broadcast, some did not | **Read the body** — the successful ones are in it |
-| `chain_unavailable` | 503 | The blockchain interface could not be reached | Retryable |
+| `chain_unavailable` | 503 | The blockchain interface could not be reached. The description is fixed; the read's own error, which names the interface's address, is in the service log | Retryable |
 | `internal` | 500 | Unexpected internal failure | Report it |
 | `unauthorized` | 401 | Authentication missing or invalid | Fix credentials |
 | `rate_limited` | 429 | Request rate exceeded | Retry after the interval in `description` |
@@ -410,6 +410,8 @@ curl -H "Authorization: Bearer your-client-api-key" \
 ```
 
 **Unconfirmed outputs are spendable.** `POST /fund` draws on the whole unspent set, so `max_fundable` counts `unconfirmed` as well as `confirmed`, and a funding request can be satisfied entirely from outputs that are still in the mempool. That is deliberate — a funding service that waited for confirmation would be unusable on a chain where its own change output is the next input — but it does mean a funded outpoint can depend on a parent transaction that has not been mined. Callers that need confirmed inputs specifically should check `confirmed` before requesting.
+
+If such a parent never makes it — a conflict, an eviction or a reorg drops it — the node refuses the next spend of its change as missing inputs. That request fails (`broadcast_failed` or `broadcast_rejected`, as the upstream judged it retryable or not), and the service forgets the change (and any change built on it) instead of offering it again, so the request after it funds from another input (CS-506).
 
 Both figures are **derived from the unspent set**, not asked for separately. A separate balance query can disagree with the UTXOs it is meant to describe — WhatsOnChain's `/address/{address}/balance` is deprecated and was reporting `unconfirmed: 0` for addresses whose unspent set plainly held unconfirmed outputs — and when they disagree, the unspent set is the one that decides what can be funded. Deriving means `confirmed`, `unconfirmed` and `max_fundable` always describe the same set of coins, and that the balance reflects a funding transaction the moment it spends from them rather than at the next refresh.
 
