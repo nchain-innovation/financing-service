@@ -610,7 +610,7 @@ async fn release_if_nothing_was_spent(
 /// Example:
 ///     curl -H "Content-Type: application/json" \
 ///     --request POST \
-///     --data '{"client_id":"client15","wif":"cVL...............qWh"}' \
+///     --data '{"client_id":"client15","wif_env":"FS_RUNTIME_WIF_CLIENT15"}' \
 ///   http://127.0.0.1:8082/client
 /// {"status": "Success"}
 #[post("/client")]
@@ -2246,6 +2246,48 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body: Value = test::read_body_json(resp).await;
         assert!(body["confirmed"].as_i64().unwrap() > 0);
+    }
+
+    /// CS-526: by default a raw `wif` is refused before anything is stored,
+    /// and the error does not echo it (SR-SEC-010). `wif_env` still works.
+    #[actix_web::test]
+    async fn sr_sec_021_a_raw_wif_is_refused_unless_allowed() {
+        // Not the configured client's key: a second client may not share its
+        // wallet (CS-521). Private key 2; testnet, compressed, throwaway.
+        const SECOND_WIF: &str = "cMahea7zqjxrtgAbB7LSGbcQUr1uX1ojuat9jZodMN87K7XCyj5v";
+        let path = unique_dynamic_config_path();
+        let mut config = test_config_with_keys(&path, None, None);
+        config.dynamic_config.allow_plaintext_wif = false;
+        let (app, service) = build_app_with_service(config).await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/client")
+                .set_json(json!({ "client_id": "raw", "wif": SECOND_WIF }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = String::from_utf8(test::read_body(resp).await.to_vec()).unwrap();
+        assert!(body.contains("wif_env"), "{body}");
+        assert!(!body.contains(SECOND_WIF), "{body}");
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(!saved.contains("raw"), "nothing may be stored: {saved}");
+        assert!(service.get_balance("raw").await.is_none());
+
+        unsafe { std::env::set_var("FS_RUNTIME_WIF_SR_SEC_021", SECOND_WIF) };
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/client")
+                .set_json(json!({ "client_id": "by-env", "wif_env": "FS_RUNTIME_WIF_SR_SEC_021" }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("env:FS_RUNTIME_WIF_SR_SEC_021"));
+        assert!(!saved.contains(SECOND_WIF));
     }
 
     #[actix_web::test]

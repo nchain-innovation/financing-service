@@ -599,6 +599,12 @@ fn is_public_key_hex(key: &str) -> bool {
 #[derive(Debug, Default, Deserialize, Clone)]
 pub struct DynamicConfigConfig {
     pub filename: String,
+    /// Whether `POST /client` may store a raw `wif` (CS-526). Off by default:
+    /// the dynamic config file would then hold the key itself, a copy that
+    /// outlives the request on a volume often bind-mounted from the host.
+    /// Off, only `wif_env` is accepted, which stores an `env:VAR` reference.
+    #[serde(default)]
+    pub allow_plaintext_wif: bool,
     /// The prefix every `wif_env` named on `POST /client` must start with
     /// (CS-521, SR-SEC-018). Default [`DEFAULT_WIF_ENV_PREFIX`].
     ///
@@ -894,11 +900,23 @@ pub(crate) fn env_key_suffix(client_id: &str) -> String {
 }
 
 /// Return the HTTP bind address and port, honouring `APP_ENV=docker`.
+///
+/// In a container a loopback address is replaced with `0.0.0.0`: loopback
+/// there is the container's own, which nothing published from the host can
+/// reach, so a config file written for a bare-metal run would otherwise give a
+/// container that answers nobody. Which host interfaces see the port is then
+/// decided where it is published (`run.sh` publishes it on the host's
+/// loopback). Any other configured address is honoured (CS-527): it used to be
+/// overridden to `0.0.0.0` too, so a container given a specific interface, or
+/// run with `--network host`, listened on every interface instead.
 pub fn web_bind_address(config: &Config) -> (Ipv4Addr, u16) {
     let port = config.web_interface.port;
+    let address = config.web_interface.address;
     match env::var_os("APP_ENV") {
-        Some(content) if content == "docker" => (Ipv4Addr::new(0, 0, 0, 0), port),
-        Some(_) | None => (config.web_interface.address, port),
+        Some(content) if content == "docker" && address.is_loopback() => {
+            (Ipv4Addr::UNSPECIFIED, port)
+        }
+        Some(_) | None => (address, port),
     }
 }
 
@@ -1104,6 +1122,28 @@ filename = "./data/dynamic.toml"
             ..Default::default()
         };
         assert_eq!(web_bind_address(&config), (Ipv4Addr::new(0, 0, 0, 0), 8080));
+        unsafe { env::remove_var("APP_ENV") };
+    }
+
+    /// CS-527: only a loopback address is replaced in a container. One the
+    /// operator chose -- a specific interface, say, under `--network host` --
+    /// is what the service binds.
+    #[test]
+    fn sr_cfg_003_web_bind_address_honours_a_non_loopback_address_in_docker() {
+        let _env = env_lock();
+        unsafe { env::set_var("APP_ENV", "docker") };
+        let config = Config {
+            web_interface: WebInterfaceConfig {
+                address: Ipv4Addr::new(10, 1, 2, 3),
+                port: 8080,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            web_bind_address(&config),
+            (Ipv4Addr::new(10, 1, 2, 3), 8080)
+        );
         unsafe { env::remove_var("APP_ENV") };
     }
 
@@ -1886,6 +1926,7 @@ filename = "./data/dynamic.toml"
             DynamicConfigConfig {
                 filename: "x".to_string(),
                 wif_env_prefix: prefix.to_string(),
+                ..Default::default()
             }
             .validate()
         };

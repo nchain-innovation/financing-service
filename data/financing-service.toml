@@ -47,6 +47,9 @@ utxo_refresh_period = 60
 
 [dynamic_config]
 filename = "./data/dynamic.toml"
+# POST /client stores env:VAR references only; a raw wif is refused unless this
+# is set, since the file would then hold the key itself. Development only.
+# allow_plaintext_wif = false
 
 # [[client]]
 # client_id = "id1"
