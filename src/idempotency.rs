@@ -190,12 +190,32 @@ impl IdempotencyStore {
             .retain(|_, entry| now.duration_since(entry.at()) < ttl);
     }
 
-    /// Make space for one new record, dropping the oldest if the store is full.
+    /// Make space for one new record when the store is full, by dropping the
+    /// oldest record of whichever client holds the most (CS-530).
+    ///
+    /// Dropping the globally oldest let one client evict the others: about
+    /// `max_entries` cheap fundings inside the TTL pushed out every other
+    /// client's records, and their retries then funded twice. Taking from the
+    /// biggest holder means a client flooding the store evicts its own.
     fn make_room_for_one(&mut self) {
         while self.entries.len() >= self.max_entries {
+            let mut held: HashMap<&str, usize> = HashMap::new();
+            for key in self.entries.keys() {
+                *held.entry(key.client_id.as_str()).or_default() += 1;
+            }
+            // Ties go to the client id that sorts first, so eviction does not
+            // depend on hash order.
+            let Some(biggest) = held
+                .into_iter()
+                .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(a.0)))
+                .map(|(client, _)| client.to_string())
+            else {
+                break;
+            };
             let oldest = self
                 .entries
                 .iter()
+                .filter(|(key, _)| key.client_id == biggest)
                 .min_by_key(|(_, entry)| entry.at())
                 .map(|(key, _)| key.clone());
             match oldest {
@@ -211,6 +231,10 @@ impl IdempotencyStore {
 /// Identity of a funding request, so an `idempotency_key` reused with different
 /// parameters is detected rather than silently answered with the earlier
 /// response.
+///
+/// A hash of the request rather than the request itself (CS-530), so a record
+/// costs the same whatever the scripts were: kept whole, one request paying
+/// many large scripts made one record that size, for the whole TTL.
 pub fn request_fingerprint(
     satoshi: u64,
     no_of_outpoints: u32,
@@ -219,11 +243,16 @@ pub fn request_fingerprint(
 ) -> String {
     // Every script is included, so two requests that differ only in which
     // scripts they pay cannot share a key.
-    format!(
+    let identity = format!(
         "{satoshi}:{no_of_outpoints}:{multiple_tx}:{}",
         locking_scripts.join(",")
-    )
+    );
+    chain_gang::util::sha256d(identity.as_bytes()).encode()
 }
+
+/// The longest `idempotency_key` accepted, in bytes (CS-530). Keys are
+/// retained for the TTL, so their size is memory a client chooses.
+pub const MAX_IDEMPOTENCY_KEY_BYTES: usize = 256;
 
 #[cfg(test)]
 mod tests {
@@ -339,6 +368,56 @@ mod tests {
             store.reserve(RecordKey::new("id1", format!("key{i}")), "fp");
         }
         assert_eq!(store.len(), 3);
+    }
+
+    /// CS-530: a client filling the store evicts its own records, not other
+    /// clients'.
+    #[test]
+    fn sr_sec_029_a_flooding_client_evicts_its_own_records() {
+        let mut store = IdempotencyStore::new(Duration::from_secs(600), 10);
+        let victim = RecordKey::new("victim", "their-retry");
+        store.reserve(victim.clone(), "fp");
+        std::thread::sleep(Duration::from_millis(2));
+        for i in 0..100 {
+            store.reserve(RecordKey::new("flooder", format!("k{i}")), "fp");
+        }
+        assert_eq!(store.len(), 10);
+        assert_eq!(
+            store.reserve(victim, "fp"),
+            Reservation::InProgress,
+            "the victim's record must survive the flood"
+        );
+    }
+
+    /// Among clients, the one holding the most loses its oldest.
+    #[test]
+    fn sr_sec_029_eviction_takes_the_biggest_holders_oldest() {
+        let mut store = IdempotencyStore::new(Duration::from_secs(600), 4);
+        store.reserve(RecordKey::new("a", "1"), "fp");
+        std::thread::sleep(Duration::from_millis(2));
+        store.reserve(RecordKey::new("b", "1"), "fp");
+        std::thread::sleep(Duration::from_millis(2));
+        store.reserve(RecordKey::new("b", "2"), "fp");
+        std::thread::sleep(Duration::from_millis(2));
+        store.reserve(RecordKey::new("b", "3"), "fp");
+        // Full: b holds three, so b's oldest goes, not a's older one.
+        store.reserve(RecordKey::new("c", "1"), "fp");
+        assert_eq!(
+            store.reserve(RecordKey::new("a", "1"), "fp"),
+            Reservation::InProgress
+        );
+        assert_eq!(
+            store.reserve(RecordKey::new("b", "1"), "fp"),
+            Reservation::Proceed
+        );
+    }
+
+    /// A record's size does not grow with the scripts it pays.
+    #[test]
+    fn sr_sec_029_the_fingerprint_is_a_fixed_size_hash() {
+        let big = vec!["ab".repeat(100_000)];
+        let fingerprint = request_fingerprint(1, 1, false, &big);
+        assert_eq!(fingerprint.len(), 64);
     }
 
     #[test]

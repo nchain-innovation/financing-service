@@ -650,6 +650,15 @@ pub struct RateLimitConfig {
     pub requests_per_second: u64,
     #[serde(default)]
     pub burst_size: Option<u32>,
+    /// Addresses of reverse proxies in front of this service (CS-530).
+    ///
+    /// A request arriving from one of them is limited by the client address
+    /// it reports in `X-Forwarded-For` -- the right-most entry that is not
+    /// itself a trusted proxy -- rather than by the proxy's own address, which
+    /// would put every caller in one bucket. From any other peer the header is
+    /// ignored, since anyone can send it.
+    #[serde(default)]
+    pub trusted_proxies: Vec<std::net::IpAddr>,
 }
 
 impl Default for RateLimitConfig {
@@ -658,6 +667,7 @@ impl Default for RateLimitConfig {
             enabled: false,
             requests_per_second: default_requests_per_second(),
             burst_size: None,
+            trusted_proxies: Vec::new(),
         }
     }
 }
@@ -732,6 +742,9 @@ pub struct Config {
     pub mapi_lite: Option<MapiLiteConfig>,
     #[serde(default)]
     pub fees: FeesConfig,
+    /// Per-client caps on what `POST /fund` pays out (CS-530). Off unless set.
+    #[serde(default)]
+    pub funding_limits: crate::funding_limits::FundingLimitsConfig,
 }
 
 impl Config {
@@ -920,11 +933,23 @@ pub(crate) fn env_key_suffix(client_id: &str) -> String {
 }
 
 /// Return the HTTP bind address and port, honouring `APP_ENV=docker`.
+///
+/// In a container a loopback address is replaced with `0.0.0.0`: loopback
+/// there is the container's own, which nothing published from the host can
+/// reach, so a config file written for a bare-metal run would otherwise give a
+/// container that answers nobody. Which host interfaces see the port is then
+/// decided where it is published (`run.sh` publishes it on the host's
+/// loopback). Any other configured address is honoured (CS-527): it used to be
+/// overridden to `0.0.0.0` too, so a container given a specific interface, or
+/// run with `--network host`, listened on every interface instead.
 pub fn web_bind_address(config: &Config) -> (Ipv4Addr, u16) {
     let port = config.web_interface.port;
+    let address = config.web_interface.address;
     match env::var_os("APP_ENV") {
-        Some(content) if content == "docker" => (Ipv4Addr::new(0, 0, 0, 0), port),
-        Some(_) | None => (config.web_interface.address, port),
+        Some(content) if content == "docker" && address.is_loopback() => {
+            (Ipv4Addr::UNSPECIFIED, port)
+        }
+        Some(_) | None => (address, port),
     }
 }
 
@@ -936,6 +961,7 @@ pub fn load_config(env_var: &str, filename: &str) -> Result<Config, String> {
     config.blockchain_interface.validate()?;
     config.fees.validate()?;
     config.dynamic_config.validate()?;
+    config.funding_limits.validate()?;
     config.check_auth_policy()?;
     if let Some(mapi_lite) = &config.mapi_lite {
         mapi_lite.validate()?;
@@ -1057,6 +1083,7 @@ mod tests {
             enabled: true,
             requests_per_second: 0,
             burst_size: None,
+            trusted_proxies: Vec::new(),
         };
         assert!(config.validate().is_err());
     }
@@ -1131,6 +1158,28 @@ filename = "./data/dynamic.toml"
             ..Default::default()
         };
         assert_eq!(web_bind_address(&config), (Ipv4Addr::new(0, 0, 0, 0), 8080));
+        unsafe { env::remove_var("APP_ENV") };
+    }
+
+    /// CS-527: only a loopback address is replaced in a container. One the
+    /// operator chose -- a specific interface, say, under `--network host` --
+    /// is what the service binds.
+    #[test]
+    fn sr_cfg_003_web_bind_address_honours_a_non_loopback_address_in_docker() {
+        let _env = env_lock();
+        unsafe { env::set_var("APP_ENV", "docker") };
+        let config = Config {
+            web_interface: WebInterfaceConfig {
+                address: Ipv4Addr::new(10, 1, 2, 3),
+                port: 8080,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            web_bind_address(&config),
+            (Ipv4Addr::new(10, 1, 2, 3), 8080)
+        );
         unsafe { env::remove_var("APP_ENV") };
     }
 

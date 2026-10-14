@@ -140,7 +140,7 @@ port = 8080
 # admin_api_key = "your-admin-secret"
 ```
 
-When `APP_ENV=docker`, the service listens on `0.0.0.0` regardless of `address`.
+When `APP_ENV=docker` (set by the image) and `address` is a loopback address, the service listens on `0.0.0.0` instead: a container's own loopback cannot be reached from the host. Which host interfaces then see the port is set where it is published — `run.sh` publishes it on the host's loopback. Any other `address` is honoured, so a container run with `--network host` and a specific address binds only that one.
 
 Bind to `127.0.0.1` or place the service behind a reverse proxy on a private network when exposing funding endpoints.
 
@@ -178,15 +178,17 @@ Optional per-IP rate limiting is configured under `[web_interface.rate_limit]`:
 enabled = true
 requests_per_second = 10
 burst_size = 20
+# trusted_proxies = ["10.0.0.1"]   # your reverse proxies, if any
 ```
 
 * `enabled` — turn rate limiting on or off (default: `false`)
 * `requests_per_second` — sustained request rate allowed per client IP
 * `burst_size` — maximum burst before limiting (defaults to `requests_per_second`)
+* `trusted_proxies` — addresses of the reverse proxies in front of the service (default: none)
 
 When enabled, excess requests receive HTTP 429 with a JSON error body. `/health` and `/ready` are exempt so container orchestration probes are not throttled.
 
-Behind a reverse proxy, the limit applies to the proxy's IP unless you configure the proxy to pass the original client address and implement a custom key extractor.
+Behind a reverse proxy, list the proxy in `trusted_proxies`; otherwise every caller arrives from the proxy's address and shares one limit. A request from a trusted proxy is limited by the client address it reports in `X-Forwarded-For`: the right-most entry that is not itself a trusted proxy, since entries further left were supplied by the client and could say anything. From any other address the header is ignored, so a caller cannot choose its own key by sending one.
 
 ## [logging]
 
@@ -311,9 +313,30 @@ max_entries = 10000
 ```
 
 * `ttl_seconds` — how long a completed record stays replayable. Should comfortably exceed your clients' retry window; too short and a legitimate retry funds a second time. Default `600`.
-* `max_entries` — upper bound on retained records, so a client sending a fresh `idempotency_key` on every request cannot grow the store without limit. When full, the oldest record is dropped. Default `10000`.
+* `max_entries` — upper bound on retained records, so a client sending a fresh `idempotency_key` on every request cannot grow the store without limit. When full, the oldest record of **whichever client holds the most** is dropped, so a client filling the store evicts its own records rather than other clients' (whose retries would then fund twice). Default `10000`.
+
+Each record holds a hash of the request rather than the request, and an `idempotency_key` may be at most 256 bytes, so a record's size does not depend on what the client sends.
 
 Records are held **in memory only** and are lost when the service restarts, so a retry that spans a restart can still produce a second funding transaction.
+
+## [funding_limits]
+
+Optional, and off unless set. Per-client caps on what `POST /fund` pays out — `satoshi` × `no_of_outpoints`, fees aside — so a leaked client API key is not worth the whole wallet in one call.
+
+```toml
+[funding_limits]
+max_satoshis_per_request = 100000     # one request
+max_satoshis_per_period = 1000000     # one client, within period_seconds
+period_seconds = 3600                 # default
+```
+
+* `max_satoshis_per_request` — a larger request is refused with `400` `invalid_request`.
+* `max_satoshis_per_period` — a request that would take the client past this within any `period_seconds` window is refused with `429` `rate_limited` and a `Retry-After` giving the soonest it could fit. A request's amount counts from the moment it is accepted, so concurrent requests cannot both slip under the limit, and is given back if nothing was broadcast. The window is held in memory and restarts with the service.
+* A limit of `0`, or a `period_seconds` of `0` with a period limit, is refused at startup.
+
+Whatever these say, no request may pay out more than the 21 million BSV that exist; one asking for more, or whose `satoshi` × `no_of_outpoints` overflows, is a `400`.
+
+The right values depend on what your clients fund. Event, for example, asks for one transaction's fee and outputs at a time — a few hundred satoshis.
 
 ## [fees]
 

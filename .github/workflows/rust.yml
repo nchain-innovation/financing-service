@@ -33,12 +33,35 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
+# The workflow token gets nothing unless a job asks for it (CS-528).
+permissions: {}
+
 jobs:
   build:
 
     runs-on: ubuntu-26.04
+    permissions:
+      contents: read  # for actions/checkout
 
+    # Every action is pinned by commit SHA, with the release it was taken from
+    # in a comment (CS-528). A tag can be moved to other code at any time, and
+    # this job hands one of these actions the mapi-lite deploy key: a moved tag
+    # could take the key, and the private source with it. To update one,
+    # resolve the new release's tag to its commit and replace both;
+    # `system_requirements::tests::sr_sec_027_*` fails on one that is not.
     steps:
+    # cargo audit reads only Cargo.lock, so it runs first -- before the deploy
+    # key is loaded, so the third-party installer never shares a job with the
+    # key in the agent. It used to run after.
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false  # no later step needs the token in .git/config
+    - name: Install cargo-audit
+      uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+      with:
+        tool: cargo-audit@0.22.2
+    - name: Audit dependencies
+      run: cargo audit
     # uls-client comes from the PRIVATE mapi-lite repo over SSH, so the
     # checkout is not what needs the credential -- the dependency fetch is.
     # Without the key, the first failure would be an opaque git error from
@@ -54,7 +77,6 @@ jobs:
                "MAPI_LITE_DEPLOY_KEY secret. See docs/Dependencies.md."
           exit 1
         fi
-    - uses: actions/checkout@v7
     # .cargo/config.toml sets net.git-fetch-with-cli = true, so the runner's
     # own git performs the fetch and picks the key up from the agent exactly
     # as a developer's git does. The action also writes github.com into
@@ -62,16 +84,13 @@ jobs:
     - name: Load the mapi-lite deploy key into ssh-agent
       # v0.10.0 is the release that moved to Node 24; v0.9.x ran on Node 20,
       # which GitHub is deprecating on its runners.
-      uses: webfactory/ssh-agent@v0.10.0
+      uses: webfactory/ssh-agent@e83874834305fe9a4a2997156cb26c5de65a8555 # v0.10.0
       with:
         ssh-private-key: ${{ secrets.MAPI_LITE_DEPLOY_KEY }}
     - name: Check formatting
       run: cargo fmt --all -- --check
     - name: Clippy
       run: cargo clippy --verbose -- -D warnings
-    - uses: taiki-e/install-action@cargo-audit
-    - name: Audit dependencies
-      run: cargo audit
     - name: Build
       run: cargo build --verbose
     - name: Run tests

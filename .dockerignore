@@ -1,0 +1,27 @@
+# What the image build may see (CS-527). Everything here is either rebuilt in
+# the image or must never reach it.
+
+# Version control and build output.
+.git
+.github
+target
+
+# Runtime state. dynamic*.toml can hold runtime clients' WIFs, and the
+# in-flight file the outpoints a wallet has just spent; neither belongs in a
+# build context, which is sent to the builder and can end up in its cache.
+data/dynamic*
+data/*.inflight.json
+data/*.tmp*
+
+# Key material and local configuration.
+certs
+*.pem
+*.key
+.env
+.env.*
+
+# Editor and OS clutter.
+.DS_Store
+*.swp
+out.txt
+tree.txt

@@ -104,3 +104,10 @@ filename = "./data/dynamic.toml"
 # [fees]
 # satoshis_per_kb = 100
 # use_mapi_fee_quote = true
+
+# Per-client caps on what POST /fund pays out (satoshi x no_of_outpoints).
+# Off unless set; see docs/Configuration.md.
+# [funding_limits]
+# max_satoshis_per_request = 100000
+# max_satoshis_per_period = 1000000
+# period_seconds = 3600
