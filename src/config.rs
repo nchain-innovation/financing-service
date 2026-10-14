@@ -650,6 +650,15 @@ pub struct RateLimitConfig {
     pub requests_per_second: u64,
     #[serde(default)]
     pub burst_size: Option<u32>,
+    /// Addresses of reverse proxies in front of this service (CS-530).
+    ///
+    /// A request arriving from one of them is limited by the client address
+    /// it reports in `X-Forwarded-For` -- the right-most entry that is not
+    /// itself a trusted proxy -- rather than by the proxy's own address, which
+    /// would put every caller in one bucket. From any other peer the header is
+    /// ignored, since anyone can send it.
+    #[serde(default)]
+    pub trusted_proxies: Vec<std::net::IpAddr>,
 }
 
 impl Default for RateLimitConfig {
@@ -658,6 +667,7 @@ impl Default for RateLimitConfig {
             enabled: false,
             requests_per_second: default_requests_per_second(),
             burst_size: None,
+            trusted_proxies: Vec::new(),
         }
     }
 }
@@ -724,6 +734,9 @@ pub struct Config {
     pub mapi_lite: Option<MapiLiteConfig>,
     #[serde(default)]
     pub fees: FeesConfig,
+    /// Per-client caps on what `POST /fund` pays out (CS-530). Off unless set.
+    #[serde(default)]
+    pub funding_limits: crate::funding_limits::FundingLimitsConfig,
 }
 
 impl Config {
@@ -915,6 +928,7 @@ pub fn load_config(env_var: &str, filename: &str) -> Result<Config, String> {
     config.blockchain_interface.validate()?;
     config.fees.validate()?;
     config.dynamic_config.validate()?;
+    config.funding_limits.validate()?;
     if let Some(mapi_lite) = &config.mapi_lite {
         mapi_lite.validate()?;
     }
@@ -1034,6 +1048,7 @@ mod tests {
             enabled: true,
             requests_per_second: 0,
             burst_size: None,
+            trusted_proxies: Vec::new(),
         };
         assert!(config.validate().is_err());
     }
