@@ -212,9 +212,9 @@ The first call reserves the key and, once the transaction is broadcast, retains 
 |---|---|
 | New key | Funds normally, and the response is retained |
 | Same key, same request, already funded | Replays the first response with `"replayed": true`; nothing is broadcast |
-| Same key, still being processed | `422` `key_in_progress` — retry shortly |
+| Same key, still being processed | `409` `key_in_progress` — retry shortly |
 | Same key, materially different request | `422` `idempotency_key_reused` — use a fresh `idempotency_key` |
-| Refused before anything was built (`insufficient_balance`, `no_suitable_utxo`, `funds_in_flight`) | The key is freed, so it can be retried |
+| Refused before anything was built (`insufficient_balance`, `no_suitable_utxo`, `funds_in_flight`), or the broadcast certainly did not land (`broadcast_rejected`, `broadcast_failed`) | The key is freed, so it can be retried |
 
 **A replayed response is marked.** It carries `"replayed": true`; an ordinary funding response omits the field entirely, so read its absence as false.
 
@@ -231,7 +231,7 @@ Keys are scoped per `client_id`, so two clients may choose the same string witho
 **Two limits worth knowing:**
 
 * **Records are held in memory and are lost when the service restarts.** A retry that spans a restart can still produce a second funding transaction. Retention is bounded by `[idempotency] ttl_seconds` (default 600) and `max_entries` (default 10000); see [Configuration](Configuration.md).
-* **After a failure that may have spent something, the key is not freed** — only the refusals listed above free it. Any other failure leaves the key reserved until its TTL expires, and a retry with it returns `key_in_progress`. This is deliberate: a broadcast may have reached the node before the connection dropped, so releasing the key could cause the duplicate this mechanism exists to prevent. Use a fresh `idempotency_key` if you need to retry sooner.
+* **After a failure that may have spent something, the key is not freed** — only the outcomes listed above free it. Any other failure leaves the key reserved until its TTL expires, and a retry with it returns `key_in_progress`. This is deliberate: a broadcast may have reached the node before the connection dropped, so releasing the key could cause the duplicate this mechanism exists to prevent. Use a fresh `idempotency_key` if you need to retry sooner.
 
 ### Error responses
 
@@ -256,7 +256,7 @@ The status is derived from the code, so a caller that cannot read the body — a
 | `unknown_client` | 404 / 400 | No such `client_id`. 404 where the id is a path segment, 400 where it is a body field | Fix configuration; never retryable as-is |
 | `client_exists` | 409 | `client_id` is already configured | `POST /client` only |
 | `invalid_request` | 400 | The request is malformed | Fix the request; never retryable unchanged |
-| `broadcast_failed` | 502 | The upstream could not be reached, or refused the transaction in a way it said was worth retrying | Nothing was spent; retry may succeed |
+| `broadcast_failed` | 502 | The transaction certainly did not reach a node: the upstream could not be reached, answered that no node can have received it, or refused it in a way it said was worth retrying. Anything that may have landed is `broadcast_outcome_unknown` instead (CS-501) | Nothing was spent; retry may succeed, with the same `idempotency_key` |
 | `broadcast_rejected` | 409 | The upstream looked at the transaction and refused it finally — either because it said so, or because it named a conflicting transaction | Nothing was spent, and **retrying will not help** — see below |
 | `broadcast_outcome_unknown` | 504 | The transaction was handed over and its fate is unknown — it may be on the network | **Do not retry with a new `idempotency_key`**; see below |
 | `partial_broadcast` | 422 | Some of the requested transactions broadcast, some did not | **Read the body** — the successful ones are in it |
@@ -333,12 +333,14 @@ Request body (JSON):
 | Field | Type | Description |
 |-------|------|-------------|
 | `client_id` | string | Identifier for the new client |
-| `wif` | string | WIF private key for the client's funding wallet. Refused with HTTP 400 unless `dynamic_config.allow_plaintext_wif` is set, since the file would then hold the key itself |
-| `wif_env` | string | Environment variable name containing the WIF; stored as `env:VAR` in dynamic config |
+| `wif` | string | WIF private key for the client's funding wallet (use `wif` or `wif_env`). Not an `env:` reference. Refused with HTTP 400 unless `dynamic_config.allow_plaintext_wif` is set, since the file would then hold the key itself |
+| `wif_env` | string | Environment variable name containing the WIF; stored as `env:VAR` in dynamic config. Must start with `dynamic_config.wif_env_prefix` (default `FS_RUNTIME_WIF_`) |
 | `api_key` | string | Optional shared secret for this client's API endpoints |
 | `api_key_env` | string | Environment variable name containing the client API key; stored as `env:VAR` in dynamic config |
 
 Provide either `wif` or `wif_env`, and either `api_key` or `api_key_env` (not both pairs).
+
+Refused as `invalid_request` (CS-521): a `wif_env` outside the prefix, a `wif` that is an `env:` reference, a key that is already another client's funding key, and a `client_id` that folds onto an existing client's environment variables.
 
 ```bash
 curl -H "Authorization: Bearer your-admin-api-key" \
