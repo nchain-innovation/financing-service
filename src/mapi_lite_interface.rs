@@ -291,10 +291,13 @@ mod tests {
 
     #[tokio::test]
     async fn sr_bchn_019_an_unreachable_mapi_lite_fails_status() {
-        let server = MockServer::start().await;
-        let uri = server.uri();
-        drop(server);
-        let config = MapiLiteConfig::for_base_url(uri);
+        // A port bound and released here, so nothing listens on it. Not a
+        // dropped MockServer: wiremock pools its servers, and a dropped one
+        // can still be listening, answering for another test.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let config = MapiLiteConfig::for_base_url(format!("http://127.0.0.1:{port}"));
         let interface = MapiLiteInterface::new(&config, Some(Duration::from_secs(2))).unwrap();
         assert!(interface.status().await.is_err());
     }
