@@ -599,6 +599,12 @@ fn is_public_key_hex(key: &str) -> bool {
 #[derive(Debug, Default, Deserialize, Clone)]
 pub struct DynamicConfigConfig {
     pub filename: String,
+    /// Whether `POST /client` may store a raw `wif` (CS-526). Off by default:
+    /// the dynamic config file would then hold the key itself, a copy that
+    /// outlives the request on a volume often bind-mounted from the host.
+    /// Off, only `wif_env` is accepted, which stores an `env:VAR` reference.
+    #[serde(default)]
+    pub allow_plaintext_wif: bool,
     /// The prefix every `wif_env` named on `POST /client` must start with
     /// (CS-521, SR-SEC-018). Default [`DEFAULT_WIF_ENV_PREFIX`].
     ///
@@ -1905,6 +1911,7 @@ filename = "./data/dynamic.toml"
             DynamicConfigConfig {
                 filename: "x".to_string(),
                 wif_env_prefix: prefix.to_string(),
+                ..Default::default()
             }
             .validate()
         };

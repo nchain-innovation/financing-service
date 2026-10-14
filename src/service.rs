@@ -334,7 +334,7 @@ impl Service {
             }
         }
 
-        let dynamic_config = DynamicConfig::new(config);
+        let dynamic_config = DynamicConfig::new(config)?;
         for client_config in &dynamic_config.contents.clients {
             crate::secrets::warn_plaintext_client_secrets(
                 &client_config.client_id,
@@ -758,6 +758,21 @@ impl Service {
     }
 
     pub async fn add_client(&self, client_config: &ClientConfig) -> Result<(), CodedError> {
+        // The dynamic config file would hold the key itself (CS-526). The
+        // message names neither the key nor any part of it (SR-SEC-010).
+        if !self
+            .dynamic_config
+            .lock()
+            .await
+            .accepts_wif(&client_config.wif_key)
+        {
+            return Err(CodedError::new(
+                ErrorCode::InvalidRequest,
+                "a raw wif would be stored in the dynamic config file; provide wif_env, naming \
+                 an environment variable that holds it, or set \
+                 dynamic_config.allow_plaintext_wif for development",
+            ));
+        }
         crate::secrets::warn_plaintext_client_secrets(
             &client_config.client_id,
             &client_config.wif_key,
@@ -1863,6 +1878,32 @@ mod tests {
     async fn service_with_watcher(config: &Config, watcher: Arc<RecordingWatcher>) -> Arc<Service> {
         let blockchain = test_blockchain_interface(config).await;
         Arc::new(Service::new_for_test_with_watcher(config, blockchain, Some(watcher)).await)
+    }
+
+    /// CS-526: a dynamic config file that does not parse stops the service
+    /// starting, rather than starting it without those clients -- and then
+    /// overwriting their WIFs on the next `POST /client`.
+    #[tokio::test]
+    async fn sr_sec_023_an_unparseable_dynamic_config_refuses_startup() {
+        use crate::broadcaster::woc::WocBroadcaster;
+        let path = unique_dynamic_config_path();
+        std::fs::write(&path, "[[clients]]\nclient_id = ").unwrap();
+        let config = test_config(&path);
+        let blockchain = test_blockchain_interface(&config).await;
+        let broadcaster: Arc<dyn TxBroadcaster> = Arc::new(WocBroadcaster::new(
+            Arc::clone(&blockchain),
+            &config.blockchain_interface.interface_type,
+        ));
+        let result = Service::build(
+            &config,
+            Backend {
+                interface: blockchain,
+                address_watcher: None,
+            },
+            broadcaster,
+        );
+        let err = result.err().expect("startup must fail");
+        assert!(err.contains("does not parse"), "{err}");
     }
 
     /// A node reports zero for an address it does not track, so the configured
