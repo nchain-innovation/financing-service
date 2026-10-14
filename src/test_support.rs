@@ -31,6 +31,12 @@ pub fn env_lock() -> MutexGuard<'static, ()> {
 pub const TEST_WIF: &str = "cTYmKQzX3CvHJAxe2sctsQaHG8ktiEnpXgyyycVXGg5pRcLJEeLd";
 pub const TEST_CLIENT_ID: &str = "id1";
 pub const TEST_ADDRESS: &str = "n1jaAsKZfE6kufLy5DAtAyQ1RzGXwMeNAF";
+
+/// A second wallet, for a client added alongside the first. Two clients may not
+/// share one (CS-521). Private key 2, as throwaway as `MAPI_TEST_SIGNER_WIF`'s
+/// key 1; testnet, compressed.
+pub const OTHER_TEST_WIF: &str = "cMahea7zqjxrtgAbB7LSGbcQUr1uX1ojuat9jZodMN87K7XCyj5v";
+pub const OTHER_TEST_ADDRESS: &str = "mg8Jz5776UdyiYcBb9Z873NTozEiADRW5H";
 pub const LOCKING_SCRIPT_HEX: &str = "76a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac";
 
 /// Signs the envelopes a mock mapi-lite returns. Any valid WIF will do: the
@@ -91,6 +97,7 @@ pub fn test_config_with_keys(
         }]),
         dynamic_config: DynamicConfigConfig {
             filename: dynamic_filename.to_string(),
+            wif_env_prefix: crate::config::DEFAULT_WIF_ENV_PREFIX.to_string(),
         },
         ..Default::default()
     }
@@ -162,6 +169,9 @@ pub async fn test_blockchain_interface(
     blockchain_interface.set_network(&config.get_network().unwrap());
     blockchain_interface
         .set_utxo(TEST_ADDRESS, &test_utxo())
+        .await;
+    blockchain_interface
+        .set_utxo(OTHER_TEST_ADDRESS, &test_utxo())
         .await;
     blockchain_interface.set_height(1517571).await;
     Arc::new(blockchain_interface)
@@ -322,6 +332,69 @@ impl BlockchainInterface for GatedBlockchain {
         self.inner.get_utxo(address).await
     }
 
+    /// Held at the gate too, so a test can stand in for a broadcast the
+    /// interface accepts and never answers (CS-502). Counted on arrival, like
+    /// reads.
+    async fn broadcast_tx(&self, tx: &Tx) -> Result<String, ChainGangError> {
+        self.open
+            .subscribe()
+            .wait_for(|open| *open)
+            .await
+            .expect("the gate outlives its readers");
+        self.inner.broadcast_tx(tx).await
+    }
+
+    async fn get_tx(&self, txid: &str) -> Result<Tx, ChainGangError> {
+        self.inner.get_tx(txid).await
+    }
+
+    async fn get_latest_block_header(&self) -> Result<BlockHeader, ChainGangError> {
+        self.inner.get_latest_block_header().await
+    }
+
+    async fn get_block_headers(&self) -> Result<String, ChainGangError> {
+        self.inner.get_block_headers().await
+    }
+}
+
+/// Where [`UnreadableBlockchain`] says it failed to connect: an internal
+/// address of the kind a real chain-read error carries, which a test can look
+/// for in a response to prove it did not leak.
+pub const UNREADABLE_CHAIN_URL: &str = "http://10.20.30.40:18332/";
+
+/// Test blockchain whose unspent set cannot be read, as when WhatsOnChain or
+/// the node behind the blockchain interface is down. The error names the
+/// address it could not reach, as reqwest's does.
+pub struct UnreadableBlockchain {
+    inner: Arc<CountingBlockchain>,
+}
+
+impl UnreadableBlockchain {
+    pub async fn new(config: &Config) -> Arc<Self> {
+        Arc::new(Self {
+            inner: CountingBlockchain::new(config).await,
+        })
+    }
+}
+
+#[async_trait]
+impl BlockchainInterface for UnreadableBlockchain {
+    fn set_network(&mut self, _network: &Network) {}
+
+    async fn status(&self) -> Result<(), ChainGangError> {
+        self.inner.status().await
+    }
+
+    async fn get_balance(&self, address: &str) -> Result<Balance, ChainGangError> {
+        self.inner.get_balance(address).await
+    }
+
+    async fn get_utxo(&self, _address: &str) -> Result<Utxo, ChainGangError> {
+        Err(ChainGangError::BadArgument(format!(
+            "error sending request for url ({UNREADABLE_CHAIN_URL})"
+        )))
+    }
+
     async fn broadcast_tx(&self, tx: &Tx) -> Result<String, ChainGangError> {
         self.inner.broadcast_tx(tx).await
     }
@@ -473,6 +546,60 @@ impl TxBroadcaster for FailingBroadcaster {
     async fn health_check(&self) -> Result<(), BroadcastError> {
         Ok(())
     }
+}
+
+/// Broadcaster that answers from a script, one answer per call, and records
+/// every transaction it was handed. Accepts once the script runs out.
+pub struct ScriptedBroadcaster {
+    answers: std::sync::Mutex<std::collections::VecDeque<Option<BroadcastError>>>,
+    sent: std::sync::Mutex<Vec<Tx>>,
+}
+
+impl ScriptedBroadcaster {
+    /// `None` accepts; `Some(error)` refuses with it.
+    pub fn new(answers: Vec<Option<BroadcastError>>) -> Arc<Self> {
+        Arc::new(Self {
+            answers: std::sync::Mutex::new(answers.into()),
+            sent: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    pub fn sent(&self) -> Vec<Tx> {
+        self.sent.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl TxBroadcaster for ScriptedBroadcaster {
+    fn name(&self) -> &str {
+        "scripted"
+    }
+
+    async fn broadcast_tx(&self, tx: &Tx) -> Result<String, BroadcastError> {
+        self.sent.lock().unwrap().push(tx.clone());
+        match self.answers.lock().unwrap().pop_front().flatten() {
+            Some(error) => Err(error),
+            None => Ok(tx.hash().encode()),
+        }
+    }
+
+    async fn health_check(&self) -> Result<(), BroadcastError> {
+        Ok(())
+    }
+}
+
+/// The test blockchain, listing `utxos` for the test client's address.
+pub async fn blockchain_listing(
+    config: &Config,
+    utxos: &[UtxoEntry],
+) -> Arc<dyn BlockchainInterface + Send + Sync> {
+    let mut blockchain_interface = TestInterface::new();
+    blockchain_interface.set_network(&config.get_network().unwrap());
+    blockchain_interface
+        .set_utxo(TEST_ADDRESS, &utxos.to_vec())
+        .await;
+    blockchain_interface.set_height(1517571).await;
+    Arc::new(blockchain_interface)
 }
 
 /// Broadcaster whose upstream refuses every transaction.

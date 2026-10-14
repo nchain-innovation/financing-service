@@ -40,7 +40,19 @@ pub struct BlockchainInterfaceConfig {
     /// `0` to turn the limit off.
     #[serde(default)]
     pub max_requests_per_second: Option<u32>,
+    /// Deadline on each call to the interface, in seconds (CS-502). Unset
+    /// means [`DEFAULT_INTERFACE_TIMEOUT_SECONDS`]; `0` turns it off.
+    ///
+    /// A call that outlives it fails as a chain failure, so a read that is
+    /// accepted and never answered cannot hold a client's refresh forever.
+    /// It bounds a whole call, which for WhatsOnChain's paged UTXO listing is
+    /// several paced requests, so leave room for the largest address.
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
 }
+
+/// The per-call deadline when `timeout_seconds` is unset (CS-502).
+pub const DEFAULT_INTERFACE_TIMEOUT_SECONDS: u64 = 30;
 
 fn default_rpc_import_addresses() -> bool {
     true
@@ -61,6 +73,7 @@ impl Default for BlockchainInterfaceConfig {
             rpc_password: None,
             rpc_import_addresses: default_rpc_import_addresses(),
             max_requests_per_second: None,
+            timeout_seconds: None,
         }
     }
 }
@@ -71,6 +84,18 @@ impl BlockchainInterfaceConfig {
     /// An explicit setting always wins, including an explicit `0` meaning
     /// unlimited. Otherwise only the interfaces that call somebody else's
     /// server are limited.
+    /// The deadline on each interface call, or `None` when it is turned off
+    /// (CS-502).
+    pub fn call_timeout(&self) -> Option<std::time::Duration> {
+        match self
+            .timeout_seconds
+            .unwrap_or(DEFAULT_INTERFACE_TIMEOUT_SECONDS)
+        {
+            0 => None,
+            seconds => Some(std::time::Duration::from_secs(seconds)),
+        }
+    }
+
     pub fn outbound_rate_limit(&self) -> Option<u32> {
         match self.max_requests_per_second {
             Some(0) => None,
@@ -234,6 +259,14 @@ pub struct FeesConfig {
     /// no effect, because there is nothing to ask.
     #[serde(default = "default_use_mapi_fee_quote")]
     pub use_mapi_fee_quote: bool,
+    /// The highest rate a mapi-lite fee quote may set, in satoshis per KB
+    /// (CS-523, SR-SEC-020). A quote above it is ignored and the current rate
+    /// kept, so a forged or mistaken quote cannot make every funding
+    /// transaction overpay. Default 1000: ten times `satoshis_per_kb`'s
+    /// default, and a thousand times mapi-lite's own default quote. Must be at
+    /// least `satoshis_per_kb`.
+    #[serde(default = "default_max_satoshis_per_kb")]
+    pub max_satoshis_per_kb: u64,
 }
 
 impl Default for FeesConfig {
@@ -241,6 +274,7 @@ impl Default for FeesConfig {
         FeesConfig {
             satoshis_per_kb: default_satoshis_per_kb(),
             use_mapi_fee_quote: default_use_mapi_fee_quote(),
+            max_satoshis_per_kb: default_max_satoshis_per_kb(),
         }
     }
 }
@@ -254,6 +288,12 @@ impl FeesConfig {
                         transaction paying no fee is not relayed."
                 .to_string());
         }
+        if self.max_satoshis_per_kb < self.satoshis_per_kb {
+            return Err(format!(
+                "fees.max_satoshis_per_kb ({}) must be at least satoshis_per_kb ({})",
+                self.max_satoshis_per_kb, self.satoshis_per_kb
+            ));
+        }
         Ok(())
     }
 }
@@ -265,6 +305,13 @@ impl FeesConfig {
 /// section pays less than it used to, which is the point of CS-451, but it is
 /// a behaviour change and not only a refactor.
 pub const DEFAULT_SATOSHIS_PER_KB: u64 = 100;
+
+/// See [`FeesConfig::max_satoshis_per_kb`].
+pub const DEFAULT_MAX_SATOSHIS_PER_KB: u64 = 1000;
+
+fn default_max_satoshis_per_kb() -> u64 {
+    DEFAULT_MAX_SATOSHIS_PER_KB
+}
 
 fn default_satoshis_per_kb() -> u64 {
     DEFAULT_SATOSHIS_PER_KB
@@ -349,6 +396,13 @@ pub struct MapiLiteConfig {
     /// open for minutes. Must be at least `timeout_seconds`.
     #[serde(default = "default_mapi_lite_total_timeout_seconds")]
     pub total_timeout_seconds: u64,
+    /// mapi-lite's miner-ID public keys, as hex: the `minerId` in every
+    /// response it signs (CS-523, SR-SEC-019). A response signed by any other
+    /// key is refused. Several allow a rotation. Empty -- the default -- accepts
+    /// any valid signature, which proves nothing about the sender, so the
+    /// service warns at startup.
+    #[serde(default)]
+    pub miner_id_public_keys: Vec<String>,
 }
 
 /// One attempt's ceiling.
@@ -398,6 +452,7 @@ impl MapiLiteConfig {
             health_timeout_seconds: default_mapi_lite_health_timeout_seconds(),
             max_retries: default_mapi_lite_max_retries(),
             total_timeout_seconds: default_mapi_lite_total_timeout_seconds(),
+            miner_id_public_keys: Vec::new(),
         }
     }
 
@@ -506,13 +561,78 @@ impl MapiLiteConfig {
                 self.total_timeout_seconds, self.timeout_seconds
             ));
         }
+        for key in &self.miner_id_public_keys {
+            if !is_public_key_hex(key) {
+                return Err(format!(
+                    "mapi_lite.miner_id_public_keys: {key:?} is not a public key in hex \
+                     (33 bytes starting 02 or 03, or 65 starting 04)"
+                ));
+            }
+        }
         Ok(())
     }
+
+    /// The startup warning for a section that names no miner ID (CS-523).
+    pub fn unpinned_warning(&self) -> Option<&'static str> {
+        self.miner_id_public_keys.is_empty().then_some(
+            "mapi_lite.miner_id_public_keys is empty: responses from mapi-lite are signed, but \
+             by a key nothing checks, so anyone able to answer in its place can forge an \
+             'accepted' or a fee quote. Set it to mapi-lite's minerId.",
+        )
+    }
+}
+
+/// A secp256k1 public key in hex: compressed (33 bytes, `02`/`03`) or
+/// uncompressed (65 bytes, `04`). The shape only; whether it is on the curve is
+/// for the signature check to find out.
+fn is_public_key_hex(key: &str) -> bool {
+    let key = key.trim();
+    let hex_ok = key.chars().all(|c| c.is_ascii_hexdigit());
+    hex_ok
+        && match key.len() {
+            66 => key.starts_with("02") || key.starts_with("03"),
+            130 => key.starts_with("04"),
+            _ => false,
+        }
 }
 
 #[derive(Debug, Default, Deserialize, Clone)]
 pub struct DynamicConfigConfig {
     pub filename: String,
+    /// The prefix every `wif_env` named on `POST /client` must start with
+    /// (CS-521, SR-SEC-018). Default [`DEFAULT_WIF_ENV_PREFIX`].
+    ///
+    /// Without it, `wif_env` could name any variable in the process
+    /// environment -- another client's `FS_CLIENT_<ID>_WIF` among them -- and
+    /// whoever could add a client could fund from that wallet under a key of
+    /// their own. With it, only variables the operator has set aside for
+    /// runtime clients can be named. It may not overlap `FS_CLIENT_`.
+    #[serde(default = "default_wif_env_prefix")]
+    pub wif_env_prefix: String,
+}
+
+/// See [`DynamicConfigConfig::wif_env_prefix`].
+pub const DEFAULT_WIF_ENV_PREFIX: &str = "FS_RUNTIME_WIF_";
+
+fn default_wif_env_prefix() -> String {
+    DEFAULT_WIF_ENV_PREFIX.to_string()
+}
+
+impl DynamicConfigConfig {
+    /// The prefix must be a usable variable-name start that no per-client
+    /// override (`FS_CLIENT_<ID>_WIF`) can begin with.
+    pub fn validate(&self) -> Result<(), String> {
+        let prefix = &self.wif_env_prefix;
+        crate::secrets::validate_env_var_name(prefix)
+            .map_err(|e| format!("dynamic_config.wif_env_prefix: {e}"))?;
+        if prefix.starts_with(CLIENT_ENV_PREFIX) || CLIENT_ENV_PREFIX.starts_with(prefix.as_str()) {
+            return Err(format!(
+                "dynamic_config.wif_env_prefix {prefix:?} overlaps {CLIENT_ENV_PREFIX:?}, the \
+                 prefix of every client's own key variable"
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Per-IP HTTP rate limiting configuration.
@@ -730,15 +850,24 @@ fn resolve_client_config(mut client: ClientConfig) -> Result<ClientConfig, Strin
     Ok(client)
 }
 
+/// What every per-client environment override starts with.
+const CLIENT_ENV_PREFIX: &str = "FS_CLIENT_";
+
 fn client_wif_env_var(client_id: &str) -> String {
-    format!("FS_CLIENT_{}_WIF", env_key_suffix(client_id))
+    format!("{CLIENT_ENV_PREFIX}{}_WIF", env_key_suffix(client_id))
 }
 
 fn client_api_key_env_var(client_id: &str) -> String {
-    format!("FS_CLIENT_{}_API_KEY", env_key_suffix(client_id))
+    format!("{CLIENT_ENV_PREFIX}{}_API_KEY", env_key_suffix(client_id))
 }
 
-fn env_key_suffix(client_id: &str) -> String {
+/// The part of a client's override variables that comes from its id.
+///
+/// Not one-to-one: case and punctuation fold, so `id.1` and `ID_1` share
+/// `FS_CLIENT_ID_1_WIF`. Two clients that fold together would both take
+/// whatever key that variable holds, so `POST /client` refuses an id that
+/// folds onto an existing client's (CS-521).
+pub(crate) fn env_key_suffix(client_id: &str) -> String {
     client_id
         .chars()
         .map(|ch| {
@@ -767,6 +896,7 @@ pub fn load_config(env_var: &str, filename: &str) -> Result<Config, String> {
     config.idempotency.validate()?;
     config.blockchain_interface.validate()?;
     config.fees.validate()?;
+    config.dynamic_config.validate()?;
     if let Some(mapi_lite) = &config.mapi_lite {
         mapi_lite.validate()?;
     }
@@ -1044,6 +1174,25 @@ filename = "./data/dynamic.toml"
         )
         .unwrap();
         assert!(config.rpc_import_addresses);
+    }
+
+    #[test]
+    fn cs_502_the_interface_deadline_defaults_to_30s_and_0_turns_it_off() {
+        let unset = BlockchainInterfaceConfig::default();
+        assert_eq!(
+            unset.call_timeout(),
+            Some(std::time::Duration::from_secs(30))
+        );
+        let off = BlockchainInterfaceConfig {
+            timeout_seconds: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(off.call_timeout(), None);
+        let set = BlockchainInterfaceConfig {
+            timeout_seconds: Some(7),
+            ..Default::default()
+        };
+        assert_eq!(set.call_timeout(), Some(std::time::Duration::from_secs(7)));
     }
 
     #[test]
@@ -1665,5 +1814,70 @@ filename = "./data/dynamic.toml"
         assert_eq!(service(10, None).ready_max_chain_read_age(), secs(60));
         assert_eq!(service(60, Some(45)).ready_max_chain_read_age(), secs(45));
         assert_eq!(service(60, Some(0)).ready_max_chain_read_age(), None);
+    }
+
+    /// Miner IDs must look like public keys, so a typo is caught at startup
+    /// rather than refusing every response (CS-523).
+    #[test]
+    fn sr_sec_019_miner_id_public_keys_must_be_public_keys() {
+        let check = |keys: &[&str]| {
+            let mut config = MapiLiteConfig::for_base_url("http://mapi-lite");
+            config.miner_id_public_keys = keys.iter().map(|k| k.to_string()).collect();
+            config.validate()
+        };
+        let good = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        assert!(check(&[]).is_ok());
+        assert!(check(&[good]).is_ok());
+        assert!(check(&[&good.to_uppercase()]).is_ok());
+        assert!(check(&[&format!("04{}", "ab".repeat(64))]).is_ok());
+        for bad in [
+            "02abc",
+            &format!("05{}", &good[2..]),
+            &format!("{}zz", &good[..64]),
+            &format!("04{}", "ab".repeat(32)),
+        ] {
+            assert!(check(&[good, bad]).is_err(), "{bad:?} was accepted");
+        }
+    }
+
+    /// Unpinned is allowed, and said so.
+    #[test]
+    fn sr_sec_019_an_unpinned_section_is_warned_about() {
+        let mut config = MapiLiteConfig::for_base_url("http://mapi-lite");
+        assert!(config.unpinned_warning().is_some());
+        config.miner_id_public_keys =
+            vec!["0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".to_string()];
+        assert!(config.unpinned_warning().is_none());
+    }
+
+    /// The fee ceiling may not sit below the rate it caps.
+    #[test]
+    fn sr_sec_020_the_fee_ceiling_is_at_least_the_configured_rate() {
+        let fees = |rate, max| FeesConfig {
+            satoshis_per_kb: rate,
+            max_satoshis_per_kb: max,
+            ..FeesConfig::default()
+        };
+        assert!(FeesConfig::default().validate().is_ok());
+        assert!(fees(100, 100).validate().is_ok());
+        assert!(fees(100, 99).validate().is_err());
+    }
+
+    /// The runtime-client prefix may not be one a client's own override
+    /// variable (`FS_CLIENT_<ID>_WIF`) could start with (CS-521).
+    #[test]
+    fn sr_sec_018_wif_env_prefix_may_not_overlap_client_variables() {
+        let check = |prefix: &str| {
+            DynamicConfigConfig {
+                filename: "x".to_string(),
+                wif_env_prefix: prefix.to_string(),
+            }
+            .validate()
+        };
+        assert!(check(DEFAULT_WIF_ENV_PREFIX).is_ok());
+        assert!(check("MY_RUNTIME_KEYS_").is_ok());
+        for bad in ["FS_CLIENT_", "FS_CLIENT_ID1_", "FS_CLIENT", "FS_", "F", ""] {
+            assert!(check(bad).is_err(), "{bad:?} was accepted");
+        }
     }
 }

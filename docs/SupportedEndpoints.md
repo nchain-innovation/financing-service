@@ -136,7 +136,7 @@ Creates one or more funding transactions. Request body (JSON):
 |-------|------|-------------|
 | `client_id` | string | Client whose wallet funds the transaction |
 | `satoshi` | number | Value in satoshis for each funding output |
-| `no_of_outpoints` | number | Number of funding outpoints to provide |
+| `no_of_outpoints` | number | Number of funding outpoints to provide, at most **1000**. The locking scripts across all of them may total at most **1 MiB** (SR-SEC-017) |
 | `multiple_tx` | boolean | If true and `no_of_outpoints` > 1, create separate transactions |
 | `locking_script` | string | Hex-encoded locking script for the funding outputs |
 
@@ -193,7 +193,7 @@ This matters when each funded output is spent by a different transaction. Output
 
 With `multiple_tx: true` the scripts are paid one per transaction rather than one per output of a single transaction.
 
-Rejected as `invalid_request`: supplying both fields, supplying neither, an empty `locking_scripts` list, and a `no_of_outpoints` that disagrees with the list length.
+Rejected as `invalid_request`: supplying both fields, supplying neither, an empty `locking_scripts` list, a `no_of_outpoints` that disagrees with the list length, more than 1000 outpoints, and locking scripts totalling more than 1 MiB (a single `locking_script` counts once per outpoint). The client and its API key are checked first, so an unknown or unauthenticated caller is refused before any of this is looked at (CS-519).
 
 ### Idempotency
 
@@ -214,7 +214,7 @@ The first call reserves the key and, once the transaction is broadcast, retains 
 | Same key, same request, already funded | Replays the first response with `"replayed": true`; nothing is broadcast |
 | Same key, still being processed | `409` `key_in_progress` — retry shortly |
 | Same key, materially different request | `409` `idempotency_key_reused` — use a fresh `idempotency_key` |
-| Refused before anything was built (`insufficient_balance`, `no_suitable_utxo`, `funds_in_flight`) | The key is freed, so it can be retried |
+| Refused before anything was built (`insufficient_balance`, `no_suitable_utxo`, `funds_in_flight`), or the broadcast certainly did not land (`broadcast_rejected`, `broadcast_failed`) | The key is freed, so it can be retried |
 
 **A replayed response is marked.** It carries `"replayed": true`; an ordinary funding response omits the field entirely, so read its absence as false.
 
@@ -231,7 +231,7 @@ Keys are scoped per `client_id`, so two clients may choose the same string witho
 **Two limits worth knowing:**
 
 * **Records are held in memory and are lost when the service restarts.** A retry that spans a restart can still produce a second funding transaction. Retention is bounded by `[idempotency] ttl_seconds` (default 600) and `max_entries` (default 10000); see [Configuration](Configuration.md).
-* **After a failure that may have spent something, the key is not freed** — only the refusals listed above free it. Any other failure leaves the key reserved until its TTL expires, and a retry with it returns `key_in_progress`. This is deliberate: a broadcast may have reached the node before the connection dropped, so releasing the key could cause the duplicate this mechanism exists to prevent. Use a fresh `idempotency_key` if you need to retry sooner.
+* **After a failure that may have spent something, the key is not freed** — only the outcomes listed above free it. Any other failure leaves the key reserved until its TTL expires, and a retry with it returns `key_in_progress`. This is deliberate: a broadcast may have reached the node before the connection dropped, so releasing the key could cause the duplicate this mechanism exists to prevent. Use a fresh `idempotency_key` if you need to retry sooner.
 
 ### Error responses
 
@@ -256,11 +256,11 @@ The status is derived from the code, so a caller that cannot read the body — a
 | `unknown_client` | 404 / 400 | No such `client_id`. 404 where the id is a path segment, 400 where it is a body field | Fix configuration; never retryable as-is |
 | `client_exists` | 409 | `client_id` is already configured | `POST /client` only |
 | `invalid_request` | 400 | The request is malformed | Fix the request; never retryable unchanged |
-| `broadcast_failed` | 502 | The upstream could not be reached, or refused the transaction in a way it said was worth retrying | Nothing was spent; retry may succeed |
+| `broadcast_failed` | 502 | The transaction certainly did not reach a node: the upstream could not be reached, answered that no node can have received it, or refused it in a way it said was worth retrying. Anything that may have landed is `broadcast_outcome_unknown` instead (CS-501) | Nothing was spent; retry may succeed, with the same `idempotency_key` |
 | `broadcast_rejected` | 409 | The upstream looked at the transaction and refused it finally — either because it said so, or because it named a conflicting transaction | Nothing was spent, and **retrying will not help** — see below |
 | `broadcast_outcome_unknown` | 504 | The transaction was handed over and its fate is unknown — it may be on the network | **Do not retry with a new `idempotency_key`**; see below |
 | `partial_broadcast` | 422 | Some of the requested transactions broadcast, some did not | **Read the body** — the successful ones are in it |
-| `chain_unavailable` | 503 | The blockchain interface could not be reached | Retryable |
+| `chain_unavailable` | 503 | The blockchain interface could not be reached. The description is fixed; the read's own error, which names the interface's address, is in the service log | Retryable |
 | `internal` | 500 | Unexpected internal failure | Report it |
 | `unauthorized` | 401 | Authentication missing or invalid | Fix credentials |
 | `rate_limited` | 429 | Request rate exceeded | Retry after the interval in `description` |
@@ -333,12 +333,14 @@ Request body (JSON):
 | Field | Type | Description |
 |-------|------|-------------|
 | `client_id` | string | Identifier for the new client |
-| `wif` | string | WIF private key for the client's funding wallet (use `wif` or `wif_env`) |
-| `wif_env` | string | Environment variable name containing the WIF; stored as `env:VAR` in dynamic config |
+| `wif` | string | WIF private key for the client's funding wallet (use `wif` or `wif_env`). Not an `env:` reference |
+| `wif_env` | string | Environment variable name containing the WIF; stored as `env:VAR` in dynamic config. Must start with `dynamic_config.wif_env_prefix` (default `FS_RUNTIME_WIF_`) |
 | `api_key` | string | Optional shared secret for this client's API endpoints |
 | `api_key_env` | string | Environment variable name containing the client API key; stored as `env:VAR` in dynamic config |
 
 Provide either `wif` or `wif_env`, and either `api_key` or `api_key_env` (not both pairs).
+
+Refused as `invalid_request` (CS-521): a `wif_env` outside the prefix, a `wif` that is an `env:` reference, a key that is already another client's funding key, and a `client_id` that folds onto an existing client's environment variables.
 
 ```bash
 curl -H "Authorization: Bearer your-admin-api-key" \
@@ -410,6 +412,8 @@ curl -H "Authorization: Bearer your-client-api-key" \
 ```
 
 **Unconfirmed outputs are spendable.** `POST /fund` draws on the whole unspent set, so `max_fundable` counts `unconfirmed` as well as `confirmed`, and a funding request can be satisfied entirely from outputs that are still in the mempool. That is deliberate — a funding service that waited for confirmation would be unusable on a chain where its own change output is the next input — but it does mean a funded outpoint can depend on a parent transaction that has not been mined. Callers that need confirmed inputs specifically should check `confirmed` before requesting.
+
+If such a parent never makes it — a conflict, an eviction or a reorg drops it — the node refuses the next spend of its change as missing inputs. That request fails (`broadcast_failed` or `broadcast_rejected`, as the upstream judged it retryable or not), and the service forgets the change (and any change built on it) instead of offering it again, so the request after it funds from another input (CS-506).
 
 Both figures are **derived from the unspent set**, not asked for separately. A separate balance query can disagree with the UTXOs it is meant to describe — WhatsOnChain's `/address/{address}/balance` is deprecated and was reporting `unconfirmed: 0` for addresses whose unspent set plainly held unconfirmed outputs — and when they disagree, the unspent set is the one that decides what can be funded. Deriving means `confirmed`, `unconfirmed` and `max_fundable` always describe the same set of coins, and that the balance reflects a funding transaction the moment it spends from them rather than at the next refresh.
 

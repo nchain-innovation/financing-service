@@ -121,6 +121,8 @@ pub struct Service {
     broadcaster: Arc<dyn TxBroadcaster>,
     clients: RwLock<HashMap<String, Arc<RwLock<Client>>>>,
     dynamic_config: Mutex<DynamicConfig>,
+    /// `dynamic_config.wif_env_prefix` (CS-521).
+    wif_env_prefix: String,
     admin_api_key: Option<String>,
     idempotency: Mutex<IdempotencyStore>,
     /// Set only for backends that must be told which addresses to follow.
@@ -153,6 +155,8 @@ pub struct Service {
     fee_satoshis_per_kb: Mutex<u64>,
     /// Whether to take the rate from mapi-lite's fee quote when there is one.
     use_mapi_fee_quote: bool,
+    /// `fees.max_satoshis_per_kb`: no quote may set a rate above it (CS-523).
+    max_satoshis_per_kb: u64,
     /// Where each client's in-flight funding state is kept across a restart
     /// (CS-465). See [`Config::inflight_state_path`].
     inflight_state_path: PathBuf,
@@ -267,6 +271,31 @@ struct CachedHealth {
     verdict: Result<(), String>,
 }
 
+/// Funding wallets held by more than one client, each with the clients that
+/// hold it, sorted (CS-521). Read at startup, when nothing else holds the
+/// locks; a client whose lock is taken is left out rather than waited for.
+fn wallets_shared_by(clients: &HashMap<String, Arc<RwLock<Client>>>) -> Vec<(String, Vec<String>)> {
+    let mut by_address: HashMap<String, Vec<String>> = HashMap::new();
+    for (id, client) in clients {
+        if let Ok(client) = client.try_read() {
+            by_address
+                .entry(client.get_address())
+                .or_default()
+                .push(id.clone());
+        }
+    }
+    let mut shared: Vec<_> = by_address
+        .into_iter()
+        .filter(|(_, ids)| ids.len() > 1)
+        .map(|(address, mut ids)| {
+            ids.sort();
+            (address, ids)
+        })
+        .collect();
+    shared.sort();
+    shared
+}
+
 impl Service {
     fn build(
         config: &Config,
@@ -322,6 +351,19 @@ impl Service {
             );
         }
 
+        // Clients that share a wallet cannot be told apart by the service and
+        // will spend each other's coins. `POST /client` now refuses them
+        // (CS-521), but a pair added before that is still in the dynamic
+        // config: say so loudly, without refusing to start a deployment that
+        // may be serving.
+        for (address, ids) in wallets_shared_by(&clients) {
+            log::error!(
+                "clients {ids:?} share one funding wallet ({address}): they will spend each \
+                 other's coins, and one may have been added to take over the other's. Remove \
+                 the one that should not be there from the dynamic config."
+            );
+        }
+
         Ok(Service {
             blockchain_status: RwLock::new(BlockchainConnectionStatus::Unknown),
             blockchain_update_time: RwLock::new(None),
@@ -329,6 +371,7 @@ impl Service {
             broadcaster,
             clients: RwLock::new(clients),
             dynamic_config: Mutex::new(dynamic_config),
+            wif_env_prefix: config.dynamic_config.wif_env_prefix.clone(),
             admin_api_key: config
                 .web_interface
                 .admin_api_key
@@ -346,6 +389,7 @@ impl Service {
             chain_refresh_locks: std::sync::Mutex::new(HashMap::new()),
             fee_satoshis_per_kb: Mutex::new(config.fees.satoshis_per_kb),
             use_mapi_fee_quote: config.fees.use_mapi_fee_quote,
+            max_satoshis_per_kb: config.fees.max_satoshis_per_kb,
             inflight_state_path,
             inflight_save: Mutex::new(0),
             inflight_commits: std::sync::atomic::AtomicU64::new(0),
@@ -671,6 +715,48 @@ impl Service {
         self.clients.read().await.values().cloned().collect()
     }
 
+    /// `dynamic_config.wif_env_prefix`: what a runtime client's `wif_env` must
+    /// start with (CS-521).
+    pub fn wif_env_prefix(&self) -> &str {
+        &self.wif_env_prefix
+    }
+
+    /// Why a new client may not join `clients`, if it may not (CS-521).
+    ///
+    /// * **The same wallet.** Two clients funding from one key is never
+    ///   meaningful -- each tracks its own UTXOs, so they would spend the same
+    ///   coins -- and it is exactly what taking over another client's wallet
+    ///   looks like, however the key was supplied: a `wif_env` naming that
+    ///   client's variable, the literal key, or an id that folds onto that
+    ///   client's override variable. Comparing addresses catches all three.
+    /// * **An id that folds onto another's.** `id.1` and `ID_1` share every
+    ///   `FS_CLIENT_ID_1_*` override, so whichever is set would apply to both.
+    async fn conflict_with_existing(
+        clients: &HashMap<String, Arc<RwLock<Client>>>,
+        client_id: &str,
+        address: &str,
+    ) -> Option<CodedError> {
+        let suffix = crate::config::env_key_suffix(client_id);
+        for (existing_id, existing) in clients {
+            if crate::config::env_key_suffix(existing_id) == suffix {
+                return Some(CodedError::new(
+                    ErrorCode::InvalidRequest,
+                    format!(
+                        "client_id {client_id:?} shares the environment variables of existing \
+                         client {existing_id:?} (FS_CLIENT_{suffix}_*); choose a distinct id"
+                    ),
+                ));
+            }
+            if existing.read().await.get_address() == address {
+                return Some(CodedError::new(
+                    ErrorCode::InvalidRequest,
+                    "this key is already the funding key of another client".to_string(),
+                ));
+            }
+        }
+        None
+    }
+
     pub async fn add_client(&self, client_config: &ClientConfig) -> Result<(), CodedError> {
         crate::secrets::warn_plaintext_client_secrets(
             &client_config.client_id,
@@ -689,6 +775,7 @@ impl Service {
         // config file says, so a client added now costs its transactions the
         // same as one that has been here since startup.
         client.set_fee_satoshis_per_kb(*self.fee_satoshis_per_kb.lock().await);
+        let address = client.get_address();
         let new_client = Arc::new(RwLock::new(client));
         {
             let mut clients = self.clients.write().await;
@@ -697,6 +784,12 @@ impl Service {
                     ErrorCode::ClientExists,
                     format!("Client already exists: {}", client_config.client_id),
                 ));
+            }
+            // Checked under the write lock, so two requests cannot both pass.
+            if let Some(error) =
+                Self::conflict_with_existing(&clients, &client_config.client_id, &address).await
+            {
+                return Err(error);
             }
             clients.insert(client_config.client_id.clone(), Arc::clone(&new_client));
         }
@@ -800,6 +893,17 @@ impl Service {
             return;
         };
         if rate == 0 {
+            return;
+        }
+        // A quote above the ceiling is ignored, not clamped: a rate that high
+        // is either forged or a mistake, and neither should be half-believed
+        // (CS-523).
+        if rate > self.max_satoshis_per_kb {
+            log::warn!(
+                "ignoring a mapi-lite fee quote of {rate} sat/KB, above fees.max_satoshis_per_kb \
+                 ({}); keeping the current rate",
+                self.max_satoshis_per_kb
+            );
             return;
         }
         let changed = {
@@ -1325,17 +1429,48 @@ impl Service {
     pub async fn commit_prepared_funding(
         service: &Arc<Service>,
         prepared: &PreparedFunding,
-    ) -> Result<(), String> {
+    ) -> Result<(), CommitError> {
         let client = service
             .client_handle(&prepared.client_id)
             .await
-            .ok_or_else(|| format!("Unknown client_id {}", prepared.client_id))?;
+            .ok_or_else(|| CommitError::ClientGone(prepared.client_id.clone()))?;
         client
             .write()
             .await
-            .commit_funding_spend(prepared.spend_plan.clone())?;
+            .commit_funding_spend(prepared.spend_plan.clone())
+            .map_err(CommitError::Refused)?;
         service.save_inflight_state().await;
         Ok(())
+    }
+
+    /// Settle a funding transaction that has just been broadcast successfully.
+    ///
+    /// Only a refusal by the commit (CS-474: these outpoints were already
+    /// handed to another caller) withholds the response. A client removed
+    /// while its transaction was broadcasting does not (CS-501): the
+    /// transaction is on the network paying the caller's script, so the
+    /// caller is given its outpoints. Answering `internal` there told the
+    /// caller nothing had been created when a coin had.
+    async fn conclude_broadcast(
+        service: &Arc<Service>,
+        prepared: &PreparedFunding,
+        response: FundingResponse,
+    ) -> Result<FundingResponse, CodedError> {
+        match Self::commit_prepared_funding(service, prepared).await {
+            Ok(()) => Ok(response),
+            Err(CommitError::ClientGone(client_id)) => {
+                log::error!(
+                    "client {client_id} was removed while its funding transaction was \
+                     broadcasting; returning the outpoints it paid, which are on the network"
+                );
+                Ok(response)
+            }
+            Err(CommitError::Refused(description)) => {
+                log::warn!("commit_prepared_funding failed: {}", description);
+                let _ = Self::refresh_client_chain_state(service, &prepared.client_id).await;
+                Err(CodedError::internal(description))
+            }
+        }
     }
 
     pub async fn execute_funding(
@@ -1345,20 +1480,15 @@ impl Service {
         let (broadcaster, prepared) =
             Self::prepare_funding_outpoints(service, fund_request).await?;
         match Self::broadcast_prepared_funding(broadcaster, &prepared).await {
-            Ok(response) => {
-                if let Err(description) = Self::commit_prepared_funding(service, &prepared).await {
-                    log::warn!("commit_prepared_funding failed: {}", description);
-                    let _ =
-                        Self::refresh_client_chain_state(service, &fund_request.client_id).await;
-                    return Err(CodedError::internal(description));
-                }
-                Ok(response)
-            }
-            Err(error) => {
+            Ok(response) => Self::conclude_broadcast(service, &prepared, response).await,
+            Err(FundingBroadcastError {
+                error,
+                inputs_missing,
+            }) => {
                 if error.code == ErrorCode::BroadcastOutcomeUnknown {
                     Self::reserve_uncertain_funding(service, &prepared).await;
                 } else {
-                    Self::release_prepared_funding(service, &prepared).await;
+                    Self::release_prepared_funding(service, &prepared, inputs_missing).await;
                 }
                 // Marked stale rather than refetched. The cache is already
                 // right -- nothing was spent on a refusal, and an uncertain
@@ -1384,9 +1514,29 @@ impl Service {
     /// Give back the inputs a prepared funding claimed, after a broadcast the
     /// upstream definitely did not take (CS-473). Nothing was spent, so they
     /// return to the cache at once rather than sitting reserved.
-    async fn release_prepared_funding(service: &Arc<Service>, prepared: &PreparedFunding) {
+    ///
+    /// Except, when the node said inputs are missing, the service's own
+    /// pending change among them, which it will never list and so could
+    /// never take back (CS-506): that is forgotten, with anything built on
+    /// it, and the in-flight state saved without it.
+    async fn release_prepared_funding(
+        service: &Arc<Service>,
+        prepared: &PreparedFunding,
+        inputs_missing: bool,
+    ) {
         if let Some(client) = service.client_handle(&prepared.client_id).await {
-            client.write().await.release_claim(&prepared.spend_plan);
+            let forgotten = {
+                let mut client = client.write().await;
+                client.release_claim(&prepared.spend_plan);
+                if inputs_missing {
+                    client.forget_refused_own_change(&prepared.spend_plan)
+                } else {
+                    0
+                }
+            };
+            if forgotten > 0 {
+                service.save_inflight_state().await;
+            }
         }
     }
 
@@ -1438,23 +1588,42 @@ impl Service {
                 Ok((broadcaster, prepared)) => {
                     match Self::broadcast_prepared_funding(broadcaster, &prepared).await {
                         Ok(partial) => {
-                            if let Err(description) =
-                                Self::commit_prepared_funding(service, &prepared).await
-                            {
-                                resync_after_multiple_tx_failure(service, fund_request).await;
-                                return Err(MultipleTxFundError::complete(
-                                    ErrorCode::Internal,
-                                    description,
-                                ));
+                            match Self::conclude_broadcast(service, &prepared, partial).await {
+                                Ok(partial) => {
+                                    combined.outpoints.extend(partial.outpoints);
+                                    combined.txs.extend(partial.txs);
+                                }
+                                // Refused (CS-474). Those outpoints are another
+                                // caller's, but the ones broadcast before them are
+                                // this caller's and on the network: report them
+                                // as a partial funding rather than dropping them
+                                // in a bare `internal` (CS-501).
+                                Err(cause) => {
+                                    resync_after_multiple_tx_failure(service, fund_request).await;
+                                    if tx_index == 0 {
+                                        return Err(MultipleTxFundError::complete(
+                                            cause.code,
+                                            cause.description,
+                                        ));
+                                    }
+                                    return Err(partial_broadcast_error(
+                                        tx_index + 1,
+                                        total,
+                                        &combined,
+                                        cause.description,
+                                    ));
+                                }
                             }
-                            combined.outpoints.extend(partial.outpoints);
-                            combined.txs.extend(partial.txs);
                         }
-                        Err(cause) => {
+                        Err(FundingBroadcastError {
+                            error: cause,
+                            inputs_missing,
+                        }) => {
                             if cause.code == ErrorCode::BroadcastOutcomeUnknown {
                                 Self::reserve_uncertain_funding(service, &prepared).await;
                             } else {
-                                Self::release_prepared_funding(service, &prepared).await;
+                                Self::release_prepared_funding(service, &prepared, inputs_missing)
+                                    .await;
                             }
                             if tx_index == 0 {
                                 resync_after_multiple_tx_failure(service, fund_request).await;
@@ -1495,7 +1664,7 @@ impl Service {
     pub async fn broadcast_prepared_funding(
         broadcaster: Arc<dyn TxBroadcaster>,
         prepared: &PreparedFunding,
-    ) -> Result<FundingResponse, CodedError> {
+    ) -> Result<FundingResponse, FundingBroadcastError> {
         let tx = prepared
             .txs
             .first()
@@ -1532,7 +1701,10 @@ impl Service {
                 broadcast_failure_class(error.code),
                 broadcaster.name()
             );
-            return Err(error);
+            return Err(FundingBroadcastError {
+                error,
+                inputs_missing: e.inputs_missing(),
+            });
         }
         log::info!(
             "broadcast accepted: funding tx {txid} (broadcaster={})",
@@ -1558,6 +1730,17 @@ async fn resync_after_multiple_tx_failure(service: &Arc<Service>, fund_request: 
     {
         log::warn!("failed to resync UTXO cache after partial multiple_tx funding: {error}");
     }
+}
+
+/// Why a successfully broadcast funding transaction could not be committed.
+#[derive(Debug)]
+pub enum CommitError {
+    /// The client was removed while the transaction was broadcasting. The
+    /// transaction is still the caller's and on the network.
+    ClientGone(String),
+    /// The client refused the commit (CS-474): these outpoints were already
+    /// handed to another caller.
+    Refused(String),
 }
 
 fn partial_broadcast_error(
@@ -1601,6 +1784,24 @@ async fn fetch_chain_state(
         .map_err(|e| format!("get_utxo failed: {e}"))
 }
 
+/// A funding broadcast that did not succeed: the caller's answer, and the one
+/// fact about the refusal the cache needs that the answer does not carry.
+#[derive(Debug)]
+pub struct FundingBroadcastError {
+    pub error: CodedError,
+    /// The node refused it because an input does not exist (CS-506).
+    pub inputs_missing: bool,
+}
+
+impl From<CodedError> for FundingBroadcastError {
+    fn from(error: CodedError) -> Self {
+        Self {
+            error,
+            inputs_missing: false,
+        }
+    }
+}
+
 /// The answer a caller gets for a broadcast that did not succeed.
 ///
 /// The code carries the distinctions the caller's next move depends on, and
@@ -1625,7 +1826,9 @@ fn coded_broadcast_error(error: &BroadcastError) -> CodedError {
              See the service log for its reason.",
         ),
         // Unreachable, or refused in a way the upstream itself called worth
-        // retrying. Either way nothing was spent.
+        // retrying. Either way nothing was spent: since CS-501 every failure
+        // that may have delivered the transaction is an unknown outcome
+        // instead, including an acceptance mapi-lite could not record.
         _ => CodedError::new(
             ErrorCode::BroadcastFailed,
             "Failed to broadcast funding transaction.",
@@ -1683,7 +1886,7 @@ mod tests {
         service
             .add_client(&ClientConfig {
                 client_id: "id2".to_string(),
-                wif_key: TEST_WIF.to_string(),
+                wif_key: crate::test_support::OTHER_TEST_WIF.to_string(),
                 api_key: None,
             })
             .await
@@ -1691,7 +1894,10 @@ mod tests {
 
         // the startup import, then the new client's
         assert_eq!(watcher.watched().len(), 2);
-        assert_eq!(watcher.watched()[1], TEST_ADDRESS);
+        assert_eq!(
+            watcher.watched()[1],
+            crate::test_support::OTHER_TEST_ADDRESS
+        );
     }
 
     /// An import failure is reported but must not stop the service: the node
@@ -1714,6 +1920,70 @@ mod tests {
         // None, as woc/uaas/test supply
         let service = Service::new_for_test_with_watcher(&config, blockchain, None).await;
         assert!(service.is_client_id_valid(TEST_CLIENT_ID).await);
+    }
+
+    /// CS-501: a client removed while its funding transaction was broadcasting
+    /// still gets its outpoints. The transaction is on the network paying the
+    /// caller's script; answering `internal` told the caller nothing had been
+    /// created when a coin had.
+    #[tokio::test]
+    async fn cs_501_a_client_removed_mid_broadcast_still_gets_its_outpoints() {
+        let config = test_config(&unique_dynamic_config_path());
+        let service = Arc::new(
+            Service::new_for_test(&config, test_blockchain_interface(&config).await).await,
+        );
+        let request = sample_fund_request(TEST_CLIENT_ID);
+        let (broadcaster, prepared) = Service::prepare_funding_outpoints(&service, &request)
+            .await
+            .expect("prepared");
+        let response = Service::broadcast_prepared_funding(broadcaster, &prepared)
+            .await
+            .expect("broadcast");
+
+        service
+            .delete_client(TEST_CLIENT_ID)
+            .await
+            .expect("deleted while the broadcast was in flight");
+
+        let settled = Service::conclude_broadcast(&service, &prepared, response)
+            .await
+            .expect("the outpoints are the caller's");
+        assert_eq!(settled.outpoints.len(), 1);
+    }
+
+    /// CS-502. A chain read that is accepted and never answered no longer
+    /// holds the client's refresh: it fails at the interface deadline, the
+    /// refresh lock is released, and the next refresh goes through.
+    #[tokio::test]
+    async fn cs_502_a_hung_chain_read_releases_the_refresh_at_the_deadline() {
+        use crate::interface_timeout::Bounded;
+        use crate::test_support::GatedBlockchain;
+
+        let config = test_config(&unique_dynamic_config_path());
+        let gated = GatedBlockchain::new(&config).await;
+        let bounded = Arc::new(Bounded::new(gated.clone(), Duration::from_millis(100)));
+        let service = Arc::new(Service::new_for_test(&config, bounded).await);
+        gated.close();
+
+        let started = Instant::now();
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            Service::refresh_client_chain_state(&service, TEST_CLIENT_ID),
+        )
+        .await
+        .expect("the refresh waited past the deadline")
+        .expect_err("the read never answered");
+        assert!(error.contains("did not answer"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        gated.open();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            Service::refresh_client_chain_state(&service, TEST_CLIENT_ID),
+        )
+        .await
+        .expect("the refresh lock was still held")
+        .expect("refreshes once the interface answers");
     }
 
     fn sample_fund_request(client_id: &str) -> FundRequest {
@@ -1821,7 +2091,7 @@ mod tests {
         service
             .add_client(&ClientConfig {
                 client_id: "client2".to_string(),
-                wif_key: TEST_WIF.to_string(),
+                wif_key: crate::test_support::OTHER_TEST_WIF.to_string(),
                 api_key: None,
             })
             .await
@@ -2369,6 +2639,117 @@ mod tests {
     /// A broadcast that is *known* to have failed spent nothing, so its input
     /// must stay available -- reserving there would strand funds for no
     /// reason. The distinction is the whole point of the new variant.
+    /// CS-506, SR-FUND-036 acceptance: the node refuses a spend of the
+    /// service's own change as missing inputs. The next request selects a
+    /// different input, and the refresh between them does not restore the
+    /// change. Before, it did, and the same spend was refused on every request
+    /// until the change expired -- 95 times in a row on the regtest bench.
+    #[tokio::test]
+    async fn sr_fund_036_own_change_refused_as_missing_inputs_is_not_offered_again() {
+        use crate::test_support::{blockchain_listing, ScriptedBroadcaster};
+
+        let config = test_config(&unique_dynamic_config_path());
+        let utxo = |seed: char, value| chain_gang::interface::UtxoEntry {
+            height: 1517000,
+            tx_pos: 0,
+            tx_hash: seed.to_string().repeat(64),
+            value,
+        };
+        let blockchain = blockchain_listing(&config, &[utxo('a', 10_000), utxo('b', 50_000)]).await;
+        // Retryable, as mapi-lite reports it -- which is why the bench saw a
+        // 502 `broadcast_failed` on every request rather than a 409.
+        let broadcaster = ScriptedBroadcaster::new(vec![
+            None,
+            Some(BroadcastError::Rejected {
+                description: "Mempool error, retry again later. (details: 16 missing-inputs)"
+                    .to_string(),
+                retryable: true,
+            }),
+        ]);
+        let service = service_with(&config, blockchain, broadcaster.clone()).await;
+        let request = FundRequest {
+            satoshi: 1_000,
+            ..sample_fund_request(TEST_CLIENT_ID)
+        };
+
+        fund_single_transaction(&service, &request)
+            .await
+            .expect("the first funding is accepted");
+        let refused = fund_single_transaction(&service, &request)
+            .await
+            .expect_err("the second is refused");
+        assert_eq!(refused.code, ErrorCode::BroadcastFailed);
+        fund_single_transaction(&service, &request)
+            .await
+            .expect("the third funds from another input");
+
+        let sent = broadcaster.sent();
+        let first = sent[0].hash().encode();
+        let spends_first = |tx: &Tx| {
+            tx.inputs
+                .iter()
+                .any(|input| input.prev_output.hash.encode() == first)
+        };
+        assert!(
+            spends_first(&sent[1]),
+            "the refused one spent the first's change"
+        );
+        assert!(
+            !spends_first(&sent[2]),
+            "the next request did not select the refused change again"
+        );
+    }
+
+    /// The forgotten change is forgotten on disk too, or a restart would bring
+    /// it back (CS-465 persists pending change).
+    #[tokio::test]
+    async fn sr_fund_036_forgotten_change_is_not_persisted() {
+        use crate::test_support::{blockchain_listing, ScriptedBroadcaster};
+
+        let config = test_config(&unique_dynamic_config_path());
+        let utxo = |seed: char, value| chain_gang::interface::UtxoEntry {
+            height: 1517000,
+            tx_pos: 0,
+            tx_hash: seed.to_string().repeat(64),
+            value,
+        };
+        let blockchain = blockchain_listing(&config, &[utxo('c', 10_000), utxo('d', 50_000)]).await;
+        let broadcaster = ScriptedBroadcaster::new(vec![
+            None,
+            Some(BroadcastError::Rejected {
+                description: "16 missing-inputs".to_string(),
+                retryable: false,
+            }),
+        ]);
+        let service = service_with(&config, blockchain, broadcaster.clone()).await;
+        let request = FundRequest {
+            satoshi: 1_000,
+            ..sample_fund_request(TEST_CLIENT_ID)
+        };
+        fund_single_transaction(&service, &request).await.unwrap();
+        let first = broadcaster.sent()[0].hash().encode();
+        let persisted_change = || {
+            load_inflight_file(&config.inflight_state_path())
+                .get(TEST_CLIENT_ID)
+                .map(|state| {
+                    state
+                        .pending_change
+                        .iter()
+                        .any(|change| change.tx_hash == first)
+                })
+                .unwrap_or(false)
+        };
+        assert!(
+            persisted_change(),
+            "the first funding's change is saved as pending"
+        );
+
+        fund_single_transaction(&service, &request)
+            .await
+            .expect_err("refused as missing inputs");
+        assert!(!persisted_change(), "and no longer saved once forgotten");
+    }
+
     #[tokio::test]
     async fn sr_fund_012_a_failed_broadcast_leaves_its_input_spendable() {
         use crate::test_support::{CountingBlockchain, FailingBroadcaster};
@@ -2660,7 +3041,7 @@ mod tests {
         service
             .add_client(&ClientConfig {
                 client_id: "added-later".to_string(),
-                wif_key: crate::test_support::TEST_WIF.to_string(),
+                wif_key: crate::test_support::OTHER_TEST_WIF.to_string(),
                 api_key: None,
             })
             .await
@@ -3407,5 +3788,113 @@ mod tests {
                 && line.starts_with(&format!("broadcast failed: funding tx {}", txids[1]))
                 && line.contains("class=failed, broadcaster=failing")
                 && line.ends_with("upstream error: simulated broadcast failure")));
+    }
+
+    /// A quote above `fees.max_satoshis_per_kb` is ignored and the current
+    /// rate kept; one at the ceiling is taken (CS-523).
+    #[tokio::test]
+    async fn sr_sec_020_a_fee_quote_above_the_ceiling_is_ignored() {
+        use crate::test_support::StubMapiBroadcaster;
+
+        for (quoted, expected) in [(1001, 100), (50_000, 100), (1000, 1000), (250, 250)] {
+            let config = test_config(&unique_dynamic_config_path());
+            assert_eq!(config.fees.satoshis_per_kb, 100);
+            assert_eq!(config.fees.max_satoshis_per_kb, 1000);
+            let blockchain = test_blockchain_interface(&config).await;
+            let service = service_with(
+                &config,
+                blockchain,
+                StubMapiBroadcaster::quoting(Some(quoted)),
+            )
+            .await;
+            service.refresh_fee_rate().await;
+            assert_eq!(
+                service.fee_satoshis_per_kb().await,
+                expected,
+                "quote of {quoted}"
+            );
+        }
+    }
+
+    // --- CS-521: one wallet, one client -----------------------------------
+
+    /// A new client funding from a wallet an existing client already uses is
+    /// refused, however the key arrived -- here, as the literal key.
+    #[tokio::test]
+    async fn sr_sec_018_a_client_sharing_another_s_wallet_is_refused() {
+        let config = test_config(&unique_dynamic_config_path());
+        let blockchain = test_blockchain_interface(&config).await;
+        let service = Service::new_for_test(&config, blockchain).await;
+
+        let error = service
+            .add_client(&ClientConfig {
+                client_id: "thief".to_string(),
+                wif_key: TEST_WIF.to_string(),
+                api_key: Some("mine".to_string()),
+            })
+            .await
+            .expect_err("the wallet is id1's");
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+        assert!(
+            error.description.contains("already the funding key"),
+            "{}",
+            error.description
+        );
+        assert!(service.client_handle("thief").await.is_none());
+    }
+
+    /// `ID1` and `id.1`-style ids fold onto an existing client's override
+    /// variables, so whatever key those hold would fund both.
+    #[tokio::test]
+    async fn sr_sec_018_an_id_that_folds_onto_another_s_is_refused() {
+        let config = test_config(&unique_dynamic_config_path());
+        let blockchain = test_blockchain_interface(&config).await;
+        let service = Service::new_for_test(&config, blockchain).await;
+
+        let folded = TEST_CLIENT_ID.to_uppercase();
+        assert_ne!(folded, TEST_CLIENT_ID);
+        let error = service
+            .add_client(&ClientConfig {
+                client_id: folded,
+                wif_key: crate::test_support::OTHER_TEST_WIF.to_string(),
+                api_key: None,
+            })
+            .await
+            .expect_err("folds onto id1");
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+        assert!(
+            error.description.contains("FS_CLIENT_ID1_"),
+            "{}",
+            error.description
+        );
+    }
+
+    /// A pair added before the check existed is still found, at startup.
+    #[tokio::test]
+    async fn sr_sec_018_clients_sharing_a_wallet_are_found_at_startup() {
+        let mut config = test_config(&unique_dynamic_config_path());
+        config.client = Some(vec![
+            ClientConfig {
+                client_id: TEST_CLIENT_ID.to_string(),
+                wif_key: TEST_WIF.to_string(),
+                api_key: None,
+            },
+            ClientConfig {
+                client_id: "twin".to_string(),
+                wif_key: TEST_WIF.to_string(),
+                api_key: None,
+            },
+        ]);
+        let blockchain = test_blockchain_interface(&config).await;
+        let service = Service::new_for_test(&config, blockchain).await;
+
+        let shared = super::wallets_shared_by(&*service.clients.read().await);
+        assert_eq!(
+            shared,
+            vec![(
+                TEST_ADDRESS.to_string(),
+                vec![TEST_CLIENT_ID.to_string(), "twin".to_string()]
+            )]
+        );
     }
 }
