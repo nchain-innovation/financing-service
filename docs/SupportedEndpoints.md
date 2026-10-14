@@ -263,7 +263,7 @@ The status is derived from the code, so a caller that cannot read the body — a
 | `chain_unavailable` | 503 | The blockchain interface could not be reached. The description is fixed; the read's own error, which names the interface's address, is in the service log | Retryable |
 | `internal` | 500 | Unexpected internal failure | Report it |
 | `unauthorized` | 401 | Authentication missing or invalid | Fix credentials |
-| `rate_limited` | 429 | Request rate exceeded | Retry after the interval in `description` |
+| `rate_limited` | 429 | Request rate exceeded, or (from `POST /fund`) the client's `funding_limits.max_satoshis_per_period` would be exceeded | Retry after the interval in `description` or `Retry-After` |
 | `key_in_progress` | 409 | A request with this `idempotency_key` is still being processed | Retry shortly |
 | `idempotency_key_reused` | 409 | This `idempotency_key` was used with a different request | Use a fresh `idempotency_key` |
 
@@ -333,7 +333,7 @@ Request body (JSON):
 | Field | Type | Description |
 |-------|------|-------------|
 | `client_id` | string | Identifier for the new client |
-| `wif` | string | WIF private key for the client's funding wallet (use `wif` or `wif_env`). Not an `env:` reference |
+| `wif` | string | WIF private key for the client's funding wallet (use `wif` or `wif_env`). Not an `env:` reference. Refused with HTTP 400 unless `dynamic_config.allow_plaintext_wif` is set, since the file would then hold the key itself |
 | `wif_env` | string | Environment variable name containing the WIF; stored as `env:VAR` in dynamic config. Must start with `dynamic_config.wif_env_prefix` (default `FS_RUNTIME_WIF_`) |
 | `api_key` | string | Optional shared secret for this client's API endpoints |
 | `api_key_env` | string | Environment variable name containing the client API key; stored as `env:VAR` in dynamic config |
@@ -346,7 +346,7 @@ Refused as `invalid_request` (CS-521): a `wif_env` outside the prefix, a `wif` t
 curl -H "Authorization: Bearer your-admin-api-key" \
      -H "Content-Type: application/json" \
      --request POST \
-     --data '{"client_id":"client15","wif":"cVLcPuZMfnNNcaU...................oLh3piTnX9WCndRqWh","api_key":"your-client-api-key"}' \
+     --data '{"client_id":"client15","wif_env":"FS_RUNTIME_WIF_CLIENT15","api_key_env":"FS_RUNTIME_API_KEY_CLIENT15"}' \
      http://127.0.0.1:8080/client
 ```
 

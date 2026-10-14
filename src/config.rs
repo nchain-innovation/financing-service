@@ -599,6 +599,12 @@ fn is_public_key_hex(key: &str) -> bool {
 #[derive(Debug, Default, Deserialize, Clone)]
 pub struct DynamicConfigConfig {
     pub filename: String,
+    /// Whether `POST /client` may store a raw `wif` (CS-526). Off by default:
+    /// the dynamic config file would then hold the key itself, a copy that
+    /// outlives the request on a volume often bind-mounted from the host.
+    /// Off, only `wif_env` is accepted, which stores an `env:VAR` reference.
+    #[serde(default)]
+    pub allow_plaintext_wif: bool,
     /// The prefix every `wif_env` named on `POST /client` must start with
     /// (CS-521, SR-SEC-018). Default [`DEFAULT_WIF_ENV_PREFIX`].
     ///
@@ -644,6 +650,15 @@ pub struct RateLimitConfig {
     pub requests_per_second: u64,
     #[serde(default)]
     pub burst_size: Option<u32>,
+    /// Addresses of reverse proxies in front of this service (CS-530).
+    ///
+    /// A request arriving from one of them is limited by the client address
+    /// it reports in `X-Forwarded-For` -- the right-most entry that is not
+    /// itself a trusted proxy -- rather than by the proxy's own address, which
+    /// would put every caller in one bucket. From any other peer the header is
+    /// ignored, since anyone can send it.
+    #[serde(default)]
+    pub trusted_proxies: Vec<std::net::IpAddr>,
 }
 
 impl Default for RateLimitConfig {
@@ -652,6 +667,7 @@ impl Default for RateLimitConfig {
             enabled: false,
             requests_per_second: default_requests_per_second(),
             burst_size: None,
+            trusted_proxies: Vec::new(),
         }
     }
 }
@@ -687,6 +703,13 @@ pub struct WebInterfaceConfig {
     pub admin_api_key: Option<String>,
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
+    /// Serve mainnet or testnet without `admin_api_key`, or with a client that
+    /// has no `api_key` (CS-514). Off, such a configuration refuses to start:
+    /// the routes it leaves open spend real or shared coins. On, it starts
+    /// with a warning; set it only where something in front of this service
+    /// authenticates callers.
+    #[serde(default)]
+    pub allow_unauthenticated: bool,
 }
 
 impl Default for WebInterfaceConfig {
@@ -696,6 +719,7 @@ impl Default for WebInterfaceConfig {
             port: 0,
             admin_api_key: None,
             rate_limit: RateLimitConfig::default(),
+            allow_unauthenticated: false,
         }
     }
 }
@@ -718,6 +742,9 @@ pub struct Config {
     pub mapi_lite: Option<MapiLiteConfig>,
     #[serde(default)]
     pub fees: FeesConfig,
+    /// Per-client caps on what `POST /fund` pays out (CS-530). Off unless set.
+    #[serde(default)]
+    pub funding_limits: crate::funding_limits::FundingLimitsConfig,
 }
 
 impl Config {
@@ -747,6 +774,31 @@ impl ClientConfig {
 }
 
 impl Config {
+    /// Whether this is a network whose coins are worth protecting: mainnet,
+    /// or testnet, whose wallets are shared and slow to refill (CS-514).
+    pub fn is_production_network(&self) -> bool {
+        matches!(
+            self.blockchain_interface.network_type.as_str(),
+            "mainnet" | "testnet"
+        )
+    }
+
+    /// The part of the authentication policy the configuration file alone
+    /// decides (CS-514). The keys are checked once environment overrides are
+    /// applied and the clients loaded: see `Service::check_auth_policy`.
+    pub fn check_auth_policy(&self) -> Result<(), String> {
+        // Never on a production network, opt-out or not: a raw key would cross
+        // the network in a request body, and sit in the dynamic config file.
+        if self.is_production_network() && self.dynamic_config.allow_plaintext_wif {
+            return Err(format!(
+                "dynamic_config.allow_plaintext_wif is for development only and cannot be set on \
+                 {}: POST /client must use wif_env",
+                self.blockchain_interface.network_type
+            ));
+        }
+        Ok(())
+    }
+
     /// Return the configured network as Network type
     pub fn get_network(&self) -> Result<Network, &str> {
         match self.blockchain_interface.network_type.as_str() {
@@ -881,11 +933,23 @@ pub(crate) fn env_key_suffix(client_id: &str) -> String {
 }
 
 /// Return the HTTP bind address and port, honouring `APP_ENV=docker`.
+///
+/// In a container a loopback address is replaced with `0.0.0.0`: loopback
+/// there is the container's own, which nothing published from the host can
+/// reach, so a config file written for a bare-metal run would otherwise give a
+/// container that answers nobody. Which host interfaces see the port is then
+/// decided where it is published (`run.sh` publishes it on the host's
+/// loopback). Any other configured address is honoured (CS-527): it used to be
+/// overridden to `0.0.0.0` too, so a container given a specific interface, or
+/// run with `--network host`, listened on every interface instead.
 pub fn web_bind_address(config: &Config) -> (Ipv4Addr, u16) {
     let port = config.web_interface.port;
+    let address = config.web_interface.address;
     match env::var_os("APP_ENV") {
-        Some(content) if content == "docker" => (Ipv4Addr::new(0, 0, 0, 0), port),
-        Some(_) | None => (config.web_interface.address, port),
+        Some(content) if content == "docker" && address.is_loopback() => {
+            (Ipv4Addr::UNSPECIFIED, port)
+        }
+        Some(_) | None => (address, port),
     }
 }
 
@@ -897,6 +961,8 @@ pub fn load_config(env_var: &str, filename: &str) -> Result<Config, String> {
     config.blockchain_interface.validate()?;
     config.fees.validate()?;
     config.dynamic_config.validate()?;
+    config.funding_limits.validate()?;
+    config.check_auth_policy()?;
     if let Some(mapi_lite) = &config.mapi_lite {
         mapi_lite.validate()?;
     }
@@ -950,6 +1016,7 @@ mod tests {
                 port: 8080,
                 admin_api_key: Some("env:FS_TEST_CONFIG_ADMIN".to_string()),
                 rate_limit: RateLimitConfig::default(),
+                allow_unauthenticated: false,
             },
             client: Some(vec![ClientConfig {
                 client_id: "id1".to_string(),
@@ -1016,6 +1083,7 @@ mod tests {
             enabled: true,
             requests_per_second: 0,
             burst_size: None,
+            trusted_proxies: Vec::new(),
         };
         assert!(config.validate().is_err());
     }
@@ -1042,6 +1110,7 @@ network_type = "testnet"
 
 [web_interface]
 address = "127.0.0.1"
+allow_unauthenticated = true  # testnet without keys (CS-514)
 port = 9091
 
 [logging]
@@ -1068,7 +1137,7 @@ filename = "./data/dynamic.toml"
         unsafe {
             env::set_var(
                 "FS_CONFIG",
-                r#"{"blockchain_interface":{"interface_type":"test","network_type":"testnet"},"web_interface":{"address":"127.0.0.1","port":9092},"logging":{"level":"info"},"service":{"utxo_refresh_period":30},"dynamic_config":{"filename":"./data/dynamic.toml"}}"#,
+                r#"{"blockchain_interface":{"interface_type":"test","network_type":"testnet"},"web_interface":{"address":"127.0.0.1","port":9092,"allow_unauthenticated":true},"logging":{"level":"info"},"service":{"utxo_refresh_period":30},"dynamic_config":{"filename":"./data/dynamic.toml"}}"#,
             );
         }
         let config = get_config("FS_CONFIG", "missing-file.toml").unwrap();
@@ -1089,6 +1158,28 @@ filename = "./data/dynamic.toml"
             ..Default::default()
         };
         assert_eq!(web_bind_address(&config), (Ipv4Addr::new(0, 0, 0, 0), 8080));
+        unsafe { env::remove_var("APP_ENV") };
+    }
+
+    /// CS-527: only a loopback address is replaced in a container. One the
+    /// operator chose -- a specific interface, say, under `--network host` --
+    /// is what the service binds.
+    #[test]
+    fn sr_cfg_003_web_bind_address_honours_a_non_loopback_address_in_docker() {
+        let _env = env_lock();
+        unsafe { env::set_var("APP_ENV", "docker") };
+        let config = Config {
+            web_interface: WebInterfaceConfig {
+                address: Ipv4Addr::new(10, 1, 2, 3),
+                port: 8080,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            web_bind_address(&config),
+            (Ipv4Addr::new(10, 1, 2, 3), 8080)
+        );
         unsafe { env::remove_var("APP_ENV") };
     }
 
@@ -1320,6 +1411,7 @@ network_type = "testnet"
 
 [web_interface]
 address = "127.0.0.1"
+allow_unauthenticated = true  # testnet without keys (CS-514)
 port = 8080
 
 [logging]
@@ -1352,6 +1444,7 @@ network_type = "testnet"
 
 [web_interface]
 address = "127.0.0.1"
+allow_unauthenticated = true  # testnet without keys (CS-514)
 port = 8080
 
 [logging]
@@ -1686,7 +1779,7 @@ filename = "./data/dynamic.toml"
         unsafe {
             env::set_var(
                 "FS_CONFIG",
-                r#"{"blockchain_interface":{"interface_type":"test","network_type":"testnet"},"web_interface":{"address":"127.0.0.1","port":9092},"logging":{"level":"info"},"service":{"utxo_refresh_period":30},"dynamic_config":{"filename":"./data/dynamic.toml"},"mapi_lite":{"base_url":"http://mapi:8080","max_retries":1}}"#,
+                r#"{"blockchain_interface":{"interface_type":"test","network_type":"testnet"},"web_interface":{"address":"127.0.0.1","port":9092,"allow_unauthenticated":true},"logging":{"level":"info"},"service":{"utxo_refresh_period":30},"dynamic_config":{"filename":"./data/dynamic.toml"},"mapi_lite":{"base_url":"http://mapi:8080","max_retries":1}}"#,
             );
         }
         let config = get_config("FS_CONFIG", "missing-file.toml").unwrap();
@@ -1800,6 +1893,43 @@ filename = "./data/dynamic.toml"
         assert_eq!(limited_node.outbound_rate_limit(), Some(5));
     }
 
+    // The struct updates cover fields other changes add to these sections.
+    #[allow(clippy::needless_update)]
+    fn policy_config(network: &str, admin: Option<&str>, open: bool, plaintext: bool) -> Config {
+        Config {
+            blockchain_interface: BlockchainInterfaceConfig {
+                network_type: network.to_string(),
+                ..Default::default()
+            },
+            web_interface: WebInterfaceConfig {
+                admin_api_key: admin.map(str::to_string),
+                allow_unauthenticated: open,
+                ..Default::default()
+            },
+            dynamic_config: DynamicConfigConfig {
+                filename: "x".to_string(),
+                allow_plaintext_wif: plaintext,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// CS-514: a raw key may never be posted on a production network, opt-out
+    /// or not.
+    #[test]
+    fn sr_sec_032_plaintext_wif_cannot_be_allowed_on_a_production_network() {
+        for open in [false, true] {
+            let err = policy_config("mainnet", Some("k"), open, true)
+                .check_auth_policy()
+                .unwrap_err();
+            assert!(err.contains("allow_plaintext_wif"), "{err}");
+        }
+        assert!(policy_config("regtest", None, false, true)
+            .check_auth_policy()
+            .is_ok());
+    }
+
     /// CS-505, SR-BCHN-017: three refresh periods by default, never under a
     /// minute, explicit when set, and off at zero.
     #[test]
@@ -1871,6 +2001,7 @@ filename = "./data/dynamic.toml"
             DynamicConfigConfig {
                 filename: "x".to_string(),
                 wif_env_prefix: prefix.to_string(),
+                ..Default::default()
             }
             .validate()
         };

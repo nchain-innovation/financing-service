@@ -18,10 +18,13 @@ network_type = "testnet"
 [web_interface]
 address = "127.0.0.1"
 port = 8080
-# Shared secret required on POST /client. Without it POST /client is
-# unauthenticated, and a warning is logged at startup. Prefer an env: reference
-# (or FS_ADMIN_API_KEY) to a literal value.
+# Shared secret required on POST /client. On mainnet and testnet the service
+# will not start without one, and every client needs an api_key (CS-514);
+# elsewhere, without it POST /client is unauthenticated and a warning is logged
+# at startup. Prefer the environment: FS_ADMIN_API_KEY, FS_CLIENT_<ID>_API_KEY.
 # admin_api_key = "env:FS_ADMIN_API_KEY"
+# Only if a gateway in front of this service authenticates callers:
+# allow_unauthenticated = true
 # [web_interface.rate_limit]
 # enabled = true
 # requests_per_second = 10
@@ -55,6 +58,9 @@ utxo_refresh_period = 60
 
 [dynamic_config]
 filename = "./data/dynamic.toml"
+# POST /client stores env:VAR references only; a raw wif is refused unless this
+# is set, since the file would then hold the key itself. Development only.
+# allow_plaintext_wif = false
 
 # [[client]]
 # client_id = "id1"
@@ -104,3 +110,10 @@ filename = "./data/dynamic.toml"
 # [fees]
 # satoshis_per_kb = 100
 # use_mapi_fee_quote = true
+
+# Per-client caps on what POST /fund pays out (satoshi x no_of_outpoints).
+# Off unless set; see docs/Configuration.md.
+# [funding_limits]
+# max_satoshis_per_request = 100000
+# max_satoshis_per_period = 1000000
+# period_seconds = 3600

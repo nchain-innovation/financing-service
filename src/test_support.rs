@@ -89,6 +89,10 @@ pub fn test_config_with_keys(
             port: 8080,
             admin_api_key: admin_api_key.map(str::to_string),
             rate_limit: crate::config::RateLimitConfig::default(),
+            // The test network is testnet, where keys are otherwise required
+            // (CS-514); most tests run without them. The requirement has its
+            // own tests (SR-SEC-031).
+            allow_unauthenticated: true,
         },
         client: Some(vec![ClientConfig {
             client_id: TEST_CLIENT_ID.to_string(),
@@ -97,6 +101,9 @@ pub fn test_config_with_keys(
         }]),
         dynamic_config: DynamicConfigConfig {
             filename: dynamic_filename.to_string(),
+            // Most tests add clients with a raw test WIF; the default, which
+            // refuses one, has its own tests (SR-SEC-021).
+            allow_plaintext_wif: true,
             wif_env_prefix: crate::config::DEFAULT_WIF_ENV_PREFIX.to_string(),
         },
         ..Default::default()

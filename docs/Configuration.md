@@ -152,7 +152,7 @@ port = 8080
 # admin_api_key = "your-admin-secret"
 ```
 
-When `APP_ENV=docker`, the service listens on `0.0.0.0` regardless of `address`.
+When `APP_ENV=docker` (set by the image) and `address` is a loopback address, the service listens on `0.0.0.0` instead: a container's own loopback cannot be reached from the host. Which host interfaces then see the port is set where it is published — `run.sh` publishes it on the host's loopback. Any other `address` is honoured, so a container run with `--network host` and a specific address binds only that one.
 
 Bind to `127.0.0.1` or place the service behind a reverse proxy on a private network when exposing funding endpoints.
 
@@ -165,6 +165,22 @@ Set `admin_api_key` to require a shared secret on `POST /client`. Clients must s
 
 When `admin_api_key` is omitted, `POST /client` is unauthenticated. The service logs a warning at startup when the admin key is not configured.
 
+### Authentication is required on mainnet and testnet
+
+With `network_type` `mainnet` or `testnet`, the service **refuses to start** (CS-514) when:
+
+* `admin_api_key` is unset — `POST /client` and `DELETE /client` would be open; or
+* any client, static or dynamic, has no `api_key` — its `/fund`, balance and address routes would be open; or
+* `dynamic_config.allow_plaintext_wif` is set — a raw key would cross the network in a `POST /client` body. This one has no opt-out.
+
+At runtime, `POST /client` likewise refuses a client without an `api_key` (or `api_key_env`).
+
+If a gateway in front of the service authenticates callers instead, set `web_interface.allow_unauthenticated = true`. The service then starts as before, with a warning. `regtest` and `stn` are unaffected.
+
+### TLS is required in front of the service in production
+
+The service speaks plain HTTP. API keys, and the WIF a client is funded from, are secrets, so in production terminate TLS in front of it — a reverse proxy or load balancer on the same host or a private network — and do not expose its port directly. `POST /client` takes only `wif_env` (an environment-variable name, not the key) on mainnet and testnet, so no private key needs to cross the network at all; API keys still do, which is what the TLS is for.
+
 ### Rate limiting
 
 Optional per-IP rate limiting is configured under `[web_interface.rate_limit]`:
@@ -174,15 +190,17 @@ Optional per-IP rate limiting is configured under `[web_interface.rate_limit]`:
 enabled = true
 requests_per_second = 10
 burst_size = 20
+# trusted_proxies = ["10.0.0.1"]   # your reverse proxies, if any
 ```
 
 * `enabled` — turn rate limiting on or off (default: `false`)
 * `requests_per_second` — sustained request rate allowed per client IP (default: `10`)
 * `burst_size` — maximum burst before limiting (defaults to `requests_per_second`)
+* `trusted_proxies` — addresses of the reverse proxies in front of the service (default: none)
 
 When enabled, excess requests receive HTTP 429 with a JSON error body. `/health` and `/ready` are exempt so container orchestration probes are not throttled.
 
-Behind a reverse proxy, the limit applies to the proxy's IP unless you configure the proxy to pass the original client address and implement a custom key extractor.
+Behind a reverse proxy, list the proxy in `trusted_proxies`; otherwise every caller arrives from the proxy's address and shares one limit. A request from a trusted proxy is limited by the client address it reports in `X-Forwarded-For`: the right-most entry that is not itself a trusted proxy, since entries further left were supplied by the client and could say anything. From any other address the header is ignored, so a caller cannot choose its own key by sending one.
 
 ## [logging]
 
@@ -307,9 +325,30 @@ max_entries = 10000
 ```
 
 * `ttl_seconds` — how long a completed record stays replayable. Should comfortably exceed your clients' retry window; too short and a legitimate retry funds a second time. Default `600`.
-* `max_entries` — upper bound on retained records, so a client sending a fresh `idempotency_key` on every request cannot grow the store without limit. When full, the oldest record is dropped. Default `10000`.
+* `max_entries` — upper bound on retained records, so a client sending a fresh `idempotency_key` on every request cannot grow the store without limit. When full, the oldest record of **whichever client holds the most** is dropped, so a client filling the store evicts its own records rather than other clients' (whose retries would then fund twice). Default `10000`.
+
+Each record holds a hash of the request rather than the request, and an `idempotency_key` may be at most 256 bytes, so a record's size does not depend on what the client sends.
 
 Records are held **in memory only** and are lost when the service restarts, so a retry that spans a restart can still produce a second funding transaction.
+
+## [funding_limits]
+
+Optional, and off unless set. Per-client caps on what `POST /fund` pays out — `satoshi` × `no_of_outpoints`, fees aside — so a leaked client API key is not worth the whole wallet in one call.
+
+```toml
+[funding_limits]
+max_satoshis_per_request = 100000     # one request
+max_satoshis_per_period = 1000000     # one client, within period_seconds
+period_seconds = 3600                 # default
+```
+
+* `max_satoshis_per_request` — a larger request is refused with `400` `invalid_request`.
+* `max_satoshis_per_period` — a request that would take the client past this within any `period_seconds` window is refused with `429` `rate_limited` and a `Retry-After` giving the soonest it could fit. A request's amount counts from the moment it is accepted, so concurrent requests cannot both slip under the limit, and is given back if nothing was broadcast. The window is held in memory and restarts with the service.
+* A limit of `0`, or a `period_seconds` of `0` with a period limit, is refused at startup.
+
+Whatever these say, no request may pay out more than the 21 million BSV that exist; one asking for more, or whose `satoshi` × `no_of_outpoints` overflows, is a `400`.
+
+The right values depend on what your clients fund. Event, for example, asks for one transaction's fee and outputs at a time — a few hundred satoshis.
 
 ## [fees]
 
@@ -432,9 +471,13 @@ Path to the file used to persist clients added at runtime via `POST /client`. Dy
 ```toml
 [dynamic_config]
 filename = "./data/dynamic.toml"
+# allow_plaintext_wif = false   # true lets POST /client store a raw wif; development only
 # wif_env_prefix = "FS_RUNTIME_WIF_"
 ```
 
+* **Only `env:VAR` references by default.** `POST /client` refuses a raw `wif` with HTTP 400 and stores nothing; send `wif_env`, naming an environment variable that holds the key, and the file records `env:VAR` instead. `allow_plaintext_wif = true` lifts this for development; on mainnet and testnet it is refused at startup (CS-514). A file written before this, holding raw WIFs, still loads, with the usual plaintext warning.
+* **Written atomically, owner-only.** Every change is written to a `0600` sibling file, synced, and renamed over the original, so a crash cannot truncate it and other users cannot read it. A file found readable by other users at startup is made `0600`, with a warning. A client is added or removed in memory only once the file has been written.
+* **A file that does not parse stops startup.** It is left exactly as it is, to be fixed by hand, rather than replaced with an empty list on the next `POST /client`. A missing or empty file means no dynamic clients.
 * `wif_env_prefix` — the only environment variables a client added through `POST /client` may take its key from with `wif_env`. Default `FS_RUNTIME_WIF_`. It is rejected at startup if it overlaps `FS_CLIENT_`, which every client's own override variable (`FS_CLIENT_<ID>_WIF`) starts with (CS-521).
 
 **Runtime clients cannot take another client's wallet (CS-521, SR-SEC-018).** Before this, `wif_env` could name any variable in the service's environment, another client's `FS_CLIENT_<ID>_WIF` included. Whoever could call `POST /client` (anyone, with no `admin_api_key`) could then fund from that client's wallet under an API key of their own. Now:
@@ -501,4 +544,4 @@ Example: for `client_id = "id1"`, set `FS_CLIENT_ID1_WIF`.
 
 When WIF keys, client `api_key`, `admin_api_key`, `rpc_password`, or `mapi_lite.auth_token` are stored as literal values in config files, the service logs a warning at startup. Literal values still work for local development.
 
-Dynamic clients added via `POST /client` can use `wif_env` and `api_key_env` instead of `wif` and `api_key`; the service stores `env:VAR` references in the dynamic config file rather than the secret values.
+Dynamic clients added via `POST /client` use `wif_env` and can use `api_key_env` instead of `wif` and `api_key`; the service stores `env:VAR` references in the dynamic config file rather than the secret values. A raw `wif` is refused unless `dynamic_config.allow_plaintext_wif` is set — see [\[dynamic_config\]](#dynamic_config).

@@ -124,7 +124,12 @@ pub struct Service {
     /// `dynamic_config.wif_env_prefix` (CS-521).
     wif_env_prefix: String,
     admin_api_key: Option<String>,
+    /// `admin_api_key` and every client's `api_key` are required: a
+    /// production network without the opt-out (CS-514).
+    auth_required: bool,
+    network_type: String,
     idempotency: Mutex<IdempotencyStore>,
+    funding_limits: crate::funding_limits::FundingLimits,
     /// Set only for backends that must be told which addresses to follow.
     address_watcher: Option<Arc<dyn AddressWatcher>>,
     /// The last mapi-lite probe verdict, reused by `GET /ready` until it
@@ -334,7 +339,7 @@ impl Service {
             }
         }
 
-        let dynamic_config = DynamicConfig::new(config);
+        let dynamic_config = DynamicConfig::new(config)?;
         for client_config in &dynamic_config.contents.clients {
             crate::secrets::warn_plaintext_client_secrets(
                 &client_config.client_id,
@@ -377,10 +382,16 @@ impl Service {
                 .admin_api_key
                 .clone()
                 .filter(|key| !key.is_empty()),
+            auth_required: config.is_production_network()
+                && !config.web_interface.allow_unauthenticated,
+            network_type: config.blockchain_interface.network_type.clone(),
             idempotency: Mutex::new(IdempotencyStore::new(
                 config.idempotency.ttl(),
                 config.idempotency.max_entries,
             )),
+            funding_limits: crate::funding_limits::FundingLimits::new(
+                config.funding_limits.clone(),
+            ),
             address_watcher,
             mapi_health: Mutex::new(None),
             chain_health: Mutex::new(ChainHealth::default()),
@@ -469,6 +480,21 @@ impl Service {
     /// retry the same key.
     pub async fn release_idempotency(&self, key: &RecordKey) {
         self.idempotency.lock().await.release(key);
+    }
+
+    /// Checks a payout against `[funding_limits]` and holds it against the
+    /// client's window (CS-530). See [`crate::funding_limits`].
+    pub fn hold_funding(
+        &self,
+        client_id: &str,
+        satoshis: u64,
+    ) -> Result<Option<crate::funding_limits::Hold>, crate::funding_limits::LimitExceeded> {
+        self.funding_limits.check_and_hold(client_id, satoshis)
+    }
+
+    /// Gives back a payout held for a request that broadcast nothing.
+    pub fn release_funding(&self, hold: &crate::funding_limits::Hold) {
+        self.funding_limits.release(hold);
     }
 
     /// Create a new Service from the provided config
@@ -758,6 +784,28 @@ impl Service {
     }
 
     pub async fn add_client(&self, client_config: &ClientConfig) -> Result<(), CodedError> {
+        // Its /fund, balance and address would be open to anyone (CS-514).
+        if self.auth_required && client_config.api_key.as_deref().is_none_or(str::is_empty) {
+            return Err(CodedError::new(
+                ErrorCode::InvalidRequest,
+                "this service requires every client to have an api_key; provide api_key_env",
+            ));
+        }
+        // The dynamic config file would hold the key itself (CS-526). The
+        // message names neither the key nor any part of it (SR-SEC-010).
+        if !self
+            .dynamic_config
+            .lock()
+            .await
+            .accepts_wif(&client_config.wif_key)
+        {
+            return Err(CodedError::new(
+                ErrorCode::InvalidRequest,
+                "a raw wif would be stored in the dynamic config file; provide wif_env, naming \
+                 an environment variable that holds it, or set \
+                 dynamic_config.allow_plaintext_wif for development",
+            ));
+        }
         crate::secrets::warn_plaintext_client_secrets(
             &client_config.client_id,
             &client_config.wif_key,
@@ -1248,6 +1296,38 @@ impl Service {
             verdict: verdict.clone(),
         });
         Some(verdict)
+    }
+
+    /// The keys the authentication policy requires (CS-514), checked with
+    /// environment overrides applied and the clients loaded: on a production
+    /// network without the opt-out, `admin_api_key` must be set, or
+    /// `POST /client` and `DELETE /client` are open, and every client needs an
+    /// `api_key`, or its `/fund`, balance and address are. See
+    /// [`crate::config::Config::check_auth_policy`] for the rest.
+    pub async fn check_auth_policy(&self) -> Result<(), String> {
+        if !self.auth_required {
+            return Ok(());
+        }
+        if self.admin_api_key.is_none() {
+            return Err(format!(
+                "web_interface.admin_api_key is not set, so POST /client and DELETE /client would \
+                 be open on {}. Set it (or FS_ADMIN_API_KEY), or set \
+                 web_interface.allow_unauthenticated = true if a gateway in front of this service \
+                 authenticates callers",
+                self.network_type
+            ));
+        }
+        let mut without = self.clients_without_api_key().await;
+        if without.is_empty() {
+            return Ok(());
+        }
+        without.sort();
+        Err(format!(
+            "clients without an api_key: {}. Their /fund, balance and address routes would be \
+             open to anyone; give each an api_key (or FS_CLIENT_<ID>_API_KEY), or set \
+             web_interface.allow_unauthenticated = true if a gateway authenticates callers",
+            without.join(", ")
+        ))
     }
 
     /// Whether chain reads are recent enough to fund from (CS-505,
@@ -1863,6 +1943,32 @@ mod tests {
     async fn service_with_watcher(config: &Config, watcher: Arc<RecordingWatcher>) -> Arc<Service> {
         let blockchain = test_blockchain_interface(config).await;
         Arc::new(Service::new_for_test_with_watcher(config, blockchain, Some(watcher)).await)
+    }
+
+    /// CS-526: a dynamic config file that does not parse stops the service
+    /// starting, rather than starting it without those clients -- and then
+    /// overwriting their WIFs on the next `POST /client`.
+    #[tokio::test]
+    async fn sr_sec_023_an_unparseable_dynamic_config_refuses_startup() {
+        use crate::broadcaster::woc::WocBroadcaster;
+        let path = unique_dynamic_config_path();
+        std::fs::write(&path, "[[clients]]\nclient_id = ").unwrap();
+        let config = test_config(&path);
+        let blockchain = test_blockchain_interface(&config).await;
+        let broadcaster: Arc<dyn TxBroadcaster> = Arc::new(WocBroadcaster::new(
+            Arc::clone(&blockchain),
+            &config.blockchain_interface.interface_type,
+        ));
+        let result = Service::build(
+            &config,
+            Backend {
+                interface: blockchain,
+                address_watcher: None,
+            },
+            broadcaster,
+        );
+        let err = result.err().expect("startup must fail");
+        assert!(err.contains("does not parse"), "{err}");
     }
 
     /// A node reports zero for an address it does not track, so the configured
@@ -3788,6 +3894,69 @@ mod tests {
                 && line.starts_with(&format!("broadcast failed: funding tx {}", txids[1]))
                 && line.contains("class=failed, broadcaster=failing")
                 && line.ends_with("upstream error: simulated broadcast failure")));
+    }
+
+    /// CS-514: on a production network without the opt-out, a client with no
+    /// `api_key` stops startup, and cannot be added at runtime.
+    #[tokio::test]
+    async fn sr_sec_031_every_client_needs_an_api_key_on_a_production_network() {
+        let path = unique_dynamic_config_path();
+        let mut config = test_config_with_keys(&path, None, Some("admin"));
+        config.web_interface.allow_unauthenticated = false;
+        let blockchain = test_blockchain_interface(&config).await;
+        let service = Service::new_for_test(&config, blockchain).await;
+        let err = service.check_auth_policy().await.unwrap_err();
+        assert!(err.contains(TEST_CLIENT_ID), "{err}");
+
+        let added = service
+            .add_client(&ClientConfig {
+                client_id: "keyless".to_string(),
+                wif_key: "env:FS_RUNTIME_WIF_KEYLESS".to_string(),
+                api_key: None,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(added.code, ErrorCode::InvalidRequest);
+        assert!(
+            added.description.contains("api_key"),
+            "{}",
+            added.description
+        );
+
+        // With a key it starts.
+        let mut config = test_config_with_keys(&path, Some("client-key"), Some("admin"));
+        config.web_interface.allow_unauthenticated = false;
+        let blockchain = test_blockchain_interface(&config).await;
+        let service = Service::new_for_test(&config, blockchain).await;
+        assert!(service.check_auth_policy().await.is_ok());
+    }
+
+    /// CS-514: without an admin key, a production network does not start;
+    /// with one from the environment it does; regtest never needed one.
+    #[tokio::test]
+    async fn sr_sec_031_a_production_network_needs_an_admin_key() {
+        let path = unique_dynamic_config_path();
+        let mut config = test_config_with_keys(&path, Some("client-key"), None);
+        config.web_interface.allow_unauthenticated = false;
+        let blockchain = test_blockchain_interface(&config).await;
+        let service = Service::new_for_test(&config, blockchain).await;
+        let err = service.check_auth_policy().await.unwrap_err();
+        assert!(err.contains("admin_api_key"), "{err}");
+
+        config.blockchain_interface.network_type = "regtest".to_string();
+        let blockchain = test_blockchain_interface(&config).await;
+        let service = Service::new_for_test(&config, blockchain).await;
+        assert!(service.check_auth_policy().await.is_ok());
+    }
+
+    /// The opt-out lets a keyless client start, as before.
+    #[tokio::test]
+    async fn sr_sec_031_the_opt_out_allows_keyless_clients() {
+        let config = test_config_with_keys(&unique_dynamic_config_path(), None, None);
+        assert!(config.web_interface.allow_unauthenticated);
+        let blockchain = test_blockchain_interface(&config).await;
+        let service = Service::new_for_test(&config, blockchain).await;
+        assert!(service.check_auth_policy().await.is_ok());
     }
 
     /// A quote above `fees.max_satoshis_per_kb` is ignored and the current

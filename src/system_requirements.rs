@@ -198,4 +198,203 @@ mod tests {
         assert!(manifest.contains("features = [\"grpc-tonic\", \"trace\"]"));
         assert!(!manifest.contains("metrics"));
     }
+
+    // --- container and image (CS-527) ---
+
+    /// Lines of a shell script or Dockerfile that are not comments.
+    fn instructions(path: &str) -> Vec<String> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The runtime stage is the part after the last `FROM`.
+    fn runtime_stage() -> Vec<String> {
+        let lines = instructions("Dockerfile");
+        let last_from = lines.iter().rposition(|l| l.starts_with("FROM ")).unwrap();
+        lines[last_from..].to_vec()
+    }
+
+    #[test]
+    fn sr_sec_024_the_image_runs_as_an_unprivileged_user() {
+        let stage = runtime_stage();
+        let user = stage
+            .iter()
+            .rev()
+            .find(|l| l.starts_with("USER "))
+            .expect("the runtime stage must set USER");
+        let who = user.trim_start_matches("USER ").trim();
+        assert!(
+            who != "root" && who != "0" && !who.starts_with("0:"),
+            "{user}"
+        );
+    }
+
+    #[test]
+    fn sr_sec_024_run_sh_mounts_no_docker_socket_and_publishes_on_loopback() {
+        let run = instructions("run.sh").join("\n");
+        assert!(
+            !run.contains("docker.sock"),
+            "run.sh must not mount the Docker socket"
+        );
+        assert!(
+            run.contains("FS_PUBLISH_ADDRESS:-127.0.0.1"),
+            "run.sh must publish on loopback unless told otherwise"
+        );
+        assert!(run.contains("-p \"${PUBLISH_ADDRESS}:8080:8080\""), "{run}");
+    }
+
+    #[test]
+    fn sr_sec_025_the_image_builds_the_committed_lockfile() {
+        let build = instructions("Dockerfile")
+            .into_iter()
+            .filter(|l| l.contains("cargo install") || l.contains("cargo build"))
+            .collect::<Vec<_>>();
+        assert!(!build.is_empty(), "no cargo build step found");
+        for line in build {
+            assert!(line.contains("--locked"), "{line}");
+        }
+    }
+
+    #[test]
+    fn sr_sec_025_base_images_are_pinned_by_digest() {
+        let froms: Vec<_> = instructions("Dockerfile")
+            .into_iter()
+            .filter(|l| l.starts_with("FROM "))
+            .collect();
+        assert!(froms.len() >= 2, "{froms:?}");
+        for from in froms {
+            let image = from.split_whitespace().nth(1).unwrap();
+            let digest = image.split("@sha256:").nth(1).unwrap_or("");
+            assert!(
+                digest.len() == 64 && digest.chars().all(|c| c.is_ascii_hexdigit()),
+                "not pinned by digest: {from}"
+            );
+        }
+    }
+
+    /// Nothing that can hold a key reaches the build context, and the build
+    /// does not copy the data directory in at all.
+    #[test]
+    fn sr_sec_025_the_build_context_excludes_secrets_and_history() {
+        let ignore = instructions(".dockerignore");
+        for required in [
+            ".git",
+            "target",
+            "data/dynamic*",
+            "data/*.inflight.json",
+            "certs",
+        ] {
+            assert!(
+                ignore.iter().any(|l| l == required),
+                ".dockerignore must exclude {required}"
+            );
+        }
+        assert!(
+            !instructions("Dockerfile")
+                .iter()
+                .any(|l| l.starts_with("COPY ./data") || l.starts_with("COPY data")),
+            "the image build must not copy data/"
+        );
+    }
+
+    /// A published tag is the version in Cargo.toml and is never overwritten.
+    #[test]
+    fn sr_sec_026_publishing_takes_its_tag_from_cargo_toml_and_never_overwrites_one() {
+        let script = instructions("multi-build.sh").join("\n");
+        assert!(
+            !script.contains("VERSION=v"),
+            "the version must not be hard-coded"
+        );
+        assert!(
+            script.contains("Cargo.toml"),
+            "the version comes from Cargo.toml"
+        );
+        assert!(
+            script.contains("imagetools inspect \"$PUBLISH_TAG\""),
+            "an existing tag must be detected before pushing"
+        );
+        let check = script.find("imagetools inspect").unwrap();
+        let push = script.find("--push").unwrap();
+        assert!(
+            check < push,
+            "the existing-tag check must come before the push"
+        );
+        assert!(
+            script.contains("git status --porcelain"),
+            "a dirty tree must not be published"
+        );
+    }
+
+    // --- CI workflow (CS-528) ---
+
+    fn workflow() -> String {
+        std::fs::read_to_string(".github/workflows/rust.yml").unwrap()
+    }
+
+    /// The `uses:` lines, comments stripped.
+    fn uses_lines(workflow: &str) -> Vec<String> {
+        workflow
+            .lines()
+            .map(|l| l.split(" #").next().unwrap().trim())
+            .filter(|l| l.trim_start_matches("- ").starts_with("uses:"))
+            .map(|l| l.trim_start_matches("- ").to_string())
+            .collect()
+    }
+
+    /// A moved tag could hand the deploy key to other code.
+    #[test]
+    fn sr_sec_027_every_action_is_pinned_by_commit_sha() {
+        let uses = uses_lines(&workflow());
+        assert!(uses.len() >= 3, "{uses:?}");
+        for line in uses {
+            let target = line.trim_start_matches("uses:").trim();
+            if target.starts_with("./") {
+                continue;
+            }
+            let sha = target.split('@').nth(1).unwrap_or("");
+            assert!(
+                sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit()),
+                "not pinned by commit SHA: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn sr_sec_028_the_workflow_token_is_read_only_and_not_persisted() {
+        let workflow = workflow();
+        assert!(
+            workflow.lines().any(|l| l == "permissions: {}"),
+            "the workflow must default the token to no permissions"
+        );
+        assert!(workflow.contains("contents: read"));
+        assert!(
+            !workflow
+                .lines()
+                .map(|l| l.split(" #").next().unwrap().trim_end())
+                .any(|l| l.ends_with(": write") || l.trim() == "permissions: write-all"),
+            "no job needs a write permission"
+        );
+        assert!(workflow.contains("persist-credentials: false"));
+    }
+
+    /// The audit installer is third-party code: it runs before the deploy
+    /// key is in the agent, not after.
+    #[test]
+    fn sr_nfr_003_cargo_audit_runs_before_the_deploy_key_is_loaded() {
+        let workflow = workflow();
+        let audit = workflow.find("run: cargo audit").expect("an audit step");
+        let installer = workflow
+            .find("taiki-e/install-action")
+            .expect("its installer");
+        let key = workflow.find("webfactory/ssh-agent").expect("the key step");
+        assert!(
+            installer < key && audit < key,
+            "audit must run before the key is loaded"
+        );
+    }
 }
