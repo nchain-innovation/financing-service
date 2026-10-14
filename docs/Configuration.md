@@ -153,6 +153,22 @@ Set `admin_api_key` to require a shared secret on `POST /client`. Clients must s
 
 When `admin_api_key` is omitted, `POST /client` is unauthenticated. The service logs a warning at startup when the admin key is not configured.
 
+### Authentication is required on mainnet and testnet
+
+With `network_type` `mainnet` or `testnet`, the service **refuses to start** (CS-514) when:
+
+* `admin_api_key` is unset — `POST /client` and `DELETE /client` would be open; or
+* any client, static or dynamic, has no `api_key` — its `/fund`, balance and address routes would be open; or
+* `dynamic_config.allow_plaintext_wif` is set — a raw key would cross the network in a `POST /client` body. This one has no opt-out.
+
+At runtime, `POST /client` likewise refuses a client without an `api_key` (or `api_key_env`).
+
+If a gateway in front of the service authenticates callers instead, set `web_interface.allow_unauthenticated = true`. The service then starts as before, with a warning. `regtest` and `stn` are unaffected.
+
+### TLS is required in front of the service in production
+
+The service speaks plain HTTP. API keys, and the WIF a client is funded from, are secrets, so in production terminate TLS in front of it — a reverse proxy or load balancer on the same host or a private network — and do not expose its port directly. `POST /client` takes only `wif_env` (an environment-variable name, not the key) on mainnet and testnet, so no private key needs to cross the network at all; API keys still do, which is what the TLS is for.
+
 ### Rate limiting
 
 Optional per-IP rate limiting is configured under `[web_interface.rate_limit]`:
@@ -447,7 +463,7 @@ filename = "./data/dynamic.toml"
 # wif_env_prefix = "FS_RUNTIME_WIF_"
 ```
 
-* **Only `env:VAR` references by default.** `POST /client` refuses a raw `wif` with HTTP 400 and stores nothing; send `wif_env`, naming an environment variable that holds the key, and the file records `env:VAR` instead. `allow_plaintext_wif = true` lifts this for development. A file written before this, holding raw WIFs, still loads, with the usual plaintext warning.
+* **Only `env:VAR` references by default.** `POST /client` refuses a raw `wif` with HTTP 400 and stores nothing; send `wif_env`, naming an environment variable that holds the key, and the file records `env:VAR` instead. `allow_plaintext_wif = true` lifts this for development; on mainnet and testnet it is refused at startup (CS-514). A file written before this, holding raw WIFs, still loads, with the usual plaintext warning.
 * **Written atomically, owner-only.** Every change is written to a `0600` sibling file, synced, and renamed over the original, so a crash cannot truncate it and other users cannot read it. A file found readable by other users at startup is made `0600`, with a warning. A client is added or removed in memory only once the file has been written.
 * **A file that does not parse stops startup.** It is left exactly as it is, to be fixed by hand, rather than replaced with an empty list on the next `POST /client`. A missing or empty file means no dynamic clients.
 * `wif_env_prefix` — the only environment variables a client added through `POST /client` may take its key from with `wif_env`. Default `FS_RUNTIME_WIF_`. It is rejected at startup if it overlaps `FS_CLIENT_`, which every client's own override variable (`FS_CLIENT_<ID>_WIF`) starts with (CS-521).

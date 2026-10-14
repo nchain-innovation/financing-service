@@ -18,6 +18,12 @@ network_type = "testnet"
 [web_interface]
 address = "127.0.0.1"
 port = 8080
+# On mainnet and testnet the service will not start without an admin key, and
+# every client needs an api_key (CS-514). Prefer the environment:
+# FS_ADMIN_API_KEY, FS_CLIENT_<ID>_API_KEY.
+# admin_api_key = "env:FS_ADMIN_API_KEY"
+# Only if a gateway in front of this service authenticates callers:
+# allow_unauthenticated = true
 # [web_interface.rate_limit]
 # enabled = true
 # requests_per_second = 10

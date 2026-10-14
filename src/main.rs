@@ -64,6 +64,18 @@ async fn main() -> std::io::Result<()> {
         log::error!("Unable to start service: {e}");
         std::io::Error::other(e)
     })?;
+    // CS-514: on mainnet and testnet, every route that spends needs a key.
+    service.check_auth_policy().await.map_err(|e| {
+        log::error!("Unable to start service: {e}");
+        std::io::Error::other(e)
+    })?;
+    if config.is_production_network() && config.web_interface.allow_unauthenticated {
+        log::warn!(
+            "web_interface.allow_unauthenticated is set on {}: authentication is left to whatever \
+             is in front of this service",
+            config.blockchain_interface.network_type
+        );
+    }
     // Which way funding transactions leave the service. Reads always go
     // through [blockchain_interface]; this names the write path.
     log::info!("{}", broadcaster::factory::describe_broadcaster(&config));
