@@ -65,11 +65,26 @@ pub struct ClientAddRequest {
 }
 
 impl ClientAddRequest {
-    fn into_client_config(self) -> Result<ClientConfig, String> {
+    /// `wif_env_prefix` is `dynamic_config.wif_env_prefix`: the only variables
+    /// a runtime client may take its key from (CS-521).
+    fn into_client_config(self, wif_env_prefix: &str) -> Result<ClientConfig, String> {
         let wif_key = match (self.wif, self.wif_env) {
+            // A literal WIF is stored as given, so an `env:` one would be read
+            // as a reference to any variable at all -- the check below,
+            // skipped.
+            (Some(wif), None) if wif.starts_with(crate::secrets::ENV_PREFIX) => {
+                return Err(
+                    "wif is a key, not a reference; name a variable with wif_env".to_string(),
+                )
+            }
             (Some(wif), None) => wif,
             (None, Some(env_var)) => {
                 validate_env_var_name(&env_var)?;
+                if env_var.len() <= wif_env_prefix.len() || !env_var.starts_with(wif_env_prefix) {
+                    return Err(format!(
+                        "wif_env must name a variable starting with {wif_env_prefix:?}"
+                    ));
+                }
                 secret_reference(&env_var)
             }
             (Some(_), Some(_)) => {
@@ -554,12 +569,16 @@ fn replay(outcome: Outcome) -> HttpResponse {
 /// answered and refused the transaction, which is as definite as "nothing was
 /// spent" gets -- and since that rejection will not change on a resubmission,
 /// holding the key would only stop the client using it for the corrected
-/// request.
+/// request. `broadcast_failed` is safe since CS-501: it now means the
+/// transaction certainly did not reach a node -- a refused connection, a
+/// mapi-lite `503`, or a refusal the node said was worth retrying -- because
+/// every failure that may have delivered it is `broadcast_outcome_unknown`.
+/// Its documented advice is "retry may succeed", and holding the key made
+/// that retry impossible with the same key.
 ///
-/// Everything else is left to expire. `broadcast_failed` covers an unreachable
-/// upstream as well as a retryable refusal; `broadcast_outcome_unknown` is
-/// unknown by definition; and a commit failure means the transaction is
-/// definitely on chain. The cost is that the same `idempotency_key` cannot be
+/// Everything else is left to expire. `broadcast_outcome_unknown` is unknown
+/// by definition, and a commit failure means the transaction is definitely on
+/// chain. The cost is that the same `idempotency_key` cannot be
 /// retried until the TTL elapses; the alternative risks the duplicate this
 /// whole mechanism exists to prevent.
 async fn release_if_nothing_was_spent(
@@ -573,6 +592,7 @@ async fn release_if_nothing_was_spent(
             | ErrorCode::NoSuitableUtxo
             | ErrorCode::FundsInFlight
             | ErrorCode::BroadcastRejected
+            | ErrorCode::BroadcastFailed
     );
     if certainly_pre_broadcast {
         if let Some((key, _)) = record {
@@ -602,7 +622,10 @@ pub async fn add_client(
     if let Some(response) = authorize_admin(&req, &data.service) {
         return response;
     }
-    let client_config = match info.into_inner().into_client_config() {
+    let client_config = match info
+        .into_inner()
+        .into_client_config(data.service.wif_env_prefix())
+    {
         Ok(client_config) => client_config,
         Err(description) => return error_response(ErrorCode::InvalidRequest, description),
     };
@@ -741,7 +764,7 @@ mod tests {
         test_support::{
             test_blockchain_interface, test_config, test_config_with_keys,
             unique_dynamic_config_path, CountingBlockchain, StubMapiBroadcaster,
-            LOCKING_SCRIPT_HEX, TEST_ADDRESS, TEST_CLIENT_ID, TEST_WIF,
+            LOCKING_SCRIPT_HEX, OTHER_TEST_WIF, TEST_ADDRESS, TEST_CLIENT_ID, TEST_WIF,
         },
     };
 
@@ -1205,7 +1228,7 @@ mod tests {
 
     #[actix_web::test]
     async fn test_add_client_with_wif_env() {
-        unsafe { std::env::set_var("FS_TEST_ADD_CLIENT_WIF", TEST_WIF) };
+        unsafe { std::env::set_var("FS_RUNTIME_WIF_TEST_ADD_CLIENT", OTHER_TEST_WIF) };
         let app = build_app().await;
         let resp = test::call_service(
             &app,
@@ -1213,7 +1236,7 @@ mod tests {
                 .uri("/client")
                 .set_json(json!({
                     "client_id": "client_env",
-                    "wif_env": "FS_TEST_ADD_CLIENT_WIF",
+                    "wif_env": "FS_RUNTIME_WIF_TEST_ADD_CLIENT",
                 }))
                 .to_request(),
         )
@@ -1232,7 +1255,7 @@ mod tests {
                 .uri("/client")
                 .set_json(json!({
                     "client_id": "client2",
-                    "wif": TEST_WIF,
+                    "wif": OTHER_TEST_WIF,
                 }))
                 .to_request(),
         )
@@ -1251,7 +1274,7 @@ mod tests {
                 .uri("/client")
                 .set_json(json!({
                     "client_id": TEST_CLIENT_ID,
-                    "wif": TEST_WIF,
+                    "wif": OTHER_TEST_WIF,
                 }))
                 .to_request(),
         )
@@ -1926,7 +1949,7 @@ mod tests {
                 .uri("/client")
                 .set_json(json!({
                     "client_id": "client2",
-                    "wif": TEST_WIF,
+                    "wif": OTHER_TEST_WIF,
                 }))
                 .to_request(),
         )
@@ -1944,7 +1967,7 @@ mod tests {
                 .insert_header(("Authorization", format!("Bearer {TEST_ADMIN_API_KEY}")))
                 .set_json(json!({
                     "client_id": "client2",
-                    "wif": TEST_WIF,
+                    "wif": OTHER_TEST_WIF,
                     "api_key": "new-client-key",
                 }))
                 .to_request(),
@@ -1963,7 +1986,7 @@ mod tests {
                 .insert_header(("X-API-Key", "wrong-admin-key"))
                 .set_json(json!({
                     "client_id": "client2",
-                    "wif": TEST_WIF,
+                    "wif": OTHER_TEST_WIF,
                 }))
                 .to_request(),
         )
@@ -2227,7 +2250,7 @@ mod tests {
 
     #[actix_web::test]
     async fn sr_func_007_add_client_persists_to_dynamic_config_file() {
-        unsafe { std::env::set_var("FS_TEST_ADD_CLIENT_WIF", TEST_WIF) };
+        unsafe { std::env::set_var("FS_RUNTIME_WIF_TEST_ADD_CLIENT", OTHER_TEST_WIF) };
         let path = unique_dynamic_config_path();
         let config = test_config_with_keys(&path, None, None);
         let (app, _service) = build_app_with_service(config).await;
@@ -2237,7 +2260,7 @@ mod tests {
                 .uri("/client")
                 .set_json(json!({
                     "client_id": "client_env",
-                    "wif_env": "FS_TEST_ADD_CLIENT_WIF",
+                    "wif_env": "FS_RUNTIME_WIF_TEST_ADD_CLIENT",
                 }))
                 .to_request(),
         )
@@ -2245,7 +2268,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let saved = std::fs::read_to_string(&path).unwrap();
         assert!(saved.contains("client_env"));
-        assert!(saved.contains("env:FS_TEST_ADD_CLIENT_WIF"));
+        assert!(saved.contains("env:FS_RUNTIME_WIF_TEST_ADD_CLIENT"));
     }
 
     #[actix_web::test]
@@ -2260,7 +2283,7 @@ mod tests {
             },
             ClientConfig {
                 client_id: "client2".to_string(),
-                wif_key: TEST_WIF.to_string(),
+                wif_key: OTHER_TEST_WIF.to_string(),
                 api_key: None,
             },
         ]);
@@ -2287,7 +2310,7 @@ mod tests {
         service
             .add_client(&ClientConfig {
                 client_id: "deletable".to_string(),
-                wif_key: TEST_WIF.to_string(),
+                wif_key: OTHER_TEST_WIF.to_string(),
                 api_key: Some(TEST_API_KEY.to_string()),
             })
             .await
@@ -2342,6 +2365,22 @@ mod tests {
         assert!(!body.contains(secret_wif));
     }
 
+    /// POST /client with `body`: the status, and the error code if any.
+    async fn add_client_code(body: Value) -> (StatusCode, Value) {
+        let app = build_app().await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/client")
+                .set_json(body)
+                .to_request(),
+        )
+        .await;
+        let http = resp.status();
+        let body: Value = test::read_body_json(resp).await;
+        (http, body["code"].clone())
+    }
+
     /// One /fund, answered after `req`, as status and error code.
     async fn fund_code(
         app: &impl ActixService<Request, Response = ServiceResponse, Error = Error>,
@@ -2356,6 +2395,68 @@ mod tests {
         let http = resp.status();
         let body: Value = test::read_body_json(resp).await;
         (http, body["code"].clone())
+    }
+
+    /// The CS-521 attack, and each way around it. A new client may not take
+    /// id1's key: not by naming id1's own override variable, not by an
+    /// `env:` reference in `wif`, not through a permitted variable that holds
+    /// the same key, and not by supplying the key itself.
+    #[actix_web::test]
+    // The environment lock is held across the requests on purpose: these set
+    // FS_CLIENT_ID1_WIF, which config tests also set under the lock, and any
+    // service built for id1 reads it. No async test takes the lock, so holding
+    // it here cannot deadlock.
+    #[allow(clippy::await_holding_lock)]
+    async fn sr_sec_018_a_runtime_client_cannot_take_another_client_s_key() {
+        let _env = crate::test_support::env_lock();
+        unsafe {
+            std::env::set_var("FS_CLIENT_ID1_WIF", TEST_WIF);
+            std::env::set_var("FS_RUNTIME_WIF_STOLEN", TEST_WIF);
+            // A key no client holds -- another service's, say -- that the
+            // operator never set aside for runtime clients.
+            std::env::set_var("UNRELATED_SERVICE_KEY", OTHER_TEST_WIF);
+        }
+        let attempts = [
+            json!({"client_id": "evil", "wif_env": "FS_CLIENT_ID1_WIF", "api_key": "mine"}),
+            json!({"client_id": "evil", "wif_env": "FS_RUNTIME_WIF_", "api_key": "mine"}),
+            json!({"client_id": "evil", "wif": "env:FS_CLIENT_ID1_WIF", "api_key": "mine"}),
+            json!({"client_id": "evil", "wif": "env:FS_RUNTIME_WIF_STOLEN", "api_key": "mine"}),
+            json!({"client_id": "evil", "wif_env": "FS_RUNTIME_WIF_STOLEN", "api_key": "mine"}),
+            json!({"client_id": "evil", "wif": TEST_WIF, "api_key": "mine"}),
+            // Only the prefix rule stops this one, and only the env: rule the
+            // next: neither key belongs to a client.
+            json!({"client_id": "evil", "wif_env": "UNRELATED_SERVICE_KEY", "api_key": "mine"}),
+            json!({"client_id": "evil", "wif": "env:UNRELATED_SERVICE_KEY", "api_key": "mine"}),
+        ];
+        let mut outcomes = Vec::new();
+        for body in attempts {
+            outcomes.push(add_client_code(body.clone()).await);
+        }
+        unsafe {
+            std::env::remove_var("FS_CLIENT_ID1_WIF");
+            std::env::remove_var("FS_RUNTIME_WIF_STOLEN");
+            std::env::remove_var("UNRELATED_SERVICE_KEY");
+        }
+        for (i, (http, code)) in outcomes.into_iter().enumerate() {
+            assert_eq!(http, StatusCode::BAD_REQUEST, "attempt {i}");
+            assert_eq!(code, "invalid_request", "attempt {i}");
+        }
+    }
+
+    /// A permitted variable holding a key of its own is the intended use.
+    #[actix_web::test]
+    // The environment lock is held across the requests on purpose: these set
+    // FS_CLIENT_ID1_WIF, which config tests also set under the lock, and any
+    // service built for id1 reads it. No async test takes the lock, so holding
+    // it here cannot deadlock.
+    #[allow(clippy::await_holding_lock)]
+    async fn sr_sec_018_a_prefixed_variable_with_its_own_key_is_accepted() {
+        let _env = crate::test_support::env_lock();
+        unsafe { std::env::set_var("FS_RUNTIME_WIF_GOOD", OTHER_TEST_WIF) };
+        let (http, _) =
+            add_client_code(json!({"client_id": "good", "wif_env": "FS_RUNTIME_WIF_GOOD"})).await;
+        unsafe { std::env::remove_var("FS_RUNTIME_WIF_GOOD") };
+        assert_eq!(http, StatusCode::OK);
     }
 
     /// The CS-519 attack: 2^32 copies of an empty script asked for about
@@ -2659,6 +2760,31 @@ mod tests {
             assert_eq!(resp.status(), StatusCode::CONFLICT);
             let json: Value = test::read_body_json(resp).await;
             assert_eq!(json["code"], "broadcast_rejected");
+        }
+    }
+
+    /// `broadcast_failed` now means the transaction certainly did not reach a
+    /// node (CS-501), and its advice is "retry may succeed" -- so the key is
+    /// free, and the retry is processed rather than refused as
+    /// `key_in_progress`.
+    #[actix_web::test]
+    async fn cs_501_a_retryable_refusal_releases_the_idempotency_key() {
+        let (app, _service) = build_app_with_rejecting_broadcaster(true).await;
+        let mut body = fund_body(TEST_CLIENT_ID, 123, 1, LOCKING_SCRIPT_HEX);
+        body["idempotency_key"] = json!("failed-1");
+
+        for _ in 0..2 {
+            let resp = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri("/fund")
+                    .set_json(body.clone())
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+            let json: Value = test::read_body_json(resp).await;
+            assert_eq!(json["code"], "broadcast_failed");
         }
     }
 

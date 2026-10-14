@@ -31,6 +31,12 @@ pub fn env_lock() -> MutexGuard<'static, ()> {
 pub const TEST_WIF: &str = "cTYmKQzX3CvHJAxe2sctsQaHG8ktiEnpXgyyycVXGg5pRcLJEeLd";
 pub const TEST_CLIENT_ID: &str = "id1";
 pub const TEST_ADDRESS: &str = "n1jaAsKZfE6kufLy5DAtAyQ1RzGXwMeNAF";
+
+/// A second wallet, for a client added alongside the first. Two clients may not
+/// share one (CS-521). Private key 2, as throwaway as `MAPI_TEST_SIGNER_WIF`'s
+/// key 1; testnet, compressed.
+pub const OTHER_TEST_WIF: &str = "cMahea7zqjxrtgAbB7LSGbcQUr1uX1ojuat9jZodMN87K7XCyj5v";
+pub const OTHER_TEST_ADDRESS: &str = "mg8Jz5776UdyiYcBb9Z873NTozEiADRW5H";
 pub const LOCKING_SCRIPT_HEX: &str = "76a914ddc574807c3035ab43553a22c0b9df1f55737fae88ac";
 
 /// Signs the envelopes a mock mapi-lite returns. Any valid WIF will do: the
@@ -91,6 +97,7 @@ pub fn test_config_with_keys(
         }]),
         dynamic_config: DynamicConfigConfig {
             filename: dynamic_filename.to_string(),
+            wif_env_prefix: crate::config::DEFAULT_WIF_ENV_PREFIX.to_string(),
         },
         ..Default::default()
     }
@@ -162,6 +169,9 @@ pub async fn test_blockchain_interface(
     blockchain_interface.set_network(&config.get_network().unwrap());
     blockchain_interface
         .set_utxo(TEST_ADDRESS, &test_utxo())
+        .await;
+    blockchain_interface
+        .set_utxo(OTHER_TEST_ADDRESS, &test_utxo())
         .await;
     blockchain_interface.set_height(1517571).await;
     Arc::new(blockchain_interface)

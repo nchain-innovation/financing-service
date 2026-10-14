@@ -330,10 +330,12 @@ Optional. Sets the fee the service pays on the funding transactions it builds. B
 [fees]
 satoshis_per_kb = 100
 use_mapi_fee_quote = true
+# max_satoshis_per_kb = 1000
 ```
 
 * `satoshis_per_kb` — the rate, in satoshis per kilobyte. The fee for a transaction is `ceil(tx_bytes * satoshis_per_kb / 1000)`, rounded **up** so that rounding never underpays. `tx_bytes` is the transaction's serialised size, counted as an upper bound: every output is its 8-byte value, its script's length prefix and the script, and every input is costed at the longest a signature can be. So a transaction never pays less than the rate on the bytes it actually has — until CS-471 each funded output was counted as its script alone, nine bytes short, and an ordinary transaction paid about 97 sat/KB at a configured 100. Must be greater than zero; the service refuses to start otherwise, because a transaction paying no fee is not relayed. Default `100`.
 * `use_mapi_fee_quote` — when `[mapi_lite]` is configured, take the rate from its `feeQuote` rather than from `satoshis_per_kb`. Default `true`. Without `[mapi_lite]` it has no effect, because there is nothing to ask.
+* `max_satoshis_per_kb` — the highest rate a fee quote may set (CS-523, SR-SEC-020). A quote above it is ignored, with a warning, and the current rate kept. It is not clamped: a rate that high is forged or a mistake. Default `1000`, which is ten times the default `satoshis_per_kb` and a thousand times mapi-lite's own default quote. Must be at least `satoshis_per_kb`.
 
 ### Dust change goes to the fee
 
@@ -394,6 +396,7 @@ auth_token = "env:FS_MAPI_LITE_AUTH_TOKEN"
 # health_timeout_seconds = 2
 # max_retries = 2
 # total_timeout_seconds = 45
+# miner_id_public_keys = ["02…"]   # mapi-lite's minerId; see below
 ```
 
 * `base_url` — **required.** Base URL of the mapi-lite server, `http://` or `https://`. Surrounding whitespace and a trailing `/` are stripped before the URL is validated or used, so the value that is checked at startup is the one that is requested.
@@ -403,6 +406,7 @@ auth_token = "env:FS_MAPI_LITE_AUTH_TOKEN"
 * `max_retries` — how many times a submit is retried after a transient failure (an HTTP 5xx, a transport error, or an attempt that ran out of `timeout_seconds`). Default `2`, so three attempts, with linear back-off of 1s then 2s (capped at 5s). Resubmitting is safe: mapi-lite answers an already-known transaction with success — which is also how a retry can *settle* an attempt that timed out, turning `broadcast_outcome_unknown` back into a plain success.
 
   Raising this only buys attempts that fit inside `total_timeout_seconds`. If they do not, the service logs a warning at startup naming how many will actually start, and carries on — the combination is legal, it just does less than it asks for.
+* `miner_id_public_keys` — mapi-lite's miner-ID public keys, as hex (33-byte compressed or 65-byte uncompressed): the `minerId` in every response it signs (CS-523, SR-SEC-019). **Set this.** A signed response is otherwise checked only against the key *it carries*, which shows it was not altered, not who sent it. Anyone able to answer in mapi-lite's place — over plain HTTP, anyone on the path — could then forge an "accepted" or a fee quote. A response signed by any other key is refused: a fee quote is ignored, and a submit is reported as `broadcast_outcome_unknown`, because what the real mapi-lite did is hidden. List more than one key to cover a rotation. Default empty, which accepts any valid signature as before and is warned about at startup. Invalid hex or length is refused at startup.
 * `total_timeout_seconds` — ceiling on a whole submit: every attempt and every back-off between them. Default `45`; must be at least `timeout_seconds`. This is the worst case a `POST /fund` caller — and the actix worker serving it — can be held by an unresponsive mapi-lite, so it is the number to set first and then fit the other two inside.
 
   On expiry the caller gets `broadcast_outcome_unknown` (HTTP 504) if an attempt was still in flight, because cancelling a request says nothing about what the server did with it and the transaction may be on the network; the service reserves that transaction's inputs in response — see [When the outcome is unknown](SupportedEndpoints.md#when-the-outcome-is-unknown). If instead the deadline was consumed by back-off between attempts that were all refused outright, nothing was ever delivered and the caller gets `broadcast_failed` (HTTP 502) with no reservation.
@@ -426,7 +430,7 @@ When the section is present the service:
 * Asks mapi-lite's own `GET /ready` for this service's `GET /ready`, and returns HTTP 503 when mapi-lite is unreachable or not ready, reusing a verdict for up to `health_timeout_seconds`. mapi-lite's readiness fails when its nodes are unreachable or its block ingest has fallen behind; the fee quote this used to probe is served from mapi-lite's configuration and answered with every node down (CS-505). `GET /health` is unaffected. See [Readiness check](SupportedEndpoints.md#readiness-check).
 * Reports `"broadcaster": "mapi-lite"` in `GET /status`.
 * Funds a request from cached chain state that has merely aged, rather than waiting for it to be refreshed through `[blockchain_interface]`, and refreshes it behind the request — see [How often the service reads the chain](#how-often-the-service-reads-the-chain).
-* Submits each funding transaction as a one-element batch to `POST /mapi/txs`, with the merkle proof declined (no callbacks are wanted). A rejection by mapi-lite or the node surfaces to the caller as `broadcast_failed` (HTTP 502), with the reason in the service log. An answer that never arrives, or one this client cannot read, surfaces as `broadcast_outcome_unknown` (HTTP 504) instead, because the transaction may have reached the network.
+* Submits each funding transaction as a one-element batch to `POST /mapi/txs`, with the merkle proof declined (no callbacks are wanted). A rejection by mapi-lite or the node surfaces to the caller as `broadcast_failed` (HTTP 502) or `broadcast_rejected` (409), with the reason in the service log, as does a mapi-lite `503` (no node can have received it). Anything that may have reached the network surfaces as `broadcast_outcome_unknown` (HTTP 504) instead, and the inputs are reserved: an answer that never arrives or cannot be read, a mapi-lite `500`/`502`/`504` (from mapi-lite v0.4.0 a `504` means a node may have received it), and mapi-lite's "accepted by the node but could not be recorded", which is resubmitted first since the resubmission records it (CS-501).
 
 The mapi-lite server must be pointed at the same network as `network_type`, since the funding transactions are signed for that network. Because mapi-lite talks to a node directly, this is also a way to broadcast on regtest while still reading chain state through another interface.
 
@@ -439,7 +443,19 @@ Path to the file used to persist clients added at runtime via `POST /client`. Dy
 ```toml
 [dynamic_config]
 filename = "./data/dynamic.toml"
+# wif_env_prefix = "FS_RUNTIME_WIF_"
 ```
+
+* `wif_env_prefix` — the only environment variables a client added through `POST /client` may take its key from with `wif_env`. Default `FS_RUNTIME_WIF_`. It is rejected at startup if it overlaps `FS_CLIENT_`, which every client's own override variable (`FS_CLIENT_<ID>_WIF`) starts with (CS-521).
+
+**Runtime clients cannot take another client's wallet (CS-521, SR-SEC-018).** Before this, `wif_env` could name any variable in the service's environment, another client's `FS_CLIENT_<ID>_WIF` included. Whoever could call `POST /client` (anyone, with no `admin_api_key`) could then fund from that client's wallet under an API key of their own. Now:
+
+* `wif_env` must start with `wif_env_prefix`. **This is a breaking change:** a deployment that names other variables has to rename them, or set the prefix to match.
+* A `wif` beginning `env:` is refused; name a variable with `wif_env` instead.
+* A client whose key is the funding key of an existing client is refused, however the key was supplied. Two clients funding from one wallet would spend the same coins.
+* A `client_id` that folds onto an existing client's override variables (case and punctuation fold, so `ID.1` and `id_1` share `FS_CLIENT_ID_1_*`) is refused.
+
+Clients that already share a wallet when the service starts are reported as an error in the log, naming them. The service still starts. Remove the one that should not be there from the dynamic config.
 
 ## [[client]]
 
