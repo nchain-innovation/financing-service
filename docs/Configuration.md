@@ -8,7 +8,7 @@ The file is composed of the following sections:
 
 ## [blockchain_interface]
 
-Configures the blockchain interface. Supported `interface_type` values: `woc`, `uaas`, `rpc`, `test`.
+Configures the blockchain interface. Supported `interface_type` values: `woc`, `mapi_lite`, `uaas`, `rpc`, `test`.
 
 ```toml
 [blockchain_interface]
@@ -31,13 +31,32 @@ The interface you choose constrains which networks you can reach, and this is us
 | `interface_type` | Reaches | mainnet | testnet | stn | regtest |
 |---|---|---|---|---|---|
 | `woc` | WhatsOnChain, a public API | ✅ | ✅ | ✅ | ❌ |
+| `mapi_lite` | the [`[mapi_lite]`](#mapi_lite) server's address reads, which it answers from WhatsOnChain | ✅ | ✅ | ❌ | ❌ |
 | `uaas` | a UTXO as a Service instance (set `url`) | ✅ | ✅ | ✅ | ❌ |
 | `rpc` | a node's JSON-RPC endpoint, directly | ✅ | ✅ | ✅ | ✅ |
 | `test` | nothing — an in-process stub | — | — | — | — |
 
 **`rpc` is the only interface that reaches regtest**, because no public explorer indexes a private chain. It also works against a node you control on any other network, which removes the dependency on a third-party API being up.
 
-The interface serves both chain *reads* (balances, UTXOs) and, by default, the *broadcast* of funding transactions. The broadcast alone can be moved to a mapi-lite server with the optional [`[mapi_lite]`](#mapi_lite) section; reads stay here.
+The interface serves both chain *reads* (balances, UTXOs) and, by default, the *broadcast* of funding transactions. The broadcast alone can be moved to a mapi-lite server with the optional [`[mapi_lite]`](#mapi_lite) section; with `interface_type = "mapi_lite"` the reads go there too.
+
+### The `mapi_lite` interface
+
+```toml
+[blockchain_interface]
+interface_type = "mapi_lite"
+network_type = "testnet"
+
+[mapi_lite]
+base_url = "http://127.0.0.1:8080"
+```
+
+Reads each client's UTXO set and balance through the `[mapi_lite]` server's `/query/address/*` endpoints, with the same `base_url`, `auth_token` and `miner_id_public_keys` as broadcasts (CS-601, SR-BCHN-019). mapi-lite then makes every WhatsOnChain request for the deployment, paced by its one limit (`[woc] max_requests_per_second` there) against WhatsOnChain's one quota. With `woc` here as well, this service and mapi-lite each pace their own requests against that same quota and can exceed it between them.
+
+* Needs a `[mapi_lite]` section, and mapi-lite needs `[woc]` configured: without it mapi-lite answers address reads with `503`, which this service reports as `chain_unavailable`, never as an empty wallet.
+* mainnet and testnet only, since mapi-lite answers these reads from WhatsOnChain. Startup refuses `regtest` and `stn`; use `rpc` for a private chain.
+* `max_requests_per_second` is unset by default, as mapi-lite paces its own requests. `timeout_seconds` bounds each read as for any interface, and a read is one request to mapi-lite however many WhatsOnChain pages it takes there, so leave room for the largest address.
+* Broadcasts go through `[mapi_lite]` as before. `/status`'s connectivity check and the startup probe use mapi-lite's signed fee quote, which costs mapi-lite no WhatsOnChain request.
 
 ### The `rpc` interface
 

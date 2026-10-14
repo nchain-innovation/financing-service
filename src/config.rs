@@ -800,6 +800,32 @@ impl Config {
     }
 
     /// Return the configured network as Network type
+    /// Refuse a chain-read backend this configuration cannot serve (CS-601).
+    ///
+    /// `mapi_lite` reads through mapi-lite's `[mapi_lite]` server, so it needs
+    /// that section, and mapi-lite answers address reads from WhatsOnChain,
+    /// which indexes mainnet and testnet only.
+    pub fn check_chain_reads(&self) -> Result<(), String> {
+        if self.blockchain_interface.interface_type != "mapi_lite" {
+            return Ok(());
+        }
+        if self.mapi_lite.is_none() {
+            return Err(
+                "blockchain_interface.interface_type = \"mapi_lite\" reads through the \
+                 [mapi_lite] server, so it needs a [mapi_lite] section"
+                    .to_string(),
+            );
+        }
+        match self.blockchain_interface.network_type.as_str() {
+            "mainnet" | "testnet" => Ok(()),
+            other => Err(format!(
+                "blockchain_interface.interface_type = \"mapi_lite\" cannot read {other}: \
+                 mapi-lite answers address reads from WhatsOnChain, which indexes mainnet and \
+                 testnet only. Use interface_type = \"rpc\" for a private chain"
+            )),
+        }
+    }
+
     pub fn get_network(&self) -> Result<Network, &str> {
         match self.blockchain_interface.network_type.as_str() {
             "mainnet" => Ok(Network::BSV_Mainnet),
@@ -963,6 +989,7 @@ pub fn load_config(env_var: &str, filename: &str) -> Result<Config, String> {
     config.dynamic_config.validate()?;
     config.funding_limits.validate()?;
     config.check_auth_policy()?;
+    config.check_chain_reads()?;
     if let Some(mapi_lite) = &config.mapi_lite {
         mapi_lite.validate()?;
     }
@@ -1254,6 +1281,41 @@ filename = "./data/dynamic.toml"
                 .expect_err("expected validation to fail");
             assert!(error.contains(expected), "should name {expected}: {error}");
         }
+    }
+
+    /// CS-601: reading through mapi-lite needs its server, and a network its
+    /// WhatsOnChain-backed address reads can answer for.
+    #[test]
+    fn sr_bchn_019_mapi_lite_reads_need_the_section_and_a_public_network() {
+        let reads = |network: &str, mapi_lite: bool| Config {
+            blockchain_interface: BlockchainInterfaceConfig {
+                interface_type: "mapi_lite".to_string(),
+                network_type: network.to_string(),
+                ..Default::default()
+            },
+            mapi_lite: mapi_lite.then(|| MapiLiteConfig::for_base_url("http://mapi:8080")),
+            ..Default::default()
+        };
+        assert!(reads("testnet", true).check_chain_reads().is_ok());
+        assert!(reads("mainnet", true).check_chain_reads().is_ok());
+
+        let missing = reads("testnet", false).check_chain_reads().unwrap_err();
+        assert!(missing.contains("[mapi_lite]"), "{missing}");
+        for private in ["regtest", "stn"] {
+            let refused = reads(private, true).check_chain_reads().unwrap_err();
+            assert!(refused.contains("rpc"), "{refused}");
+        }
+
+        // Other backends are not this check's business.
+        let woc = Config {
+            blockchain_interface: BlockchainInterfaceConfig {
+                interface_type: "woc".to_string(),
+                network_type: "regtest".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(woc.check_chain_reads().is_ok());
     }
 
     /// Imports are on unless turned off, because the failure they prevent is
