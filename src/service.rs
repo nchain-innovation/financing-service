@@ -155,6 +155,8 @@ pub struct Service {
     fee_satoshis_per_kb: Mutex<u64>,
     /// Whether to take the rate from mapi-lite's fee quote when there is one.
     use_mapi_fee_quote: bool,
+    /// `fees.max_satoshis_per_kb`: no quote may set a rate above it (CS-523).
+    max_satoshis_per_kb: u64,
     /// Where each client's in-flight funding state is kept across a restart
     /// (CS-465). See [`Config::inflight_state_path`].
     inflight_state_path: PathBuf,
@@ -387,6 +389,7 @@ impl Service {
             chain_refresh_locks: std::sync::Mutex::new(HashMap::new()),
             fee_satoshis_per_kb: Mutex::new(config.fees.satoshis_per_kb),
             use_mapi_fee_quote: config.fees.use_mapi_fee_quote,
+            max_satoshis_per_kb: config.fees.max_satoshis_per_kb,
             inflight_state_path,
             inflight_save: Mutex::new(0),
             inflight_commits: std::sync::atomic::AtomicU64::new(0),
@@ -890,6 +893,17 @@ impl Service {
             return;
         };
         if rate == 0 {
+            return;
+        }
+        // A quote above the ceiling is ignored, not clamped: a rate that high
+        // is either forged or a mistake, and neither should be half-believed
+        // (CS-523).
+        if rate > self.max_satoshis_per_kb {
+            log::warn!(
+                "ignoring a mapi-lite fee quote of {rate} sat/KB, above fees.max_satoshis_per_kb \
+                 ({}); keeping the current rate",
+                self.max_satoshis_per_kb
+            );
             return;
         }
         let changed = {
@@ -3774,6 +3788,32 @@ mod tests {
                 && line.starts_with(&format!("broadcast failed: funding tx {}", txids[1]))
                 && line.contains("class=failed, broadcaster=failing")
                 && line.ends_with("upstream error: simulated broadcast failure")));
+    }
+
+    /// A quote above `fees.max_satoshis_per_kb` is ignored and the current
+    /// rate kept; one at the ceiling is taken (CS-523).
+    #[tokio::test]
+    async fn sr_sec_020_a_fee_quote_above_the_ceiling_is_ignored() {
+        use crate::test_support::StubMapiBroadcaster;
+
+        for (quoted, expected) in [(1001, 100), (50_000, 100), (1000, 1000), (250, 250)] {
+            let config = test_config(&unique_dynamic_config_path());
+            assert_eq!(config.fees.satoshis_per_kb, 100);
+            assert_eq!(config.fees.max_satoshis_per_kb, 1000);
+            let blockchain = test_blockchain_interface(&config).await;
+            let service = service_with(
+                &config,
+                blockchain,
+                StubMapiBroadcaster::quoting(Some(quoted)),
+            )
+            .await;
+            service.refresh_fee_rate().await;
+            assert_eq!(
+                service.fee_satoshis_per_kb().await,
+                expected,
+                "quote of {quoted}"
+            );
+        }
     }
 
     // --- CS-521: one wallet, one client -----------------------------------

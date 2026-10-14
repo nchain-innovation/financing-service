@@ -307,10 +307,12 @@ Optional. Sets the fee the service pays on the funding transactions it builds. B
 [fees]
 satoshis_per_kb = 100
 use_mapi_fee_quote = true
+# max_satoshis_per_kb = 1000
 ```
 
 * `satoshis_per_kb` — the rate, in satoshis per kilobyte. The fee for a transaction is `ceil(tx_bytes * satoshis_per_kb / 1000)`, rounded **up** so that rounding never underpays. `tx_bytes` is the transaction's serialised size, counted as an upper bound: every output is its 8-byte value, its script's length prefix and the script, and every input is costed at the longest a signature can be. So a transaction never pays less than the rate on the bytes it actually has — until CS-471 each funded output was counted as its script alone, nine bytes short, and an ordinary transaction paid about 97 sat/KB at a configured 100. Must be greater than zero; the service refuses to start otherwise, because a transaction paying no fee is not relayed. Default `100`.
 * `use_mapi_fee_quote` — when `[mapi_lite]` is configured, take the rate from its `feeQuote` rather than from `satoshis_per_kb`. Default `true`. Without `[mapi_lite]` it has no effect, because there is nothing to ask.
+* `max_satoshis_per_kb` — the highest rate a fee quote may set (CS-523, SR-SEC-020). A quote above it is ignored, with a warning, and the current rate kept. It is not clamped: a rate that high is forged or a mistake. Default `1000`, which is ten times the default `satoshis_per_kb` and a thousand times mapi-lite's own default quote. Must be at least `satoshis_per_kb`.
 
 ### Dust change goes to the fee
 
@@ -371,6 +373,7 @@ auth_token = "env:FS_MAPI_LITE_AUTH_TOKEN"
 # health_timeout_seconds = 2
 # max_retries = 2
 # total_timeout_seconds = 45
+# miner_id_public_keys = ["02…"]   # mapi-lite's minerId; see below
 ```
 
 * `base_url` — **required.** Base URL of the mapi-lite server, `http://` or `https://`. Surrounding whitespace and a trailing `/` are stripped before the URL is validated or used, so the value that is checked at startup is the one that is requested.
@@ -380,6 +383,7 @@ auth_token = "env:FS_MAPI_LITE_AUTH_TOKEN"
 * `max_retries` — how many times a submit is retried after a transient failure (an HTTP 5xx, a transport error, or an attempt that ran out of `timeout_seconds`). Default `2`, so three attempts, with linear back-off of 1s then 2s (capped at 5s). Resubmitting is safe: mapi-lite answers an already-known transaction with success — which is also how a retry can *settle* an attempt that timed out, turning `broadcast_outcome_unknown` back into a plain success.
 
   Raising this only buys attempts that fit inside `total_timeout_seconds`. If they do not, the service logs a warning at startup naming how many will actually start, and carries on — the combination is legal, it just does less than it asks for.
+* `miner_id_public_keys` — mapi-lite's miner-ID public keys, as hex (33-byte compressed or 65-byte uncompressed): the `minerId` in every response it signs (CS-523, SR-SEC-019). **Set this.** A signed response is otherwise checked only against the key *it carries*, which shows it was not altered, not who sent it. Anyone able to answer in mapi-lite's place — over plain HTTP, anyone on the path — could then forge an "accepted" or a fee quote. A response signed by any other key is refused: a fee quote is ignored, and a submit is reported as `broadcast_outcome_unknown`, because what the real mapi-lite did is hidden. List more than one key to cover a rotation. Default empty, which accepts any valid signature as before and is warned about at startup. Invalid hex or length is refused at startup.
 * `total_timeout_seconds` — ceiling on a whole submit: every attempt and every back-off between them. Default `45`; must be at least `timeout_seconds`. This is the worst case a `POST /fund` caller — and the actix worker serving it — can be held by an unresponsive mapi-lite, so it is the number to set first and then fit the other two inside.
 
   On expiry the caller gets `broadcast_outcome_unknown` (HTTP 504) if an attempt was still in flight, because cancelling a request says nothing about what the server did with it and the transaction may be on the network; the service reserves that transaction's inputs in response — see [When the outcome is unknown](SupportedEndpoints.md#when-the-outcome-is-unknown). If instead the deadline was consumed by back-off between attempts that were all refused outright, nothing was ever delivered and the caller gets `broadcast_failed` (HTTP 502) with no reservation.

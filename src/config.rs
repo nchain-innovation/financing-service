@@ -259,6 +259,14 @@ pub struct FeesConfig {
     /// no effect, because there is nothing to ask.
     #[serde(default = "default_use_mapi_fee_quote")]
     pub use_mapi_fee_quote: bool,
+    /// The highest rate a mapi-lite fee quote may set, in satoshis per KB
+    /// (CS-523, SR-SEC-020). A quote above it is ignored and the current rate
+    /// kept, so a forged or mistaken quote cannot make every funding
+    /// transaction overpay. Default 1000: ten times `satoshis_per_kb`'s
+    /// default, and a thousand times mapi-lite's own default quote. Must be at
+    /// least `satoshis_per_kb`.
+    #[serde(default = "default_max_satoshis_per_kb")]
+    pub max_satoshis_per_kb: u64,
 }
 
 impl Default for FeesConfig {
@@ -266,6 +274,7 @@ impl Default for FeesConfig {
         FeesConfig {
             satoshis_per_kb: default_satoshis_per_kb(),
             use_mapi_fee_quote: default_use_mapi_fee_quote(),
+            max_satoshis_per_kb: default_max_satoshis_per_kb(),
         }
     }
 }
@@ -279,6 +288,12 @@ impl FeesConfig {
                         transaction paying no fee is not relayed."
                 .to_string());
         }
+        if self.max_satoshis_per_kb < self.satoshis_per_kb {
+            return Err(format!(
+                "fees.max_satoshis_per_kb ({}) must be at least satoshis_per_kb ({})",
+                self.max_satoshis_per_kb, self.satoshis_per_kb
+            ));
+        }
         Ok(())
     }
 }
@@ -290,6 +305,13 @@ impl FeesConfig {
 /// section pays less than it used to, which is the point of CS-451, but it is
 /// a behaviour change and not only a refactor.
 pub const DEFAULT_SATOSHIS_PER_KB: u64 = 100;
+
+/// See [`FeesConfig::max_satoshis_per_kb`].
+pub const DEFAULT_MAX_SATOSHIS_PER_KB: u64 = 1000;
+
+fn default_max_satoshis_per_kb() -> u64 {
+    DEFAULT_MAX_SATOSHIS_PER_KB
+}
 
 fn default_satoshis_per_kb() -> u64 {
     DEFAULT_SATOSHIS_PER_KB
@@ -374,6 +396,13 @@ pub struct MapiLiteConfig {
     /// open for minutes. Must be at least `timeout_seconds`.
     #[serde(default = "default_mapi_lite_total_timeout_seconds")]
     pub total_timeout_seconds: u64,
+    /// mapi-lite's miner-ID public keys, as hex: the `minerId` in every
+    /// response it signs (CS-523, SR-SEC-019). A response signed by any other
+    /// key is refused. Several allow a rotation. Empty -- the default -- accepts
+    /// any valid signature, which proves nothing about the sender, so the
+    /// service warns at startup.
+    #[serde(default)]
+    pub miner_id_public_keys: Vec<String>,
 }
 
 /// One attempt's ceiling.
@@ -423,6 +452,7 @@ impl MapiLiteConfig {
             health_timeout_seconds: default_mapi_lite_health_timeout_seconds(),
             max_retries: default_mapi_lite_max_retries(),
             total_timeout_seconds: default_mapi_lite_total_timeout_seconds(),
+            miner_id_public_keys: Vec::new(),
         }
     }
 
@@ -531,8 +561,39 @@ impl MapiLiteConfig {
                 self.total_timeout_seconds, self.timeout_seconds
             ));
         }
+        for key in &self.miner_id_public_keys {
+            if !is_public_key_hex(key) {
+                return Err(format!(
+                    "mapi_lite.miner_id_public_keys: {key:?} is not a public key in hex \
+                     (33 bytes starting 02 or 03, or 65 starting 04)"
+                ));
+            }
+        }
         Ok(())
     }
+
+    /// The startup warning for a section that names no miner ID (CS-523).
+    pub fn unpinned_warning(&self) -> Option<&'static str> {
+        self.miner_id_public_keys.is_empty().then_some(
+            "mapi_lite.miner_id_public_keys is empty: responses from mapi-lite are signed, but \
+             by a key nothing checks, so anyone able to answer in its place can forge an \
+             'accepted' or a fee quote. Set it to mapi-lite's minerId.",
+        )
+    }
+}
+
+/// A secp256k1 public key in hex: compressed (33 bytes, `02`/`03`) or
+/// uncompressed (65 bytes, `04`). The shape only; whether it is on the curve is
+/// for the signature check to find out.
+fn is_public_key_hex(key: &str) -> bool {
+    let key = key.trim();
+    let hex_ok = key.chars().all(|c| c.is_ascii_hexdigit());
+    hex_ok
+        && match key.len() {
+            66 => key.starts_with("02") || key.starts_with("03"),
+            130 => key.starts_with("04"),
+            _ => false,
+        }
 }
 
 #[derive(Debug, Default, Deserialize, Clone)]
@@ -1753,6 +1814,53 @@ filename = "./data/dynamic.toml"
         assert_eq!(service(10, None).ready_max_chain_read_age(), secs(60));
         assert_eq!(service(60, Some(45)).ready_max_chain_read_age(), secs(45));
         assert_eq!(service(60, Some(0)).ready_max_chain_read_age(), None);
+    }
+
+    /// Miner IDs must look like public keys, so a typo is caught at startup
+    /// rather than refusing every response (CS-523).
+    #[test]
+    fn sr_sec_019_miner_id_public_keys_must_be_public_keys() {
+        let check = |keys: &[&str]| {
+            let mut config = MapiLiteConfig::for_base_url("http://mapi-lite");
+            config.miner_id_public_keys = keys.iter().map(|k| k.to_string()).collect();
+            config.validate()
+        };
+        let good = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        assert!(check(&[]).is_ok());
+        assert!(check(&[good]).is_ok());
+        assert!(check(&[&good.to_uppercase()]).is_ok());
+        assert!(check(&[&format!("04{}", "ab".repeat(64))]).is_ok());
+        for bad in [
+            "02abc",
+            &format!("05{}", &good[2..]),
+            &format!("{}zz", &good[..64]),
+            &format!("04{}", "ab".repeat(32)),
+        ] {
+            assert!(check(&[good, bad]).is_err(), "{bad:?} was accepted");
+        }
+    }
+
+    /// Unpinned is allowed, and said so.
+    #[test]
+    fn sr_sec_019_an_unpinned_section_is_warned_about() {
+        let mut config = MapiLiteConfig::for_base_url("http://mapi-lite");
+        assert!(config.unpinned_warning().is_some());
+        config.miner_id_public_keys =
+            vec!["0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".to_string()];
+        assert!(config.unpinned_warning().is_none());
+    }
+
+    /// The fee ceiling may not sit below the rate it caps.
+    #[test]
+    fn sr_sec_020_the_fee_ceiling_is_at_least_the_configured_rate() {
+        let fees = |rate, max| FeesConfig {
+            satoshis_per_kb: rate,
+            max_satoshis_per_kb: max,
+            ..FeesConfig::default()
+        };
+        assert!(FeesConfig::default().validate().is_ok());
+        assert!(fees(100, 100).validate().is_ok());
+        assert!(fees(100, 99).validate().is_err());
     }
 
     /// The runtime-client prefix may not be one a client's own override
