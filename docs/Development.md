@@ -49,6 +49,8 @@ cargo build
 
 `./build.sh` runs `docker build` with BuildKit and `--ssh default`, which lends your ssh-agent socket to the one build step that fetches dependencies; the key never enters the image. Have an agent running with the key loaded before building. `multi-build.sh` passes the same flag to `docker buildx build`.
 
+Moving a base image: both `FROM` lines are pinned by tag **and** digest. Take the index digest from `docker buildx imagetools inspect <image:tag>` and update both parts together; `system_requirements::tests::sr_sec_025_base_images_are_pinned_by_digest` fails on a `FROM` without one.
+
 ## Formatting and linting
 
 Check formatting:
