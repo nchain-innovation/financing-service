@@ -128,6 +128,7 @@ mod tests {
         let config = Config {
             dynamic_config: DynamicConfigConfig {
                 filename: path.clone(),
+                wif_env_prefix: crate::config::DEFAULT_WIF_ENV_PREFIX.to_string(),
                 ..Default::default()
             },
             ..Default::default()
