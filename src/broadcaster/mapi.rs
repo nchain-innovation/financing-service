@@ -3,15 +3,17 @@
 //! mapi-lite is nChain's Rust MerchantAPI surface; `uls-client` is its typed
 //! HTTP client and shares the wire types with the server, so this module never
 //! spells out JSON. A submit is `POST /mapi/txs` with a one-element batch; the
-//! health probe is `GET /mapi/feeQuote`, which `uls-client` documents as the
-//! readiness probe -- it is authenticated and signed, so a pass proves the
-//! token and the response-verification path both work, which is exactly what
-//! a submit needs.
+//! fee rate comes from `GET /mapi/feeQuote`. The health probe is mapi-lite's
+//! own `GET /ready` (CS-505), which fails when mapi-lite cannot do its work --
+//! nodes unreachable, block ingest behind, or it cannot sign or reach its
+//! database. It used to be the fee quote, which mapi-lite answers from its
+//! configuration even with every node down.
 //!
-//! Two clients share one base URL and token: the submit client and the probe
-//! client, the latter with a short timeout and no retries, because `GET
-//! /ready` has to answer inside a readiness probe's few seconds however slow
-//! mapi-lite is being.
+//! Two `uls-client` clients share one base URL and token: the submit client
+//! and the probe client, which fetches the fee quote. The probe client, and the
+//! plain HTTP client behind the health probe, have a short timeout and no
+//! retries, because `GET /ready` has to answer inside a readiness probe's few
+//! seconds however slow mapi-lite is being.
 //!
 //! **Retries are this module's, not uls-client's.** uls-client will retry a
 //! submit for us, but it reports the whole sequence as one `RetriesExhausted`

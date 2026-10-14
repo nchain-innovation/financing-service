@@ -78,13 +78,17 @@ cargo install cargo-audit --locked
 cargo audit
 ```
 
-These checks run automatically in GitHub Actions (`.github/workflows/rust.yml`) on push and pull request to `main`.
+These checks run automatically in GitHub Actions (`.github/workflows/rust.yml`) on every push to any branch and on every pull request, whatever it targets.
 
 ## Dependencies
 
 `Cargo.lock` is committed for reproducible builds. Run `cargo update` only when intentionally upgrading dependencies, then re-run tests and commit the updated lockfile.
 
-`chain-gang` must resolve to exactly one package in the lockfile — it is referenced both directly and through `uls-client` — and `dependency_graph::tests` fails the build if it does not. See [Dependencies.md](Dependencies.md) for why, and for the order to bump things in.
+`chain-gang` must resolve to exactly one package in the lockfile — it is referenced both directly and through `uls-core` — and `dependency_graph::tests` fails the build if it does not. See [Dependencies.md](Dependencies.md) for why, and for the order to bump things in.
+
+## Releases and versioning
+
+The version is the `version` in `Cargo.toml`; `GET /status` and the telemetry `service.version` report it. Release notes are in [Releases](Releases), oldest first, with changes not yet released in an `Unreleased` entry at the end. A release is tagged `vX.Y.Z`. An entry that begins `Breaking:` marks a change that is not backwards compatible.
 
 ## Source code documentation
 

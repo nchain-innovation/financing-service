@@ -141,11 +141,13 @@ pub async fn health() -> impl Responder {
 
 /// Readiness: can this service do its job right now?
 ///
-/// Without `[mapi_lite]` this matches `/health` -- there is no upstream whose
-/// absence would stop funding. With mapi-lite configured it probes mapi-lite
-/// and answers HTTP 503 when the probe fails, because a funding service whose
-/// only broadcast path is unreachable should be taken out of rotation rather
-/// than handed requests it will refuse.
+/// It reports chain-read health always: HTTP 503 once a client's last
+/// successful chain read is older than
+/// `service.ready_max_chain_read_age_seconds` (CS-505). With mapi-lite
+/// configured it also asks mapi-lite's own `GET /ready` and answers HTTP 503
+/// when that fails, because a funding service whose only broadcast path is
+/// unreachable should be taken out of rotation rather than handed requests it
+/// will refuse.
 ///
 /// Point a readiness probe here and a liveness probe at [`health`]. Sending
 /// both at this endpoint reintroduces exactly the restart loop the split

@@ -22,13 +22,13 @@ The FS is designed to be as simple as possible, in that light it:
 
 * FS accesses the blockchain through WhatsOnChain, UTXO as a Service (UaaS), or a node's JSON-RPC endpoint. The first two reach mainnet, testnet and STN; the `rpc` interface additionally reaches regtest, and works against any node you control. See [which interface reaches which network](docs/Configuration.md#which-interface-reaches-which-network).
 * FS can optionally broadcast funding transactions through [mapi-lite](https://github.com/nchain-innovation/mapi-lite) instead of the blockchain interface. Configure a `[mapi_lite]` section and transactions go to mapi-lite while chain reads stay where they were; leave it out and nothing changes. When configured, mapi-lite's own readiness is part of `GET /ready`, the readiness probe, alongside chain-read health; `GET /health` stays a pure liveness check. See [Configuration](docs/Configuration.md#mapi_lite). Building with this integration needs SSH access to the private mapi-lite repository — see [Dependencies](docs/Dependencies.md).
-* FS maintains an in-memory UTXO cache per client, refreshed periodically from the blockchain and before funding and balance requests. Clients added at runtime are persisted to a dynamic config file.
+* FS maintains an in-memory UTXO cache per client, refreshed periodically from the blockchain, and again by a funding or balance request that finds it older than `service.chain_state_max_age_seconds`. Clients added at runtime are persisted to a dynamic config file.
 * FS is configurable; it reads its configuration on startup.
 
 * FS does not cache funding transactions for client applications. That is a task better performed by the requesting application, which has much better oversight to determine how many funding transactions to cache, and when to request them.
 
 * FS is written in Rust.
-* FS build dependencies are all freely available open-source Rust crates.
+* FS build dependencies are open-source Rust crates, except `uls-client` and `uls-core`, which come from the private mapi-lite repository (see [Dependencies](docs/Dependencies.md)).
 
 * FS does not support Hierarchical Deterministic (HD) Keys (BIP-32).
 * FS supports optional per-client API key authentication and an optional admin key for `POST /client`. Clients without an `api_key` rely on network isolation (firewalls, private networks, reverse proxies). See [Configuration](docs/Configuration.md) and [Supported endpoints](docs/SupportedEndpoints.md).
@@ -50,7 +50,7 @@ The Financing Service Client use cases are:
 
 The Financing Service Admin use cases are:
 * `Get Status` - the FS will return the current status of the component.
-* `Health Check` - the FS exposes a liveness endpoint for container deployments (which also reports mapi-lite reachability when mapi-lite is configured).
+* `Health Check` - the FS exposes a liveness endpoint (`GET /health`) for container deployments, which checks no upstream, and a readiness endpoint (`GET /ready`), which reports chain-read health and, when mapi-lite is configured, mapi-lite's own readiness.
 * `Add Client` - Dynamically add the client while the service is running.
 * `Delete Client` - Dynamically delete the client while the service is running.
 * `Top-up Balance` - The Admin will provide a funding transaction to increase the satoshi that the FS can use for funding. This is done outside the Financing Service.
@@ -62,13 +62,13 @@ The Financing Service Admin use cases are:
 
 Diagram 2 - Financing Service Overview
 
-As shown in diagram 1 the FS provides an interface that the other application components interface with and uses the blockchain to create the funding transaction outpoints.
+As shown in diagram 2 the FS provides an interface that the other application components interface with and uses the blockchain to create the funding transaction outpoints.
 
 The service reads its configuration on startup, maintains per-client wallet state in memory, and persists runtime-added clients to disk.
 
-Before returning a balance or building a funding transaction, the service refreshes UTXO state from the blockchain. Concurrent fund requests for the same client use read-only planning under a shared lock and commit UTXO updates only after a transaction is broadcast successfully.
+Before returning a balance or building a funding transaction, the service refreshes UTXO state from the blockchain if its cached state is older than `service.chain_state_max_age_seconds` (with `[mapi_lite]`, a funding request uses state that has merely aged and the refresh runs behind it). Concurrent fund requests for the same client each claim the inputs they select under an exclusive per-client lock, so no two spend the same input, and broadcast outside it; a claim is committed only after its transaction is broadcast successfully.
 
-The service uses the `chain-gang` library to interact with the BSV blockchain via a configurable interface: WhatsOnChain (WoC) by default in sample config, or optionally UTXO as a Service (UaaS).
+The service uses the `chain-gang` library to interact with the BSV blockchain via a configurable interface: WhatsOnChain (WoC) by default in sample config, or optionally UTXO as a Service (UaaS) or a node's JSON-RPC endpoint (`rpc`).
 
 
 ## Getting Started

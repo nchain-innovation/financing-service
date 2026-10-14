@@ -24,7 +24,9 @@ cloud "Blockchain" {
 
 [Chain-Gang\n(BSV library)] ..> [Bitcoin node\n(JSON-RPC)] : RPC interface\n(interface_type = rpc)\n<<optional>>
 
-[uls-client\n(mapi-lite client)] ..> [mapi-lite] : POST /mapi/txs\nGET /mapi/feeQuote (health)
+[uls-client\n(mapi-lite client)] ..> [mapi-lite] : POST /mapi/txs\nGET /mapi/feeQuote (fee rate)
+
+[FinancingService] ..> [mapi-lite] : GET /ready (health probe)\n<<optional: [mapi_lite]>>
 
 [WhatsOnChain] ..> Blockchain
 [UTXO as a Service\n(UaaS)] ..> Blockchain

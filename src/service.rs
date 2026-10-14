@@ -1262,15 +1262,15 @@ impl Service {
     /// Probe mapi-lite for `GET /ready`, reusing a recent verdict.
     ///
     /// `None` when mapi-lite is not configured: there is then nothing to
-    /// probe, and `/health` stays the pure liveness check it always was.
+    /// probe, and `/ready` reports chain reads alone.
     ///
     /// The verdict is cached for `mapi_lite.health_timeout_seconds`, because
-    /// `/health` is unauthenticated *and* exempt from the rate limiter
+    /// `/ready` is unauthenticated *and* exempt from the rate limiter
     /// (SR-SEC-013), so without a cache anyone who can reach the port can turn
-    /// health traffic into an unbounded stream of requests to mapi-lite and
+    /// readiness traffic into an unbounded stream of requests to mapi-lite and
     /// starve the funding path from an endpoint that costs them nothing. One
-    /// probe per TTL bounds that, and still answers the Docker health check
-    /// (every 30s) with a fresh result each time.
+    /// probe per TTL bounds that, and still answers a readiness probe on any
+    /// ordinary interval with a fresh result each time.
     pub async fn mapi_lite_health(&self) -> Option<Result<(), String>> {
         if !self.mapi_lite_configured() {
             return None;

@@ -15,11 +15,11 @@ A -> FS: get_balance\n(client_id)
 activate FS
 FS -> FS: client_id_valid(client_id)
 alt Failure case
-    FS --> A: response\n{status: failure, client_id, unknown_client_id}
+    FS --> A: response\n{code: unknown_client, description}
 end
 
 FS -> FS: check_balance\n(client_id)
-FS --> A: response\n{status: success, client_id, balance}
+FS --> A: response\n{confirmed, unconfirmed, max_fundable}
 deactivate FS
 ...
 

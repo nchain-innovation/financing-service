@@ -13,14 +13,9 @@ Collections Blockchain
 
 C -> FS: get_status()
 activate FS
-FS -> FS: check_blockchain_health()
+FS -> FS: read blockchain_status\n(recorded by the periodic refresh)
 
-
-loop for each client
-    FS -> FS: get_balance()
-end
-
-FS --> C: response\n(status: success, blockchain_health, [client_balance])
+FS --> C: response\n{version, blockchain_status, blockchain_update_time, broadcaster}
 deactivate FS
 
 @enduml
