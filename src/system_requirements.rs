@@ -174,6 +174,39 @@ mod tests {
         assert!(configuration.contains("OTEL_EXPORTER_OTLP_ENDPOINT"));
     }
 
+    #[test]
+    fn sr_tele_011_configuration_documents_every_metric() {
+        let configuration = std::fs::read_to_string("docs/Configuration.md").unwrap();
+        assert!(configuration.contains("## Metrics"));
+        assert!(configuration.contains("OTEL_METRICS_EXPORTER"));
+        assert!(configuration.contains("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"));
+        for metric in [
+            "`http_requests`",
+            "`http_request_duration`",
+            "`ready`",
+            "`fs_fund_requests`",
+            "`fs_client_balance`",
+            "`fs_client_chain_state_age`",
+            "http_requests_total",
+            "http_request_duration_seconds",
+            "fs_client_balance_sat",
+            "ready{check=\"overall\"} == 0",
+        ] {
+            assert!(configuration.contains(metric), "{metric} is not documented");
+        }
+        let source = include_str!("metrics.rs");
+        for name in [
+            "\"http_requests\"",
+            "\"http_request_duration\"",
+            "\"ready\"",
+            "\"fs_fund_requests\"",
+            "\"fs_client_balance\"",
+            "\"fs_client_chain_state_age\"",
+        ] {
+            assert!(source.contains(name), "{name} is not an instrument");
+        }
+    }
+
     /// The ticket's first point was that the documentation never said whether
     /// unconfirmed outputs could be used as funds, so a reader had to guess --
     /// and guessed wrong. The behaviour is pinned by a test in `client`; this
@@ -192,11 +225,18 @@ mod tests {
     }
 
     #[test]
-    fn sr_lim_006_opentelemetry_exports_traces_only() {
+    fn sr_lim_006_opentelemetry_exports_traces_and_metrics_not_logs() {
         let manifest = std::fs::read_to_string("Cargo.toml").unwrap();
-        assert!(manifest.contains("opentelemetry-otlp"));
-        assert!(manifest.contains("features = [\"grpc-tonic\", \"trace\"]"));
-        assert!(!manifest.contains("metrics"));
+        assert!(manifest.contains(
+            "opentelemetry-otlp = { version = \"0.32\", features = [\"grpc-tonic\", \"trace\", \"metrics\"] }"
+        ));
+        assert!(!manifest.contains("\"logs\""));
+        let telemetry = include_str!("telemetry.rs");
+        assert!(telemetry.contains("SpanExporter"));
+        assert!(telemetry.contains("MetricExporter"));
+        assert!(!telemetry.contains("LogExporter"));
+        let main_source = include_str!("main.rs");
+        assert!(!main_source.contains("\"/metrics\""));
     }
 
     // --- container and image (CS-527) ---

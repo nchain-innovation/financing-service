@@ -83,6 +83,29 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
+    /// The code as it is serialised, for a metric attribute (CS-608) without
+    /// going through serde on every request.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ErrorCode::InsufficientBalance => "insufficient_balance",
+            ErrorCode::NoSuitableUtxo => "no_suitable_utxo",
+            ErrorCode::FundsInFlight => "funds_in_flight",
+            ErrorCode::UnknownClient => "unknown_client",
+            ErrorCode::ClientExists => "client_exists",
+            ErrorCode::InvalidRequest => "invalid_request",
+            ErrorCode::BroadcastFailed => "broadcast_failed",
+            ErrorCode::BroadcastRejected => "broadcast_rejected",
+            ErrorCode::BroadcastOutcomeUnknown => "broadcast_outcome_unknown",
+            ErrorCode::PartialBroadcast => "partial_broadcast",
+            ErrorCode::ChainUnavailable => "chain_unavailable",
+            ErrorCode::Internal => "internal",
+            ErrorCode::Unauthorized => "unauthorized",
+            ErrorCode::RateLimited => "rate_limited",
+            ErrorCode::KeyInProgress => "key_in_progress",
+            ErrorCode::IdempotencyKeyReused => "idempotency_key_reused",
+        }
+    }
+
     /// HTTP status this code is reported with.
     ///
     /// Splitting the statuses lets a caller classify a failure without
@@ -356,7 +379,7 @@ pub fn partial_funding_error_response(
     description: impl Into<String>,
     funding: &FundingResponseJson,
 ) -> HttpResponse {
-    HttpResponse::build(ErrorCode::PartialBroadcast.status())
+    let response = HttpResponse::build(ErrorCode::PartialBroadcast.status())
         .content_type(ContentType::json())
         .json(PartialFundingErrorResponse {
             code: ErrorCode::PartialBroadcast,
@@ -364,7 +387,21 @@ pub fn partial_funding_error_response(
             outpoints: funding.outpoints.clone(),
             txs: funding.txs.clone(),
             replayed: funding.replayed,
-        })
+        });
+    with_code(response, ErrorCode::PartialBroadcast)
+}
+
+/// Tag a response with the code its body carries, so `fs_fund_requests`
+/// (CS-608) can count it without parsing the body back. Response extensions
+/// never leave the process.
+fn with_code(mut response: HttpResponse, code: ErrorCode) -> HttpResponse {
+    response.extensions_mut().insert(code);
+    response
+}
+
+/// The code an error response from this module was built with, if any.
+pub fn response_code(response: &HttpResponse) -> Option<ErrorCode> {
+    response.extensions().get::<ErrorCode>().copied()
 }
 
 pub fn error_response(code: ErrorCode, description: impl Into<String>) -> HttpResponse {
@@ -385,10 +422,11 @@ pub fn error_response_with_status(
     if let Some(seconds) = code.retry_after_seconds() {
         response.insert_header((header::RETRY_AFTER, seconds.to_string()));
     }
-    response.json(ErrorResponse {
+    let response = response.json(ErrorResponse {
         code,
         description: description.into(),
-    })
+    });
+    with_code(response, code)
 }
 
 /// Build an error response from an error that already carries its code.
@@ -397,12 +435,13 @@ pub fn coded_error_response(error: CodedError) -> HttpResponse {
 }
 
 pub fn unauthorized_response() -> HttpResponse {
-    HttpResponse::build(ErrorCode::Unauthorized.status())
+    let response = HttpResponse::build(ErrorCode::Unauthorized.status())
         .content_type(ContentType::json())
         .json(ErrorResponse {
             code: ErrorCode::Unauthorized,
             description: "Unauthorized".to_string(),
-        })
+        });
+    with_code(response, ErrorCode::Unauthorized)
 }
 
 pub fn json_ok<T: Serialize>(value: &T) -> HttpResponse {
@@ -441,6 +480,49 @@ mod tests {
                 serde_json::Value::String(expected.to_string()),
             );
         }
+    }
+
+    /// `as_str` is what `fs_fund_requests` labels with, so it must be the
+    /// code a client is answered with -- for every variant.
+    #[test]
+    fn as_str_matches_the_serialised_code_for_every_variant() {
+        let all = [
+            ErrorCode::InsufficientBalance,
+            ErrorCode::NoSuitableUtxo,
+            ErrorCode::FundsInFlight,
+            ErrorCode::UnknownClient,
+            ErrorCode::ClientExists,
+            ErrorCode::InvalidRequest,
+            ErrorCode::BroadcastFailed,
+            ErrorCode::BroadcastRejected,
+            ErrorCode::BroadcastOutcomeUnknown,
+            ErrorCode::PartialBroadcast,
+            ErrorCode::ChainUnavailable,
+            ErrorCode::Internal,
+            ErrorCode::Unauthorized,
+            ErrorCode::RateLimited,
+            ErrorCode::KeyInProgress,
+            ErrorCode::IdempotencyKeyReused,
+        ];
+        for code in all {
+            assert_eq!(
+                serde_json::to_value(code).unwrap(),
+                serde_json::Value::String(code.as_str().to_string()),
+            );
+        }
+    }
+
+    #[test]
+    fn error_responses_are_tagged_with_their_code() {
+        assert_eq!(
+            response_code(&error_response(ErrorCode::ChainUnavailable, "x")),
+            Some(ErrorCode::ChainUnavailable)
+        );
+        assert_eq!(
+            response_code(&unauthorized_response()),
+            Some(ErrorCode::Unauthorized)
+        );
+        assert_eq!(response_code(&json_ok(&SuccessResponse::new())), None);
     }
 
     #[test]

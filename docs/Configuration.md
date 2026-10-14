@@ -233,7 +233,7 @@ WARN  broadcast failed: funding tx <txid> (class=rejected, broadcaster=mapi-lite
 
 ## [telemetry]
 
-Optional OpenTelemetry trace export via OTLP (gRPC). Disabled by default.
+Optional OpenTelemetry export via OTLP (gRPC): traces, and metrics (see [Metrics](#metrics)). Both are disabled by default; logs are not exported over OTLP.
 
 ```toml
 [telemetry]
@@ -242,7 +242,7 @@ service_name = "financing-service"
 otlp_endpoint = "http://localhost:4317"
 ```
 
-* `enabled` — export traces to an OTLP collector (default: `false`)
+* `enabled` — export traces and metrics to an OTLP collector (default: `false`)
 * `service_name` — `service.name` resource attribute (default: `financing-service`)
 * `otlp_endpoint` — OTLP gRPC endpoint (default: `http://localhost:4317`)
 
@@ -251,15 +251,21 @@ When enabled, the service:
 * Creates a span per HTTP request via `tracing-actix-web` (OpenTelemetry semantic conventions)
 * Exports traces in batches to the configured collector
 * Bridges existing `log` crate output through `tracing` to include `trace_id` in logs
+* Exports the [metrics](#metrics) periodically to the same collector
 
 Standard OpenTelemetry environment variables are also supported:
 
 | Variable | Purpose |
 |----------|---------|
-| `OTEL_TRACES_EXPORTER=otlp` | Enable export when `telemetry.enabled` is `false` |
+| `OTEL_TRACES_EXPORTER=otlp` | Enable trace export when `telemetry.enabled` is `false` |
+| `OTEL_METRICS_EXPORTER=otlp` | Enable metrics export when `telemetry.enabled` is `false` |
 | `OTEL_SERVICE_NAME` | Overrides `telemetry.service_name` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | Overrides `telemetry.otlp_endpoint` |
 | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | Trace-specific OTLP endpoint |
+| `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | Metrics-specific OTLP endpoint |
+| `OTEL_METRIC_EXPORT_INTERVAL` | Metrics export interval in milliseconds (SDK default: 60000) |
+
+Traces and metrics have separate switches: `OTEL_TRACES_EXPORTER=otlp` turns on traces only and `OTEL_METRICS_EXPORTER=otlp` metrics only; `enabled = true` turns on both.
 
 Example with the OpenTelemetry Collector:
 
@@ -268,6 +274,33 @@ docker run -p 4317:4317 otel/opentelemetry-collector:latest
 ```
 
 Then enable telemetry in config or set `OTEL_TRACES_EXPORTER=otlp` and `OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317`.
+
+## Metrics
+
+The service pushes metrics over OTLP (CS-608). There is no `/metrics` endpoint to scrape: point the export at an OpenTelemetry Collector and let it forward to Prometheus (or any other backend).
+
+**Enabling.** Off by default. Set `OTEL_METRICS_EXPORTER=otlp`, or `[telemetry] enabled = true` (which also turns on traces). The endpoint is `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`, else `OTEL_EXPORTER_OTLP_ENDPOINT`, else `telemetry.otlp_endpoint`, else `http://localhost:4317`; the resource carries `service.name` (`OTEL_SERVICE_NAME`, default `financing-service`) and `service.version`. With export off no meter provider is installed and recording costs nothing. Startup logs one line, `OpenTelemetry metrics export on (...)` or `... off`, naming the endpoint without any credential or query string. Metrics are flushed on shutdown.
+
+Names follow OpenTelemetry conventions: counters have no `_total` and units are set on the instrument, not in the name. An OTLP-to-Prometheus conversion adds both, so `http_requests` becomes `http_requests_total` and `http_request_duration` (unit `s`) becomes `http_request_duration_seconds`. Attribute values come from fixed sets -- never raw paths, addresses, txids or keys -- so cardinality is bounded by the routes and clients configured.
+
+| Metric | Type | Unit | Attributes | Meaning | Prometheus name |
+|--------|------|------|------------|---------|-----------------|
+| `http_requests` | Counter | — | `route`, `status_class` | Requests answered. `route` is the matched route template (`/client/{client_id}/balance`, never the raw path), `unmatched` for a path no route matches; `status_class` is `2xx`/`3xx`/`4xx`/`5xx`. `/health`, `/ready` and `/status` count like any other route, and so do requests the rate limiter refuses. | `http_requests_total` |
+| `http_request_duration` | Histogram | `s` | `route` | Time to answer a request. Buckets from 5 ms to 60 s. | `http_request_duration_seconds` (`_bucket`, `_sum`, `_count`) |
+| `ready` | Gauge (0/1) | — | `check` | The `GET /ready` verdict: one series per check (`chain`, and `mapi_lite` when `[mapi_lite]` is configured) plus `check="overall"`. Sampled every 15 s. | `ready` |
+| `fs_fund_requests` | Counter | — | `code` | `POST /fund` answers: `funded`, or the [error code](SupportedEndpoints.md) the caller got (`insufficient_balance`, `no_suitable_utxo`, `funds_in_flight`, `broadcast_rejected`, `broadcast_failed`, `broadcast_outcome_unknown`, `partial_broadcast`, `chain_unavailable`, `invalid_request`, `unknown_client`, `unauthorized`, `rate_limited`, `key_in_progress`, `idempotency_key_reused`, `internal`). A replayed `idempotency_key` answer counts as the outcome it replays. A body that is not valid JSON is refused before the handler and appears only in `http_requests`. | `fs_fund_requests_total` |
+| `fs_client_balance` | Gauge | `sat` | `client_id`, `kind` | Each client's balance from the service's cache, `kind` = `confirmed` or `unconfirmed`. Sampled every 15 s. | `fs_client_balance_sat` |
+| `fs_client_chain_state_age` | Gauge | `s` | `client_id` | Seconds since the client's unspent set was last read from the chain -- what `service.ready_max_chain_read_age_seconds` is measured against. No series until the first read. | `fs_client_chain_state_age_seconds` |
+
+The gauges are read from a snapshot a background task takes every 15 s while export is on; the one upstream call it makes is the mapi-lite readiness probe `GET /ready` already makes, cached for `mapi_lite.health_timeout_seconds`.
+
+**Suggested alerts** (CS-608 phase 1), in PromQL over the converted names:
+
+1. Not ready: `ready{check="overall"} == 0` for 2m.
+2. Outcome unknown, so funds may be spent without the caller knowing: `increase(fs_fund_requests_total{code="broadcast_outcome_unknown"}[5m]) > 0`. Across the stack, also Event's `increase(event_funding_outputs_stranded_total[5m]) > 0` and its `*outcome_unknown` outcomes.
+3. A client running dry: `fs_client_balance_sat{kind="confirmed"} < <threshold>` (per client; pick the threshold from its spend rate).
+4. mapi-lite (exported by mapi-lite): `mapi_nodes_live < <min_live_nodes>` or `mapi_block_ingest_lag > 3`.
+5. Errors or latency, for 5m: `sum(rate(http_requests_total{status_class="5xx"}[5m])) / sum(rate(http_requests_total[5m])) > 0.01`, or `histogram_quantile(0.95, sum by (le, route) (rate(http_request_duration_seconds_bucket[5m]))) > <target>`.
 
 ## [service]
 
