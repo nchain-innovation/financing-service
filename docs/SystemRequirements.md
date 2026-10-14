@@ -141,6 +141,8 @@ Requirement IDs appear in test function names (for example `sr_fund_008_*`) or a
 | SR-SEC-024 | The Docker image SHALL run as an unprivileged user, and `run.sh` SHALL NOT mount the Docker socket and SHALL publish the port on the host's loopback unless `FS_PUBLISH_ADDRESS` says otherwise. | Must | **AT:** `system_requirements::tests::sr_sec_024_the_image_runs_as_an_unprivileged_user`, `sr_sec_024_run_sh_mounts_no_docker_socket_and_publishes_on_loopback` |
 | SR-SEC-025 | The Docker image SHALL be built with `--locked` from the committed `Cargo.lock`, from base images pinned by digest, and from a build context that excludes `.git`, `target/`, and the `data/` files that can hold WIFs. | Must | **AT:** `system_requirements::tests::sr_sec_025_the_image_builds_the_committed_lockfile`, `sr_sec_025_base_images_are_pinned_by_digest`, `sr_sec_025_the_build_context_excludes_secrets_and_history` |
 | SR-SEC-026 | `multi-build.sh` SHALL tag the published image with the version in `Cargo.toml`, SHALL refuse to publish from a working tree with uncommitted changes, and SHALL refuse to overwrite a tag that is already published. | Must | **AT:** `system_requirements::tests::sr_sec_026_publishing_takes_its_tag_from_cargo_toml_and_never_overwrites_one` |
+| SR-SEC-027 | Every action in the CI workflow SHALL be pinned by full commit SHA, since the job hands one of them the mapi-lite deploy key and a tag can be moved to other code. | Must | **AT:** `system_requirements::tests::sr_sec_027_every_action_is_pinned_by_commit_sha` |
+| SR-SEC-028 | The CI workflow SHALL default its token to no permissions (`permissions: {}`), grant each job only `contents: read`, and check out with `persist-credentials: false`. | Must | **AT:** `system_requirements::tests::sr_sec_028_the_workflow_token_is_read_only_and_not_persisted` |
 
 ## Configuration and deployment requirements
 
@@ -173,7 +175,7 @@ Requirement IDs appear in test function names (for example `sr_fund_008_*`) or a
 |----|-------------|----------|--------------|
 | SR-NFR-001 | The codebase SHALL pass `cargo fmt --check` without formatting violations. | Must | **AT:** `system_requirements::tests::sr_nfr_001_ci_runs_cargo_fmt_check` |
 | SR-NFR-002 | The codebase SHALL pass `cargo clippy -- -D warnings` without warnings. | Must | **AT:** `system_requirements::tests::sr_nfr_002_ci_runs_cargo_clippy_with_warnings_denied` |
-| SR-NFR-003 | Dependencies SHALL pass `cargo audit` without known vulnerabilities (or with documented exceptions). | Must | **AT:** `system_requirements::tests::sr_nfr_003_ci_runs_cargo_audit` |
+| SR-NFR-003 | Dependencies SHALL pass `cargo audit` without known vulnerabilities (or with documented exceptions). CI SHALL run the audit before the mapi-lite deploy key is loaded. | Must | **AT:** `system_requirements::tests::sr_nfr_003_ci_runs_cargo_audit`, `sr_nfr_003_cargo_audit_runs_before_the_deploy_key_is_loaded` |
 | SR-NFR-004 | All automated tests SHALL pass on supported platforms in CI. | Must | **AT:** `system_requirements::tests::sr_nfr_004_ci_runs_cargo_test` |
 | SR-NFR-005 | `Cargo.lock` SHALL be committed for reproducible builds. | Must | **AT:** `system_requirements::tests::sr_nfr_005_cargo_lock_is_committed` |
 | SR-NFR-007 | Startup configuration or secret resolution errors SHALL return an error from `main` rather than panic. | Must | **AT:** `system_requirements::tests::sr_nfr_007_main_returns_error_instead_of_panicking_on_config_failure`, `config::tests::sr_nfr_007_load_config_returns_error_for_invalid_file` |
