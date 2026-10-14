@@ -85,12 +85,16 @@ To build the docker image associated with the service run the following comand i
 ./build.sh
 ```
 This builds the Docker image `financing-service-rust`. The image includes a health check against `GET /health`, the liveness endpoint.
+
+The image is built with `--locked` from the committed `Cargo.lock`, from base images pinned by digest, and runs as an unprivileged user (`fs`, uid 10001). `.dockerignore` keeps `.git`, `target/` and the runtime files in `data/` — which can hold client WIFs — out of the build context.
 ### 2) To Run the Image
 To start the Docker container:
 ```bash
 ./run.sh
 ```
-This will provide a REST API at http://localhost:8080
+This will provide a REST API at http://localhost:8080, on the host's loopback only. Set `FS_PUBLISH_ADDRESS` (for example `FS_PUBLISH_ADDRESS=0.0.0.0 ./run.sh`) to publish it more widely — and put the funding endpoints behind something that authenticates when you do.
+
+`run.sh` mounts `./data` as the data directory and runs the container as you, so it can write the dynamic config file there. It mounts nothing else from the host. Elsewhere, give the image a volume at `/app/bin/data` that uid 10001 can write, or run it with `--user` as `run.sh` does.
 
 
 ## To Build the Service
@@ -128,6 +132,8 @@ To build and publish the image to Docker Hub, run the following command:
 ```
 ./multi-build.sh
 ```
+
+The tag is `v` plus the `version` in `Cargo.toml`. The script refuses to publish from a working tree with uncommitted changes, and refuses to push a tag that is already published: an image someone pulled by tag stays the image that tag names. Bump the version to publish again. `BUILDER=cloud-nchain-rndprototyping ./multi-build.sh` uses the cloud builder.
 
 **Requirements**
 
