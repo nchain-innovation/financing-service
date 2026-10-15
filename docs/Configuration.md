@@ -64,7 +64,7 @@ Reads each client's UTXO set and balance through the `[mapi_lite]` server's `/qu
 [blockchain_interface]
 interface_type = "rpc"
 network_type = "regtest"
-url = "127.0.0.1:18443"
+url = "127.0.0.1:18332"   # bitcoin-sv's regtest RPC port; Bitcoin Core's is 18443
 rpc_user = "rpcuser"
 rpc_password = "env:FS_RPC_PASSWORD"
 ```
@@ -170,6 +170,8 @@ address = "127.0.0.1"
 port = 8080
 # admin_api_key = "your-admin-secret"
 ```
+
+mapi-lite also defaults to port 8080. Running both on one host, as a local regtest setup does, move this service to another port: Event's regtest config expects it on 8081. The Docker image keeps 8080, which its health check and the uls-rs compose file use.
 
 When `APP_ENV=docker` (set by the image) and `address` is a loopback address, the service listens on `0.0.0.0` instead: a container's own loopback cannot be reached from the host. Which host interfaces then see the port is set where it is published — `run.sh` publishes it on the host's loopback. Any other `address` is honoured, so a container run with `--network host` and a specific address binds only that one.
 
