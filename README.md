@@ -35,6 +35,7 @@ The FS is designed to be as simple as possible, in that light it:
 * FS supports secret references (`env:VAR`), environment variable overrides, and `wif_env` / `api_key_env` when adding clients at runtime. See [Configuration](docs/Configuration.md#secret-management).
 * FS supports optional per-IP HTTP rate limiting (disabled by default). See [Configuration](docs/Configuration.md#rate-limiting).
 * FS supports optional OpenTelemetry trace export via OTLP (disabled by default). Each HTTP request creates a span; traces include resource metadata and request fields but not secrets or request bodies. See [Configuration](docs/Configuration.md#telemetry).
+* FS can also push metrics over OTLP (disabled by default; `OTEL_METRICS_EXPORTER=otlp`): requests by route and status, request duration, readiness, `/fund` outcomes, and each client's balance and chain-state age. See [Metrics](docs/Configuration.md#metrics).
 
 ## Use cases
 

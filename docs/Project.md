@@ -69,7 +69,7 @@ Admin       ──REST──▶       │                │
 * Optional per-client `api_key` authentication
 * Optional `admin_api_key` for `POST /client`
 * Secret references via `env:VAR`, environment overrides, and `wif_env` / `api_key_env` on `POST /client`
-* Optional OpenTelemetry trace export via OTLP (configurable, disabled by default)
+* Optional OpenTelemetry trace and metrics export via OTLP (configurable, disabled by default; metrics listed in [Configuration.md](Configuration.md#metrics))
 * Configurable per-IP HTTP rate limiting with `/health` and `/ready` exempt
 * Balance checks against total wallet balance; funding combines multiple UTXOs when needed; balance endpoint refreshes from chain when the cached state is older than `service.chain_state_max_age_seconds`; `multiple_tx` partial failures return structured successful transaction data; concurrent fund requests for the same client each claim their inputs under an exclusive per-client lock and commit the claim only after a successful broadcast
 * Optional mapi-lite transaction broadcaster (`[mapi_lite]`): broadcasts go to mapi-lite, reads stay on the blockchain interface, `/ready` probes mapi-lite's own `/ready` and returns 503 when it is down or not ready while `/health` stays up, `/status` names the broadcaster, startup logs the selection

@@ -1423,6 +1423,34 @@ impl Service {
         Ok(())
     }
 
+    /// Every client's cached balance and last chain read, for the
+    /// `fs_client_balance` and `fs_client_chain_state_age` gauges (CS-608).
+    /// Reads the cache only; nothing reaches the chain.
+    pub async fn client_samples(&self) -> Vec<crate::metrics::ClientSample> {
+        let handles: Vec<(String, Arc<RwLock<Client>>)> = self
+            .clients
+            .read()
+            .await
+            .iter()
+            .map(|(id, client)| (id.clone(), Arc::clone(client)))
+            .collect();
+        let mut samples = Vec::with_capacity(handles.len());
+        for (client_id, client) in handles {
+            let client = client.read().await;
+            let balance = client.get_balance();
+            samples.push(crate::metrics::ClientSample {
+                client_id,
+                confirmed: balance.confirmed,
+                unconfirmed: balance.unconfirmed,
+                chain_read_at: client
+                    .chain_read_age()
+                    .and_then(|age| Instant::now().checked_sub(age)),
+            });
+        }
+        samples.sort_by(|a, b| a.client_id.cmp(&b.client_id));
+        samples
+    }
+
     /// Age every client's last chain read, and the interface's last answer,
     /// by `by` -- so a test can make the cache old without waiting.
     #[cfg(test)]

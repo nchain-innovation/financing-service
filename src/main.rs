@@ -2,7 +2,7 @@ use std::{sync::Arc, time::Duration};
 use tokio::time;
 
 use actix_governor::Governor;
-use actix_web::{web, App, HttpServer};
+use actix_web::{middleware::from_fn, web, App, HttpServer};
 
 mod address_watcher;
 mod auth;
@@ -15,6 +15,7 @@ mod funding_limits;
 mod idempotency;
 mod interface_timeout;
 mod mapi_lite_interface;
+mod metrics;
 mod outbound_rate_limit;
 mod private_file;
 mod rate_limit;
@@ -56,7 +57,7 @@ async fn main() -> std::io::Result<()> {
         std::io::Error::new(std::io::ErrorKind::InvalidData, e)
     })?;
 
-    let _telemetry = telemetry::init(&config.telemetry, log_level).map_err(|e| {
+    let telemetry = telemetry::init(&config.telemetry, log_level).map_err(|e| {
         eprintln!("Unable to initialise telemetry: {e}");
         std::io::Error::new(std::io::ErrorKind::InvalidData, e)
     })?;
@@ -105,9 +106,23 @@ async fn main() -> std::io::Result<()> {
         );
         rate_limit::spawn_retain_task(&governor_config);
     }
-    let app_state = web::Data::new(AppState {
-        service: Arc::new(service),
-    });
+    // After telemetry::init, so the instruments come from the meter provider
+    // it installed (or the no-op one when metrics export is off).
+    let app_state = web::Data::new(AppState::new(Arc::new(service)));
+    // CS-608: the gauges, and the task that samples the service for them,
+    // only when metrics are exported.
+    let _gauges = telemetry
+        .as_ref()
+        .is_some_and(|guard| guard.metrics_enabled())
+        .then(|| {
+            let samples = metrics::SharedSamples::default();
+            let gauges = metrics::register_gauges(
+                &opentelemetry::global::meter(metrics::METER_NAME),
+                samples.clone(),
+            );
+            metrics::spawn_sampler(Arc::clone(&app_state.service), samples);
+            gauges
+        });
     let app_state2 = app_state.clone();
     let addr = web_bind_address(&config);
 
@@ -128,6 +143,8 @@ async fn main() -> std::io::Result<()> {
         App::new()
             .wrap(tracing_actix_web::TracingLogger::default())
             .wrap(Governor::new(&governor_config))
+            // Outermost, so requests the rate limiter refuses are counted too.
+            .wrap(from_fn(metrics::record_http))
             .app_data(app_state.clone())
             .service(index)
             .service(health)

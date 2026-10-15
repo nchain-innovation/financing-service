@@ -16,9 +16,9 @@ hex = "0.4.3"
 async-trait = "0.1.92"
 chain-gang = { version = "0.13.0", features = ["interface"] }
 log = { version = "0.4.34", features = ["max_level_trace", "release_max_level_warn"] }
-opentelemetry = { version = "0.32", features = ["trace"] }
-opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic", "trace"] }
-opentelemetry_sdk = { version = "0.32", features = ["trace"] }
+opentelemetry = { version = "0.32", features = ["trace", "metrics"] }
+opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic", "trace", "metrics"] }
+opentelemetry_sdk = { version = "0.32", features = ["trace", "metrics", "rt-tokio"] }
 tracing-actix-web = { version = "0.7", features = ["opentelemetry_0_32"] }
 tracing-log = "0.2"
 tracing-opentelemetry = "0.33"
@@ -47,3 +47,5 @@ actix-http = "3"
 # MapiBroadcaster tests: a mock mapi-lite serving the real wire shapes, with
 # uls-core signing the envelopes the way the server does.
 wiremock = "0.6"
+# InMemoryMetricExporter, for asserting the CS-608 metrics.
+opentelemetry_sdk = { version = "0.32", features = ["testing"] }
