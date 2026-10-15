@@ -1,8 +1,10 @@
 # Financing Service - Configuration
 
-Configuration for this service can be found in `data/financing-service.toml`. The file is read when the service starts.
+Configuration for this service is a TOML file, read when the service starts: the file `FS_CONFIG` names, or `data/financing-service.toml` when it is unset. `FS_CONFIG` names a file, as `TE_CONFIG` and `MAPI_CONFIG` do for Event and mapi-lite; it no longer holds JSON (CS-624).
 
-Alternatively, set the `FS_CONFIG` environment variable to a JSON-encoded config object.
+Any setting can then be overridden from the environment with `FS__<TABLE>__<KEY>`, two underscores between each part: `FS__WEB_INTERFACE__PORT=9090` sets `[web_interface] port`. See [Environment overrides](#environment-overrides).
+
+**A key no setting reads stops startup**, naming it: a misspelling, a key written under the wrong `[table]`, an override with a typo, or a setting this version has removed. Before CS-624 such a key was silently ignored and the setting kept its default.
 
 The file is composed of the following sections:
 
@@ -72,7 +74,7 @@ rpc_password = "env:FS_RPC_PASSWORD"
 * `url` — the node's JSON-RPC host and port. A bare `host:port` is treated as `http://`; give a full URL for `https`.
 * `rpc_user` / `rpc_password` — the node's RPC credentials, sent as HTTP basic auth on every call. **Point this only at a node you control**, since the credentials go to whatever host is configured.
 
-`rpc_password` takes an `env:VAR_NAME` reference and is overridden by `FS_RPC_PASSWORD`; `rpc_user` behaves the same way with `FS_RPC_USER`. A plaintext `rpc_password` is reported at startup like any other plaintext secret.
+`rpc_password` and `rpc_user` take an `env:VAR_NAME` reference, or can be set with `FS__BLOCKCHAIN_INTERFACE__RPC_PASSWORD` and `FS__BLOCKCHAIN_INTERFACE__RPC_USER`. A plaintext `rpc_password` is reported at startup like any other plaintext secret.
 
 #### Address imports
 
@@ -482,7 +484,7 @@ auth_token = "env:FS_MAPI_LITE_AUTH_TOKEN"
 ```
 
 * `base_url` — **required.** Base URL of the mapi-lite server, `http://` or `https://`. Surrounding whitespace and a trailing `/` are stripped before the URL is validated or used, so the value that is checked at startup is the one that is requested.
-* `auth_token` — optional. Sent **verbatim** as the `Authorization` header on every request, so include the scheme the server expects, e.g. `"Bearer <secret>"`. Takes an `env:VAR_NAME` reference and is overridden by `FS_MAPI_LITE_AUTH_TOKEN`. A plaintext value is reported at startup like any other plaintext secret. Never logged.
+* `auth_token` — optional. Sent **verbatim** as the `Authorization` header on every request, so include the scheme the server expects, e.g. `"Bearer <secret>"`. Takes an `env:VAR_NAME` reference, or can be set with `FS__MAPI_LITE__AUTH_TOKEN`. A plaintext value is reported at startup like any other plaintext secret. Never logged.
 * `timeout_seconds` — ceiling on **one** submit attempt. Default `13`. Chosen so the whole retry budget fits the deadline: 3 attempts × 13s plus 3s of back-off is 42s, inside `total_timeout_seconds` of 45. It was 30s, which meant the deadline cut the sequence off after one attempt and part of a second, so `max_retries` described attempts that never ran.
 * `health_timeout_seconds` — timeout for the mapi-lite probe behind `GET /ready`. Default `2`. Must be **less than 3**, and is rejected at startup otherwise: readiness probes allow a few seconds at most (Docker's health check defaults to `--timeout=3s`), and a slower probe would be killed by the caller before it answered, marking the instance unready on every check even while mapi-lite is fine. The probe's verdict is cached for this long, so `/ready` — which is unauthenticated and exempt from rate limiting — cannot be used to flood mapi-lite.
 * `max_retries` — how many times a submit is retried after a transient failure (an HTTP 5xx, a transport error, or an attempt that ran out of `timeout_seconds`). Default `2`, so three attempts, with linear back-off of 1s then 2s (capped at 5s). Resubmitting is safe: mapi-lite answers an already-known transaction with success — which is also how a retry can *settle* an attempt that timed out, turning `broadcast_outcome_unknown` back into a plain success.
@@ -532,14 +534,13 @@ filename = "./data/dynamic.toml"
 * **Only `env:VAR` references by default.** `POST /client` refuses a raw `wif` with HTTP 400 and stores nothing; send `wif_env`, naming an environment variable that holds the key, and the file records `env:VAR` instead. `allow_plaintext_wif = true` lifts this for development; on mainnet and testnet it is refused at startup (CS-514). A file written before this, holding raw WIFs, still loads, with the usual plaintext warning.
 * **Written atomically, owner-only.** Every change is written to a `0600` sibling file, synced, and renamed over the original, so a crash cannot truncate it and other users cannot read it. A file found readable by other users at startup is made `0600`, with a warning. A client is added or removed in memory only once the file has been written.
 * **A file that does not parse stops startup.** It is left exactly as it is, to be fixed by hand, rather than replaced with an empty list on the next `POST /client`. A missing or empty file means no dynamic clients.
-* `wif_env_prefix` — the only environment variables a client added through `POST /client` may take its key from with `wif_env`. Default `FS_RUNTIME_WIF_`. It is rejected at startup if it overlaps `FS_CLIENT_`, which every client's own override variable (`FS_CLIENT_<ID>_WIF`) starts with (CS-521).
+* `wif_env_prefix` — the only environment variables a client added through `POST /client` may take its key from with `wif_env`. Default `FS_RUNTIME_WIF_`. It is rejected at startup if it overlaps `FS__`, which every configuration override starts with: those can carry any secret (CS-624).
 
-**Runtime clients cannot take another client's wallet (CS-521, SR-SEC-018).** Before this, `wif_env` could name any variable in the service's environment, another client's `FS_CLIENT_<ID>_WIF` included. Whoever could call `POST /client` (anyone, with no `admin_api_key`) could then fund from that client's wallet under an API key of their own. Now:
+**Runtime clients cannot take another client's wallet (CS-521, SR-SEC-018).** Before this, `wif_env` could name any variable in the service's environment, another client's key variable included. Whoever could call `POST /client` (anyone, with no `admin_api_key`) could then fund from that client's wallet under an API key of their own. Now:
 
 * `wif_env` must start with `wif_env_prefix`. **This is a breaking change:** a deployment that names other variables has to rename them, or set the prefix to match.
 * A `wif` beginning `env:` is refused; name a variable with `wif_env` instead.
 * A client whose key is the funding key of an existing client is refused, however the key was supplied. Two clients funding from one wallet would spend the same coins.
-* A `client_id` that folds onto an existing client's override variables (case and punctuation fold, so `ID.1` and `id_1` share `FS_CLIENT_ID_1_*`) is refused.
 
 Clients that already share a wallet when the service starts are reported as an error in the log, naming them. The service still starts. Remove the one that should not be there from the dynamic config.
 
@@ -582,20 +583,21 @@ If a referenced variable is not set, startup fails with a clear error.
 
 ### Environment overrides
 
-These variables take precedence over config file values:
+`FS__<TABLE>__<KEY>` sets any setting, over whatever the file holds, as `TE__` and `MAPI__` do for Event and mapi-lite (CS-624). The value is taken as written; the setting parses it, so a port or a number of seconds can be overridden too.
 
-| Variable | Overrides |
-|----------|-----------|
-| `FS_ADMIN_API_KEY` | `web_interface.admin_api_key` |
-| `FS_CLIENT_{CLIENT_ID}_WIF` | `wif_key` for that client (`CLIENT_ID` is uppercased; non-alphanumeric characters become `_`) |
-| `FS_CLIENT_{CLIENT_ID}_API_KEY` | `api_key` for that client |
-| `FS_RPC_USER` / `FS_RPC_PASSWORD` | `blockchain_interface.rpc_user` / `rpc_password` |
-| `FS_MAPI_LITE_AUTH_TOKEN` | `mapi_lite.auth_token` (include the scheme, e.g. `Bearer <secret>`) |
+| Variable | Sets |
+|----------|------|
+| `FS__WEB_INTERFACE__ADMIN_API_KEY` | `web_interface.admin_api_key` |
+| `FS__BLOCKCHAIN_INTERFACE__RPC_USER` / `FS__BLOCKCHAIN_INTERFACE__RPC_PASSWORD` | `blockchain_interface.rpc_user` / `rpc_password` |
+| `FS__MAPI_LITE__AUTH_TOKEN` | `mapi_lite.auth_token` (include the scheme, e.g. `Bearer <secret>`) |
+| `FS__WEB_INTERFACE__PORT` | `web_interface.port` |
 
-Example: for `client_id = "id1"`, set `FS_CLIENT_ID1_WIF`.
+A `[[client]]` entry sits in an array, which an override cannot address: give its `wif_key` and `api_key` as `env:` references.
+
+**Breaking change (CS-624).** The named overrides `FS_ADMIN_API_KEY`, `FS_RPC_USER`, `FS_RPC_PASSWORD`, `FS_MAPI_LITE_AUTH_TOKEN`, `FS_CLIENT_<ID>_WIF` and `FS_CLIENT_<ID>_API_KEY` are no longer read. Rename the first four to their `FS__` form; for a client, write `wif_key = "env:FS_CLIENT_ID1_WIF"` (any variable name works) in the file.
 
 ### Plaintext warnings
 
-When WIF keys, client `api_key`, `admin_api_key`, `rpc_password`, or `mapi_lite.auth_token` are stored as literal values in config files, the service logs a warning at startup. Literal values still work for local development.
+When WIF keys, client `api_key`, `admin_api_key`, `rpc_password`, or `mapi_lite.auth_token` are stored as literal values in the config file, the service logs a warning at startup. A value set by an `FS__` override is not warned about: it is already in the environment. Literal values still work for local development.
 
 Dynamic clients added via `POST /client` use `wif_env` and can use `api_key_env` instead of `wif` and `api_key`; the service stores `env:VAR` references in the dynamic config file rather than the secret values. A raw `wif` is refused unless `dynamic_config.allow_plaintext_wif` is set — see [\[dynamic_config\]](#dynamic_config).

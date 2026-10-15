@@ -37,9 +37,7 @@ mod tests {
     #[test]
     fn sr_nfr_007_main_returns_error_instead_of_panicking_on_config_failure() {
         let source = include_str!("main.rs");
-        assert!(
-            source.contains("load_config(\"FS_CONFIG\", \"data/financing-service.toml\").map_err(")
-        );
+        assert!(source.contains("load_config(&config_file()).map_err("));
     }
 
     /// The line an operator reads to learn where funding transactions go.
@@ -105,7 +103,7 @@ mod tests {
     fn sr_bchn_009_configuration_and_readme_document_mapi_lite() {
         let configuration = std::fs::read_to_string("docs/Configuration.md").unwrap();
         assert!(configuration.contains("## [mapi_lite]"));
-        assert!(configuration.contains("FS_MAPI_LITE_AUTH_TOKEN"));
+        assert!(configuration.contains("FS__MAPI_LITE__AUTH_TOKEN"));
         let readme = std::fs::read_to_string("README.md").unwrap();
         assert!(readme.contains("Configuration.md#mapi_lite"));
         let endpoints = std::fs::read_to_string("docs/SupportedEndpoints.md").unwrap();

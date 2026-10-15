@@ -28,7 +28,9 @@ port = 8080
 # Shared secret required on POST /client. On mainnet and testnet the service
 # will not start without one, and every client needs an api_key (CS-514);
 # elsewhere, without it POST /client is unauthenticated and a warning is logged
-# at startup. Prefer the environment: FS_ADMIN_API_KEY, FS_CLIENT_<ID>_API_KEY.
+# at startup. Prefer the environment: an env: reference, or
+# FS__WEB_INTERFACE__ADMIN_API_KEY (any setting takes an FS__<TABLE>__<KEY>
+# override, CS-624).
 # admin_api_key = "env:FS_ADMIN_API_KEY"
 # Only if a gateway in front of this service authenticates callers:
 # allow_unauthenticated = true

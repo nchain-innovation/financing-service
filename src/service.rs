@@ -753,26 +753,13 @@ impl Service {
     ///   meaningful -- each tracks its own UTXOs, so they would spend the same
     ///   coins -- and it is exactly what taking over another client's wallet
     ///   looks like, however the key was supplied: a `wif_env` naming that
-    ///   client's variable, the literal key, or an id that folds onto that
-    ///   client's override variable. Comparing addresses catches all three.
-    /// * **An id that folds onto another's.** `id.1` and `ID_1` share every
-    ///   `FS_CLIENT_ID_1_*` override, so whichever is set would apply to both.
+    ///   client's variable or the literal key. Comparing addresses catches
+    ///   both.
     async fn conflict_with_existing(
         clients: &HashMap<String, Arc<RwLock<Client>>>,
-        client_id: &str,
         address: &str,
     ) -> Option<CodedError> {
-        let suffix = crate::config::env_key_suffix(client_id);
-        for (existing_id, existing) in clients {
-            if crate::config::env_key_suffix(existing_id) == suffix {
-                return Some(CodedError::new(
-                    ErrorCode::InvalidRequest,
-                    format!(
-                        "client_id {client_id:?} shares the environment variables of existing \
-                         client {existing_id:?} (FS_CLIENT_{suffix}_*); choose a distinct id"
-                    ),
-                ));
-            }
+        for existing in clients.values() {
             if existing.read().await.get_address() == address {
                 return Some(CodedError::new(
                     ErrorCode::InvalidRequest,
@@ -834,9 +821,7 @@ impl Service {
                 ));
             }
             // Checked under the write lock, so two requests cannot both pass.
-            if let Some(error) =
-                Self::conflict_with_existing(&clients, &client_config.client_id, &address).await
-            {
+            if let Some(error) = Self::conflict_with_existing(&clients, &address).await {
                 return Err(error);
             }
             clients.insert(client_config.client_id.clone(), Arc::clone(&new_client));
@@ -1337,7 +1322,7 @@ impl Service {
     }
 
     /// The keys the authentication policy requires (CS-514), checked with
-    /// environment overrides applied and the clients loaded: on a production
+    /// `FS__` overrides applied and the clients loaded: on a production
     /// network without the opt-out, `admin_api_key` must be set, or
     /// `POST /client` and `DELETE /client` are open, and every client needs an
     /// `api_key`, or its `/fund`, balance and address are. See
@@ -1349,7 +1334,7 @@ impl Service {
         if self.admin_api_key.is_none() {
             return Err(format!(
                 "web_interface.admin_api_key is not set, so POST /client and DELETE /client would \
-                 be open on {}. Set it (or FS_ADMIN_API_KEY), or set \
+                 be open on {}. Set it (or FS__WEB_INTERFACE__ADMIN_API_KEY), or set \
                  web_interface.allow_unauthenticated = true if a gateway in front of this service \
                  authenticates callers",
                 self.network_type
@@ -1362,7 +1347,7 @@ impl Service {
         without.sort();
         Err(format!(
             "clients without an api_key: {}. Their /fund, balance and address routes would be \
-             open to anyone; give each an api_key (or FS_CLIENT_<ID>_API_KEY), or set \
+             open to anyone; give each an api_key (an env: reference keeps it out of the file), or set \
              web_interface.allow_unauthenticated = true if a gateway authenticates callers",
             without.join(", ")
         ))
@@ -4234,32 +4219,6 @@ mod tests {
             error.description
         );
         assert!(service.client_handle("thief").await.is_none());
-    }
-
-    /// `ID1` and `id.1`-style ids fold onto an existing client's override
-    /// variables, so whatever key those hold would fund both.
-    #[tokio::test]
-    async fn sr_sec_018_an_id_that_folds_onto_another_s_is_refused() {
-        let config = test_config(&unique_dynamic_config_path());
-        let blockchain = test_blockchain_interface(&config).await;
-        let service = Service::new_for_test(&config, blockchain).await;
-
-        let folded = TEST_CLIENT_ID.to_uppercase();
-        assert_ne!(folded, TEST_CLIENT_ID);
-        let error = service
-            .add_client(&ClientConfig {
-                client_id: folded,
-                wif_key: crate::test_support::OTHER_TEST_WIF.to_string(),
-                api_key: None,
-            })
-            .await
-            .expect_err("folds onto id1");
-        assert_eq!(error.code, ErrorCode::InvalidRequest);
-        assert!(
-            error.description.contains("FS_CLIENT_ID1_"),
-            "{}",
-            error.description
-        );
     }
 
     /// A pair added before the check existed is still found, at startup.

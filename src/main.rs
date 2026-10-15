@@ -30,7 +30,7 @@ mod util;
 mod test_support;
 
 use crate::{
-    config::{load_config, web_bind_address},
+    config::{config_file, load_config, web_bind_address},
     rest_api::{
         add_client, balance, delete_client, get_address, get_funds, health, index, ready, status,
         update_clients, AppState,
@@ -47,7 +47,7 @@ mod dependency_graph;
 /// Main - Read config and setup Web server.
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let config = load_config("FS_CONFIG", "data/financing-service.toml").map_err(|e| {
+    let config = load_config(&config_file()).map_err(|e| {
         eprintln!("Unable to read config: {e}");
         std::io::Error::new(std::io::ErrorKind::InvalidData, e)
     })?;

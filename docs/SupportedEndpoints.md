@@ -341,7 +341,7 @@ Request body (JSON):
 
 Provide either `wif` or `wif_env`, and either `api_key` or `api_key_env` (not both pairs).
 
-Refused as `invalid_request` (CS-521): a `wif_env` outside the prefix, a `wif` that is an `env:` reference, a key that is already another client's funding key, and a `client_id` that folds onto an existing client's environment variables.
+Refused as `invalid_request` (CS-521): a `wif_env` outside the prefix, a `wif` that is an `env:` reference, and a key that is already another client's funding key.
 
 ```bash
 curl -H "Authorization: Bearer your-admin-api-key" \

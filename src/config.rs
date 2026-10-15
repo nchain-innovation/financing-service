@@ -19,7 +19,7 @@ pub struct BlockchainInterfaceConfig {
     #[serde(default)]
     pub rpc_user: Option<String>,
     /// JSON-RPC password, for `interface_type = "rpc"`. Takes an
-    /// `env:VAR_NAME` reference, and is overridden by `FS_RPC_PASSWORD`.
+    /// `env:VAR_NAME` reference, or `FS__BLOCKCHAIN_INTERFACE__RPC_PASSWORD`.
     #[serde(default)]
     pub rpc_password: Option<String>,
     /// Whether to ask the node to watch each client's funding address at
@@ -371,7 +371,7 @@ pub struct MapiLiteConfig {
     pub base_url: String,
     /// Sent verbatim as the `Authorization` header on every request, so it
     /// must include the scheme: `"Bearer <secret>"`. Takes an `env:VAR_NAME`
-    /// reference, and is overridden by `FS_MAPI_LITE_AUTH_TOKEN`.
+    /// reference, or `FS__MAPI_LITE__AUTH_TOKEN`.
     #[serde(default)]
     pub auth_token: Option<String>,
     /// Per-request timeout for transaction submits, in seconds.
@@ -609,10 +609,11 @@ pub struct DynamicConfigConfig {
     /// (CS-521, SR-SEC-018). Default [`DEFAULT_WIF_ENV_PREFIX`].
     ///
     /// Without it, `wif_env` could name any variable in the process
-    /// environment -- another client's `FS_CLIENT_<ID>_WIF` among them -- and
+    /// environment -- another client's key variable among them -- and
     /// whoever could add a client could fund from that wallet under a key of
     /// their own. With it, only variables the operator has set aside for
-    /// runtime clients can be named. It may not overlap `FS_CLIENT_`.
+    /// runtime clients can be named. It may not overlap `FS__`, the
+    /// configuration overrides, which carry secrets (CS-624).
     #[serde(default = "default_wif_env_prefix")]
     pub wif_env_prefix: String,
 }
@@ -625,16 +626,18 @@ fn default_wif_env_prefix() -> String {
 }
 
 impl DynamicConfigConfig {
-    /// The prefix must be a usable variable-name start that no per-client
-    /// override (`FS_CLIENT_<ID>_WIF`) can begin with.
+    /// The prefix must be a usable variable-name start that no configuration
+    /// override (`FS__...`) can begin with.
     pub fn validate(&self) -> Result<(), String> {
         let prefix = &self.wif_env_prefix;
         crate::secrets::validate_env_var_name(prefix)
             .map_err(|e| format!("dynamic_config.wif_env_prefix: {e}"))?;
-        if prefix.starts_with(CLIENT_ENV_PREFIX) || CLIENT_ENV_PREFIX.starts_with(prefix.as_str()) {
+        if prefix.starts_with(ENV_OVERRIDE_PREFIX)
+            || ENV_OVERRIDE_PREFIX.starts_with(prefix.as_str())
+        {
             return Err(format!(
-                "dynamic_config.wif_env_prefix {prefix:?} overlaps {CLIENT_ENV_PREFIX:?}, the \
-                 prefix of every client's own key variable"
+                "dynamic_config.wif_env_prefix {prefix:?} overlaps {ENV_OVERRIDE_PREFIX:?}, the \
+                 prefix of the configuration overrides, which carry secrets"
             ));
         }
         Ok(())
@@ -848,50 +851,29 @@ impl Config {
         }
     }
 
-    /// Resolve secret references and apply environment overrides.
+    /// Resolve `env:VAR_NAME` references in the secret fields.
+    ///
+    /// The named overrides that used to take precedence here --
+    /// `FS_ADMIN_API_KEY`, `FS_RPC_USER`, `FS_RPC_PASSWORD`,
+    /// `FS_MAPI_LITE_AUTH_TOKEN` and each client's `FS_CLIENT_<ID>_WIF` and
+    /// `_API_KEY` -- are gone (CS-624). Any setting can be overridden with
+    /// `FS__<TABLE>__<KEY>`, applied when the file is read; a client's keys,
+    /// which live in an array, are `env:` references in the file.
     pub fn resolve_secrets(mut self) -> Result<Self, String> {
-        if let Ok(admin_api_key) = env::var("FS_ADMIN_API_KEY") {
-            if !admin_api_key.is_empty() {
-                self.web_interface.admin_api_key = Some(admin_api_key);
-            }
-        } else if let Some(admin_api_key) = self.web_interface.admin_api_key.take() {
-            self.web_interface.admin_api_key = Some(resolve_secret(&admin_api_key)?);
-        }
-
-        // The node's RPC credentials are secrets like any other.
-        if let Ok(rpc_user) = env::var("FS_RPC_USER") {
-            if !rpc_user.is_empty() {
-                self.blockchain_interface.rpc_user = Some(rpc_user);
-            }
-        } else if let Some(rpc_user) = self.blockchain_interface.rpc_user.take() {
-            self.blockchain_interface.rpc_user = Some(resolve_secret(&rpc_user)?);
-        }
-
-        if let Ok(rpc_password) = env::var("FS_RPC_PASSWORD") {
-            if !rpc_password.is_empty() {
-                self.blockchain_interface.rpc_password = Some(rpc_password);
-            }
-        } else if let Some(rpc_password) = self.blockchain_interface.rpc_password.take() {
-            self.blockchain_interface.rpc_password = Some(resolve_secret(&rpc_password)?);
-        }
-
-        // The mapi-lite token is a bearer credential like the API keys.
+        let resolve = |value: Option<String>| -> Result<Option<String>, String> {
+            value.map(|v| resolve_secret(&v)).transpose()
+        };
+        self.web_interface.admin_api_key = resolve(self.web_interface.admin_api_key.take())?;
+        self.blockchain_interface.rpc_user = resolve(self.blockchain_interface.rpc_user.take())?;
+        self.blockchain_interface.rpc_password =
+            resolve(self.blockchain_interface.rpc_password.take())?;
         if let Some(mapi_lite) = self.mapi_lite.as_mut() {
-            if let Ok(auth_token) = env::var("FS_MAPI_LITE_AUTH_TOKEN") {
-                if !auth_token.is_empty() {
-                    mapi_lite.auth_token = Some(auth_token);
-                } else if let Some(auth_token) = mapi_lite.auth_token.take() {
-                    mapi_lite.auth_token = Some(resolve_secret(&auth_token)?);
-                }
-            } else if let Some(auth_token) = mapi_lite.auth_token.take() {
-                mapi_lite.auth_token = Some(resolve_secret(&auth_token)?);
-            }
+            mapi_lite.auth_token = resolve(mapi_lite.auth_token.take())?;
             // An empty token and no token mean the same thing: send none.
             if mapi_lite.auth_token.as_deref() == Some("") {
                 mapi_lite.auth_token = None;
             }
         }
-
         if let Some(clients) = self.client.as_mut() {
             let resolved = std::mem::take(clients)
                 .into_iter()
@@ -899,63 +881,34 @@ impl Config {
                 .collect::<Result<Vec<_>, _>>()?;
             *clients = resolved;
         }
-
         Ok(self)
     }
 }
 
 fn resolve_client_config(mut client: ClientConfig) -> Result<ClientConfig, String> {
-    if let Ok(wif_key) = env::var(client_wif_env_var(&client.client_id)) {
-        if !wif_key.is_empty() {
-            client.wif_key = wif_key;
-        } else {
-            client.wif_key = resolve_secret(&client.wif_key)?;
-        }
-    } else {
-        client.wif_key = resolve_secret(&client.wif_key)?;
-    }
-
-    if let Ok(api_key) = env::var(client_api_key_env_var(&client.client_id)) {
-        if !api_key.is_empty() {
-            client.api_key = Some(api_key);
-        } else if let Some(key) = client.api_key.take() {
-            client.api_key = Some(resolve_secret(&key)?);
-        }
-    } else if let Some(api_key) = client.api_key.take() {
-        client.api_key = Some(resolve_secret(&api_key)?);
-    }
-
+    client.wif_key = resolve_secret(&client.wif_key)?;
+    client.api_key = client.api_key.map(|key| resolve_secret(&key)).transpose()?;
     Ok(client)
 }
 
-/// What every per-client environment override starts with.
-const CLIENT_ENV_PREFIX: &str = "FS_CLIENT_";
+/// What every configuration override's name starts with (CS-624):
+/// `FS__WEB_INTERFACE__ADMIN_API_KEY` sets `web_interface.admin_api_key`.
+pub const ENV_OVERRIDE_PREFIX: &str = "FS__";
 
-fn client_wif_env_var(client_id: &str) -> String {
-    format!("{CLIENT_ENV_PREFIX}{}_WIF", env_key_suffix(client_id))
-}
+/// The variable naming the configuration file, as `TE_CONFIG` and
+/// `MAPI_CONFIG` do for the other two services (CS-624).
+pub const CONFIG_FILE_ENV: &str = "FS_CONFIG";
 
-fn client_api_key_env_var(client_id: &str) -> String {
-    format!("{CLIENT_ENV_PREFIX}{}_API_KEY", env_key_suffix(client_id))
-}
+/// The configuration file when [`CONFIG_FILE_ENV`] is unset.
+pub const DEFAULT_CONFIG_FILE: &str = "data/financing-service.toml";
 
-/// The part of a client's override variables that comes from its id.
-///
-/// Not one-to-one: case and punctuation fold, so `id.1` and `ID_1` share
-/// `FS_CLIENT_ID_1_WIF`. Two clients that fold together would both take
-/// whatever key that variable holds, so `POST /client` refuses an id that
-/// folds onto an existing client's (CS-521).
-pub(crate) fn env_key_suffix(client_id: &str) -> String {
-    client_id
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() {
-                ch.to_ascii_uppercase()
-            } else {
-                '_'
-            }
-        })
-        .collect()
+/// The configuration file to read: [`CONFIG_FILE_ENV`], else
+/// [`DEFAULT_CONFIG_FILE`].
+pub fn config_file() -> String {
+    env::var(CONFIG_FILE_ENV)
+        .ok()
+        .filter(|path| !path.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_CONFIG_FILE.to_string())
 }
 
 /// Return the HTTP bind address and port, honouring `APP_ENV=docker`.
@@ -979,8 +932,11 @@ pub fn web_bind_address(config: &Config) -> (Ipv4Addr, u16) {
     }
 }
 
-pub fn load_config(env_var: &str, filename: &str) -> Result<Config, String> {
-    let config = get_config(env_var, filename)?;
+/// Read, validate and resolve the configuration in `path` (CS-624): the TOML
+/// file, then `FS__` environment overrides, then `env:` references. A key no
+/// setting reads -- in the file or an override -- is refused, naming it.
+pub fn load_config(path: &str) -> Result<Config, String> {
+    let config = get_config(path)?;
     config.web_interface.rate_limit.validate()?;
     config.telemetry.validate()?;
     config.idempotency.validate()?;
@@ -993,33 +949,52 @@ pub fn load_config(env_var: &str, filename: &str) -> Result<Config, String> {
     if let Some(mapi_lite) = &config.mapi_lite {
         mapi_lite.validate()?;
     }
-    warn_plaintext_secrets(&config);
+    // Only what the file itself holds is warned about: a secret set by an
+    // FS__ override is the environment already, which is what the warning
+    // asks for.
+    warn_plaintext_secrets(&read_layers(path, false)?);
     config.resolve_secrets()
 }
 
-/// Read the config from the provided file
-fn read_config(filename: &str) -> Result<Config, String> {
-    debug!("read_config = {}", filename);
-    // Given filename read the config
-    let content = std::fs::read_to_string(filename).map_err(|e| e.to_string())?;
-    let config = toml::from_str(&content).map_err(|e| e.to_string())?;
-    Ok(config)
+/// The configuration in `path` with `FS__` overrides applied, before
+/// validation and secret resolution.
+pub fn get_config(path: &str) -> Result<Config, String> {
+    read_layers(path, true)
 }
 
-/// Read the config from environment variable, if not read from filename
-pub fn get_config(env_var: &str, filename: &str) -> Result<Config, String> {
-    match env::var_os(env_var) {
-        Some(content) => {
-            let val = content
-                .into_string()
-                .map_err(|_| format!("Environment variable {env_var} is not valid UTF-8"))?;
-            serde_json::from_str(&val)
-                .map_err(|e| format!("Error parsing JSON environment variable {env_var}: {e}"))
-        }
-        None => {
-            read_config(filename).map_err(|e| format!("Error reading config file {filename}: {e}"))
-        }
+/// The file, and the `FS__` environment when `with_env`, as one [`Config`].
+fn read_layers(path: &str, with_env: bool) -> Result<Config, String> {
+    debug!("read_config = {}", path);
+    let mut builder = config::Config::builder()
+        .add_source(config::File::new(path, config::FileFormat::Toml).required(true));
+    if with_env {
+        builder = builder.add_source(
+            // Values stay text until a setting reads them, which then
+            // parses "8080" or "true" as its own type. `try_parsing` would
+            // parse first, so a key of "007" would arrive as "7".
+            config::Environment::with_prefix("FS")
+                .prefix_separator("__")
+                .separator("__"),
+        );
     }
+    let built = builder
+        .build()
+        .map_err(|e| format!("Error reading config file {path}: {e}"))?;
+    let mut unused = Vec::new();
+    let config: Config = serde_ignored::deserialize(built, |key| {
+        // serde_ignored writes an Option's inside as a `?` segment.
+        unused.push(key.to_string().replace(".?", ""))
+    })
+    .map_err(|e| format!("Error in config file {path}: {e}"))?;
+    if !unused.is_empty() {
+        unused.sort();
+        return Err(format!(
+            "configuration keys no setting reads: {}. Check the spelling: a key belongs in the \
+             [table] it is written under, and an override is {ENV_OVERRIDE_PREFIX}<TABLE>__<KEY>",
+            unused.join(", ")
+        ));
+    }
+    Ok(config)
 }
 
 #[cfg(test)]
@@ -1035,7 +1010,6 @@ mod tests {
         unsafe { env::set_var("FS_TEST_CONFIG_WIF", "test-wif-value") };
         unsafe { env::set_var("FS_TEST_CONFIG_API_KEY", "test-api-key") };
         unsafe { env::set_var("FS_TEST_CONFIG_ADMIN", "admin-from-env") };
-        unsafe { env::remove_var("FS_CLIENT_ID1_WIF") };
 
         let config = Config {
             web_interface: WebInterfaceConfig {
@@ -1061,47 +1035,6 @@ mod tests {
         let client = resolved.client.as_ref().unwrap().first().unwrap();
         assert_eq!(client.wif_key, "test-wif-value");
         assert_eq!(client.api_key.as_deref(), Some("test-api-key"));
-    }
-
-    #[test]
-    fn resolve_secrets_applies_client_env_overrides() {
-        let _env = env_lock();
-        unsafe { env::set_var("FS_CLIENT_ID1_WIF", "override-wif") };
-        let config = Config {
-            client: Some(vec![ClientConfig {
-                client_id: "id1".to_string(),
-                wif_key: "env:SHOULD_NOT_BE_USED".to_string(),
-                api_key: None,
-            }]),
-            ..Default::default()
-        };
-        let resolved = config.resolve_secrets().unwrap();
-        assert_eq!(resolved.client.as_ref().unwrap()[0].wif_key, "override-wif");
-        unsafe { env::remove_var("FS_CLIENT_ID1_WIF") };
-    }
-
-    #[test]
-    fn sr_sec_008_resolve_secrets_applies_client_api_key_env_override() {
-        let _env = env_lock();
-        unsafe { env::set_var("FS_CLIENT_ID1_API_KEY", "override-api-key") };
-        let config = Config {
-            client: Some(vec![ClientConfig {
-                client_id: "id1".to_string(),
-                wif_key: "env:FS_TEST_CONFIG_WIF".to_string(),
-                api_key: Some("env:SHOULD_NOT_BE_USED".to_string()),
-            }]),
-            ..Default::default()
-        };
-        unsafe { env::set_var("FS_TEST_CONFIG_WIF", "test-wif-value") };
-        let resolved = config.resolve_secrets().unwrap();
-        assert_eq!(
-            resolved.client.as_ref().unwrap()[0].api_key.as_deref(),
-            Some("override-api-key")
-        );
-        unsafe {
-            env::remove_var("FS_CLIENT_ID1_API_KEY");
-            env::remove_var("FS_TEST_CONFIG_WIF");
-        }
     }
 
     #[test]
@@ -1152,24 +1085,140 @@ filename = "./data/dynamic.toml"
         )
         .unwrap();
 
-        unsafe { env::remove_var("FS_CONFIG") };
-        let config = load_config("FS_CONFIG", path.to_str().unwrap()).unwrap();
+        let config = load_config(path.to_str().unwrap()).unwrap();
         assert_eq!(config.web_interface.port, 9091);
         assert_eq!(config.service.utxo_refresh_period, 45);
     }
 
+    /// `FS_CONFIG` names the file, as `TE_CONFIG` and `MAPI_CONFIG` do; it
+    /// no longer holds the configuration itself (CS-624).
     #[test]
-    fn sr_cfg_002_get_config_reads_fs_config_json() {
+    fn sr_cfg_002_fs_config_names_the_file() {
         let _env = env_lock();
-        unsafe {
-            env::set_var(
-                "FS_CONFIG",
-                r#"{"blockchain_interface":{"interface_type":"test","network_type":"testnet"},"web_interface":{"address":"127.0.0.1","port":9092,"allow_unauthenticated":true},"logging":{"level":"info"},"service":{"utxo_refresh_period":30},"dynamic_config":{"filename":"./data/dynamic.toml"}}"#,
+        unsafe { env::remove_var(CONFIG_FILE_ENV) };
+        assert_eq!(config_file(), DEFAULT_CONFIG_FILE);
+        let path = write_temp_config("named", MINIMAL_TOML);
+        unsafe { env::set_var(CONFIG_FILE_ENV, &path) };
+        assert_eq!(config_file(), path.to_str().unwrap());
+        let config = load_config(&config_file()).unwrap();
+        assert_eq!(config.web_interface.port, 8080);
+        unsafe { env::remove_var(CONFIG_FILE_ENV) };
+    }
+
+    /// Runs `body` with `vars` set, removing them after, under the env lock.
+    fn with_env<T>(vars: &[(&str, &str)], body: impl FnOnce() -> T) -> T {
+        let _env = env_lock();
+        for (name, value) in vars {
+            unsafe { env::set_var(name, value) };
+        }
+        let result = body();
+        for (name, _) in vars {
+            unsafe { env::remove_var(name) };
+        }
+        result
+    }
+
+    /// `FS__<TABLE>__<KEY>` overrides any setting the file holds, or adds
+    /// one it does not, with its value taken as the setting's type (CS-624).
+    #[test]
+    fn sr_cfg_002_fs_overrides_any_setting() {
+        let path = write_temp_config("override", MINIMAL_TOML);
+        let config = with_env(
+            &[
+                ("FS__WEB_INTERFACE__PORT", "9093"),
+                ("FS__WEB_INTERFACE__ADMIN_API_KEY", "admin-from-env"),
+                ("FS__SERVICE__UTXO_REFRESH_PERIOD", "15"),
+            ],
+            || load_config(path.to_str().unwrap()).unwrap(),
+        );
+        assert_eq!(config.web_interface.port, 9093);
+        assert_eq!(
+            config.web_interface.admin_api_key.as_deref(),
+            Some("admin-from-env")
+        );
+        assert_eq!(config.service.utxo_refresh_period, 15);
+    }
+
+    /// A secret set by override is taken as written: a key of digits keeps
+    /// its leading zeros and one that reads as a number stays text.
+    #[test]
+    fn sr_sec_008_an_override_secret_is_taken_verbatim() {
+        let path = write_temp_config("verbatim", MINIMAL_TOML);
+        for secret in ["007", "1e5", "true", "0x10"] {
+            let config = with_env(&[("FS__WEB_INTERFACE__ADMIN_API_KEY", secret)], || {
+                load_config(path.to_str().unwrap()).unwrap()
+            });
+            assert_eq!(
+                config.web_interface.admin_api_key.as_deref(),
+                Some(secret),
+                "{secret:?}"
             );
         }
-        let config = get_config("FS_CONFIG", "missing-file.toml").unwrap();
-        assert_eq!(config.web_interface.port, 9092);
-        unsafe { env::remove_var("FS_CONFIG") };
+    }
+
+    /// A key no setting reads -- misspelt, or under the wrong table -- is
+    /// refused at startup with its name, whether the file or an override
+    /// holds it, rather than silently leaving the setting at its default.
+    #[test]
+    fn sr_cfg_002_a_key_no_setting_reads_is_refused() {
+        let path = write_temp_config(
+            "unknown",
+            &MINIMAL_TOML.replace("port = 8080", "port = 8080\nprot = 8081"),
+        );
+        let err = with_env(&[], || load_config(path.to_str().unwrap()).unwrap_err());
+        assert!(err.contains("web_interface.prot"), "{err}");
+
+        let path = write_temp_config("unknown-env", MINIMAL_TOML);
+        let err = with_env(&[("FS__FEES__SATOSHIS_PER_KBYTE", "100")], || {
+            load_config(path.to_str().unwrap()).unwrap_err()
+        });
+        assert!(err.contains("fees.satoshis_per_kbyte"), "{err}");
+        assert!(err.contains("FS__<TABLE>__<KEY>"), "{err}");
+    }
+
+    /// The overrides that preceded `FS__` are gone, so a deployment still
+    /// setting one learns nothing changed only by reading the docs: they no
+    /// longer take effect (CS-624).
+    #[test]
+    fn sr_sec_008_the_retired_named_overrides_are_not_read() {
+        let path = write_temp_config(
+            "retired",
+            &format!(
+                "{MINIMAL_TOML}\n[[client]]\nclient_id = \"id1\"\nwif_key = \"in-file-wif\"\n"
+            ),
+        );
+        let config = with_env(
+            &[
+                ("FS_ADMIN_API_KEY", "retired"),
+                ("FS_CLIENT_ID1_WIF", "retired"),
+                ("FS_CLIENT_ID1_API_KEY", "retired"),
+            ],
+            || {
+                get_config(path.to_str().unwrap())
+                    .unwrap()
+                    .resolve_secrets()
+                    .unwrap()
+            },
+        );
+        assert_eq!(config.web_interface.admin_api_key, None);
+        let client = &config.client.unwrap()[0];
+        assert_eq!(client.wif_key, "in-file-wif");
+        assert_eq!(client.api_key, None);
+    }
+
+    /// The plaintext-secret warning reads the file alone: a secret an
+    /// override supplies is already where the warning asks for it.
+    #[test]
+    fn sr_sec_008_the_file_layer_excludes_overrides() {
+        let path = write_temp_config("file-layer", MINIMAL_TOML);
+        let (file_only, merged) = with_env(&[("FS__WEB_INTERFACE__ADMIN_API_KEY", "k")], || {
+            (
+                read_layers(path.to_str().unwrap(), false).unwrap(),
+                read_layers(path.to_str().unwrap(), true).unwrap(),
+            )
+        });
+        assert_eq!(file_only.web_interface.admin_api_key, None);
+        assert_eq!(merged.web_interface.admin_api_key.as_deref(), Some("k"));
     }
 
     #[test]
@@ -1364,8 +1413,6 @@ filename = "./data/dynamic.toml"
     fn sr_sec_014_rpc_password_resolves_from_an_env_reference() {
         let _guard = crate::test_support::env_lock();
         unsafe { std::env::set_var("FS_TEST_RPC_PASSWORD", "from-env") };
-        unsafe { std::env::remove_var("FS_RPC_PASSWORD") };
-        unsafe { std::env::remove_var("FS_RPC_USER") };
         let config = Config {
             blockchain_interface: rpc_interface_config(
                 Some("127.0.0.1:18443"),
@@ -1380,26 +1427,6 @@ filename = "./data/dynamic.toml"
             Some("from-env")
         );
         unsafe { std::env::remove_var("FS_TEST_RPC_PASSWORD") };
-    }
-
-    #[test]
-    fn sr_sec_014_fs_rpc_password_env_overrides_the_config() {
-        let _guard = crate::test_support::env_lock();
-        unsafe { std::env::set_var("FS_RPC_PASSWORD", "override") };
-        let config = Config {
-            blockchain_interface: rpc_interface_config(
-                Some("127.0.0.1:18443"),
-                Some("rpcuser"),
-                Some("in-file"),
-            ),
-            ..Default::default()
-        };
-        let resolved = config.resolve_secrets().unwrap();
-        assert_eq!(
-            resolved.blockchain_interface.rpc_password.as_deref(),
-            Some("override")
-        );
-        unsafe { std::env::remove_var("FS_RPC_PASSWORD") };
     }
 
     #[test]
@@ -1439,8 +1466,7 @@ filename = "./data/dynamic.toml"
     #[test]
     fn sr_nfr_007_load_config_returns_error_for_invalid_file() {
         let _env = env_lock();
-        unsafe { env::remove_var("FS_CONFIG") };
-        let err = load_config("FS_CONFIG", "definitely-missing-config.toml").unwrap_err();
+        let err = load_config("definitely-missing-config.toml").unwrap_err();
         assert!(err.contains("Error reading config file"));
     }
 
@@ -1492,8 +1518,7 @@ filename = "./data/dynamic.toml"
         )
         .unwrap();
 
-        unsafe { env::remove_var("FS_CONFIG") };
-        let err = load_config("FS_CONFIG", path.to_str().unwrap()).unwrap_err();
+        let err = load_config(path.to_str().unwrap()).unwrap_err();
         assert!(err.contains("telemetry.otlp_endpoint"));
     }
 
@@ -1562,8 +1587,7 @@ filename = "./data/dynamic.toml"
             "fees-zero",
             &format!("{MINIMAL_TOML}\n[fees]\nsatoshis_per_kb = 0\n"),
         );
-        unsafe { env::remove_var("FS_CONFIG") };
-        let err = load_config("FS_CONFIG", path.to_str().unwrap()).unwrap_err();
+        let err = load_config(path.to_str().unwrap()).unwrap_err();
         assert!(err.contains("fees.satoshis_per_kb"), "{err}");
     }
 
@@ -1817,8 +1841,7 @@ filename = "./data/dynamic.toml"
     fn sr_cfg_008_load_config_validates_the_mapi_lite_section() {
         let _env = env_lock();
         let path = write_temp_config("mapi-lite", &with_mapi_lite_section("base_url = \"\"\n"));
-        unsafe { env::remove_var("FS_CONFIG") };
-        let err = load_config("FS_CONFIG", path.to_str().unwrap()).unwrap_err();
+        let err = load_config(path.to_str().unwrap()).unwrap_err();
         assert!(err.contains("mapi_lite.base_url"), "{err}");
     }
 
@@ -1829,33 +1852,32 @@ filename = "./data/dynamic.toml"
             "mapi-lite-ok",
             &with_mapi_lite_section("base_url = \"http://127.0.0.1:8080\"\n"),
         );
-        unsafe { env::remove_var("FS_CONFIG") };
-        unsafe { env::remove_var("FS_MAPI_LITE_AUTH_TOKEN") };
-        let config = load_config("FS_CONFIG", path.to_str().unwrap()).unwrap();
+        let config = load_config(path.to_str().unwrap()).unwrap();
         assert_eq!(config.mapi_lite.unwrap().base_url, "http://127.0.0.1:8080");
     }
 
+    /// An override can supply the whole section, which then takes the
+    /// defaults for everything it leaves out.
     #[test]
-    fn sr_cfg_008_fs_config_json_accepts_a_mapi_lite_object() {
-        let _env = env_lock();
-        unsafe {
-            env::set_var(
-                "FS_CONFIG",
-                r#"{"blockchain_interface":{"interface_type":"test","network_type":"testnet"},"web_interface":{"address":"127.0.0.1","port":9092,"allow_unauthenticated":true},"logging":{"level":"info"},"service":{"utxo_refresh_period":30},"dynamic_config":{"filename":"./data/dynamic.toml"},"mapi_lite":{"base_url":"http://mapi:8080","max_retries":1}}"#,
-            );
-        }
-        let config = get_config("FS_CONFIG", "missing-file.toml").unwrap();
-        unsafe { env::remove_var("FS_CONFIG") };
-        let mapi_lite = config.mapi_lite.expect("object present");
+    fn sr_cfg_008_overrides_can_supply_the_mapi_lite_section() {
+        let path = write_temp_config("mapi-lite-env", MINIMAL_TOML);
+        let config = with_env(
+            &[
+                ("FS__MAPI_LITE__BASE_URL", "http://mapi:8080"),
+                ("FS__MAPI_LITE__MAX_RETRIES", "1"),
+            ],
+            || load_config(path.to_str().unwrap()).unwrap(),
+        );
+        let mapi_lite = config.mapi_lite.expect("section supplied");
         assert_eq!(mapi_lite.base_url, "http://mapi:8080");
         assert_eq!(mapi_lite.max_retries, 1);
+        assert_eq!(mapi_lite.total_timeout_seconds, 45);
     }
 
     #[test]
     fn sr_sec_015_mapi_lite_auth_token_resolves_from_an_env_reference() {
         let _env = env_lock();
         unsafe { env::set_var("FS_TEST_MAPI_TOKEN", "Bearer from-env") };
-        unsafe { env::remove_var("FS_MAPI_LITE_AUTH_TOKEN") };
         let config = config_with_mapi_lite(Some("env:FS_TEST_MAPI_TOKEN"));
         let resolved = config.resolve_secrets().unwrap();
         assert_eq!(
@@ -1866,22 +1888,23 @@ filename = "./data/dynamic.toml"
     }
 
     #[test]
-    fn sr_sec_015_fs_mapi_lite_auth_token_env_overrides_the_config() {
-        let _env = env_lock();
-        unsafe { env::set_var("FS_MAPI_LITE_AUTH_TOKEN", "Bearer override") };
-        let config = config_with_mapi_lite(Some("env:SHOULD_NOT_BE_USED"));
-        let resolved = config.resolve_secrets().unwrap();
+    fn sr_sec_015_the_mapi_lite_auth_token_can_be_an_override() {
+        let path = write_temp_config(
+            "mapi-lite-token",
+            &with_mapi_lite_section("base_url = \"http://127.0.0.1:8080\"\n"),
+        );
+        let config = with_env(&[("FS__MAPI_LITE__AUTH_TOKEN", "Bearer override")], || {
+            load_config(path.to_str().unwrap()).unwrap()
+        });
         assert_eq!(
-            resolved.mapi_lite.unwrap().auth_token.as_deref(),
+            config.mapi_lite.unwrap().auth_token.as_deref(),
             Some("Bearer override")
         );
-        unsafe { env::remove_var("FS_MAPI_LITE_AUTH_TOKEN") };
     }
 
     #[test]
     fn sr_sec_015_missing_mapi_lite_auth_token_env_reference_fails_resolution() {
         let _env = env_lock();
-        unsafe { env::remove_var("FS_MAPI_LITE_AUTH_TOKEN") };
         unsafe { env::remove_var("FS_DEFINITELY_MISSING_MAPI_TOKEN") };
         let config = config_with_mapi_lite(Some("env:FS_DEFINITELY_MISSING_MAPI_TOKEN"));
         let err = config.resolve_secrets().unwrap_err();
@@ -1891,7 +1914,6 @@ filename = "./data/dynamic.toml"
     #[test]
     fn mapi_lite_auth_token_absent_stays_absent_after_resolution() {
         let _env = env_lock();
-        unsafe { env::remove_var("FS_MAPI_LITE_AUTH_TOKEN") };
         let resolved = config_with_mapi_lite(None).resolve_secrets().unwrap();
         assert_eq!(resolved.mapi_lite.unwrap().auth_token, None);
     }
@@ -2055,10 +2077,10 @@ filename = "./data/dynamic.toml"
         assert!(fees(100, 99).validate().is_err());
     }
 
-    /// The runtime-client prefix may not be one a client's own override
-    /// variable (`FS_CLIENT_<ID>_WIF`) could start with (CS-521).
+    /// The runtime-client prefix may not be one a configuration override
+    /// (`FS__...`), which may carry any secret, could start with (CS-624).
     #[test]
-    fn sr_sec_018_wif_env_prefix_may_not_overlap_client_variables() {
+    fn sr_sec_018_wif_env_prefix_may_not_overlap_the_overrides() {
         let check = |prefix: &str| {
             DynamicConfigConfig {
                 filename: "x".to_string(),
@@ -2069,7 +2091,8 @@ filename = "./data/dynamic.toml"
         };
         assert!(check(DEFAULT_WIF_ENV_PREFIX).is_ok());
         assert!(check("MY_RUNTIME_KEYS_").is_ok());
-        for bad in ["FS_CLIENT_", "FS_CLIENT_ID1_", "FS_CLIENT", "FS_", "F", ""] {
+        assert!(check("FS_CLIENT_").is_ok());
+        for bad in ["FS__", "FS__WEB_INTERFACE__", "FS_", "FS", "F", ""] {
             assert!(check(bad).is_err(), "{bad:?} was accepted");
         }
     }
