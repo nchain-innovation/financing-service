@@ -263,10 +263,8 @@ impl MapiBroadcaster {
         let mut client = MapiClient::new(config.base_url().to_string())
             .with_timeout(timeout)
             .with_trusted_miner_ids(&config.miner_id_public_keys);
-        if let Some(token) = &config.auth_token {
-            // Sent verbatim as the Authorization header; the scheme is the
-            // operator's to include (see MapiLiteConfig::auth_token).
-            client = client.with_token(token.clone());
+        if let Some(authorization) = config.authorization() {
+            client = client.with_token(authorization);
         }
         Ok(client)
     }
@@ -599,7 +597,7 @@ mod tests {
             .await;
 
         let mut config = config(&server);
-        config.auth_token = Some("Bearer secret".to_string());
+        config.auth_token = Some("secret".to_string());
         let broadcaster = MapiBroadcaster::new(&config).expect("broadcaster builds");
 
         broadcaster.broadcast_tx(&tx).await.expect("accepted");

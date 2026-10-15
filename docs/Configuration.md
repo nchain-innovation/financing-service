@@ -479,7 +479,7 @@ auth_token = "env:FS_MAPI_LITE_AUTH_TOKEN"
 ```
 
 * `base_url` — **required.** Base URL of the mapi-lite server, `http://` or `https://`. Surrounding whitespace and a trailing `/` are stripped before the URL is validated or used, so the value that is checked at startup is the one that is requested.
-* `auth_token` — optional. Sent **verbatim** as the `Authorization` header on every request, so include the scheme the server expects, e.g. `"Bearer <secret>"`. Takes an `env:VAR_NAME` reference, or can be set with `FS__MAPI_LITE__AUTH_TOKEN`. A plaintext value is reported at startup like any other plaintext secret. Never logged.
+* `auth_token` — optional. The token alone, as mapi-lite's own `auth_token` is: every request carries `Authorization: Bearer <token>`. **Before CS-624 this held the whole header**; a value starting `Bearer `, or holding any space, is now refused at startup, so drop the prefix. Takes an `env:VAR_NAME` reference, or can be set with `FS__MAPI_LITE__AUTH_TOKEN`. A plaintext value is reported at startup like any other plaintext secret. Never logged.
 * `timeout_seconds` — ceiling on **one** submit attempt. Default `13`. Chosen so the whole retry budget fits the deadline: 3 attempts × 13s plus 3s of back-off is 42s, inside `total_timeout_seconds` of 45. It was 30s, which meant the deadline cut the sequence off after one attempt and part of a second, so `max_retries` described attempts that never ran.
 * `health_timeout_seconds` — timeout for the mapi-lite probe behind `GET /ready`. Default `2`. Must be **less than 3**, and is rejected at startup otherwise: readiness probes allow a few seconds at most (Docker's health check defaults to `--timeout=3s`), and a slower probe would be killed by the caller before it answered, marking the instance unready on every check even while mapi-lite is fine. The probe's verdict is cached for this long, so `/ready` — which is unauthenticated and exempt from rate limiting — cannot be used to flood mapi-lite.
 * `max_retries` — how many times a submit is retried after a transient failure (an HTTP 5xx, a transport error, or an attempt that ran out of `timeout_seconds`). Default `2`, so three attempts, with linear back-off of 1s then 2s (capped at 5s). Resubmitting is safe: mapi-lite answers an already-known transaction with success — which is also how a retry can *settle* an attempt that timed out, turning `broadcast_outcome_unknown` back into a plain success.
@@ -584,7 +584,7 @@ If a referenced variable is not set, startup fails with a clear error.
 |----------|------|
 | `FS__WEB_INTERFACE__ADMIN_API_KEY` | `web_interface.admin_api_key` |
 | `FS__BLOCKCHAIN_INTERFACE__RPC_USER` / `FS__BLOCKCHAIN_INTERFACE__RPC_PASSWORD` | `blockchain_interface.rpc_user` / `rpc_password` |
-| `FS__MAPI_LITE__AUTH_TOKEN` | `mapi_lite.auth_token` (include the scheme, e.g. `Bearer <secret>`) |
+| `FS__MAPI_LITE__AUTH_TOKEN` | `mapi_lite.auth_token` (the token alone, without `Bearer `) |
 | `FS__LISTEN_ADDR` | `listen_addr` |
 
 A `[[client]]` entry sits in an array, which an override cannot address: give its `wif_key` and `api_key` as `env:` references.

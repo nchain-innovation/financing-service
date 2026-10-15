@@ -101,7 +101,7 @@ mod tests {
     #[test]
     fn describe_broadcaster_never_includes_the_token() {
         let mut config = with_mapi_lite(test_config(&unique_dynamic_config_path()));
-        config.mapi_lite.as_mut().unwrap().auth_token = Some("Bearer very-secret".to_string());
+        config.mapi_lite.as_mut().unwrap().auth_token = Some("very-secret".to_string());
         assert!(!describe_broadcaster(&config).contains("very-secret"));
     }
 }

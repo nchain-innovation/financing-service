@@ -350,9 +350,11 @@ pub struct MapiLiteConfig {
     /// through [`MapiLiteConfig::base_url`] rather than touching the field,
     /// so what was validated is what gets requested.
     pub base_url: String,
-    /// Sent verbatim as the `Authorization` header on every request, so it
-    /// must include the scheme: `"Bearer <secret>"`. Takes an `env:VAR_NAME`
-    /// reference, or `FS__MAPI_LITE__AUTH_TOKEN`.
+    /// The token alone, as mapi-lite's own `auth_token` is (CS-624): every
+    /// request carries `Authorization: Bearer <token>`, see
+    /// [`MapiLiteConfig::authorization`]. A value starting `Bearer ` is
+    /// refused at startup. Takes an `env:VAR_NAME` reference, or
+    /// `FS__MAPI_LITE__AUTH_TOKEN`.
     #[serde(default)]
     pub auth_token: Option<String>,
     /// Per-request timeout for transaction submits, in seconds.
@@ -435,6 +437,14 @@ impl MapiLiteConfig {
             total_timeout_seconds: default_mapi_lite_total_timeout_seconds(),
             miner_id_public_keys: Vec::new(),
         }
+    }
+
+    /// The `Authorization` header every request to mapi-lite carries, when
+    /// a token is configured.
+    pub fn authorization(&self) -> Option<String> {
+        self.auth_token
+            .as_deref()
+            .map(|token| format!("Bearer {token}"))
     }
 
     /// The configured base URL, normalised: surrounding whitespace removed and
@@ -836,6 +846,15 @@ impl Config {
             if mapi_lite.auth_token.as_deref() == Some("") {
                 mapi_lite.auth_token = None;
             }
+            // Checked once resolved, where the value an env: reference or
+            // override supplied can be seen. The message never repeats it.
+            if mapi_lite
+                .auth_token
+                .as_deref()
+                .is_some_and(|token| token.contains(char::is_whitespace))
+            {
+                return Err(MAPI_LITE_TOKEN_SHAPE.to_string());
+            }
         }
         if let Some(clients) = self.client.as_mut() {
             let resolved = std::mem::take(clients)
@@ -853,6 +872,10 @@ fn resolve_client_config(mut client: ClientConfig) -> Result<ClientConfig, Strin
     client.api_key = client.api_key.map(|key| resolve_secret(&key)).transpose()?;
     Ok(client)
 }
+
+/// Why a `mapi_lite.auth_token` holding a scheme, or any space, is refused.
+const MAPI_LITE_TOKEN_SHAPE: &str = "mapi_lite.auth_token holds the token alone, which is sent as \
+     `Authorization: Bearer <token>`: drop the \"Bearer \" prefix and any spaces (CS-624)";
 
 /// What every configuration override's name starts with (CS-624):
 /// `FS__WEB_INTERFACE__ADMIN_API_KEY` sets `web_interface.admin_api_key`.
@@ -1701,12 +1724,13 @@ filename = "./data/dynamic.toml"
     #[test]
     fn sr_cfg_008_mapi_lite_section_accepts_every_field() {
         let content = with_mapi_lite_section(
-            "base_url = \"https://mapi.example:8443/\"\nauth_token = \"Bearer secret\"\ntimeout_seconds = 5\nhealth_timeout_seconds = 1\nmax_retries = 0\n",
+            "base_url = \"https://mapi.example:8443/\"\nauth_token = \"secret\"\ntimeout_seconds = 5\nhealth_timeout_seconds = 1\nmax_retries = 0\n",
         );
         let config: Config = toml::from_str(&content).unwrap();
         let mapi_lite = config.mapi_lite.expect("section present");
         assert_eq!(mapi_lite.base_url, "https://mapi.example:8443/");
-        assert_eq!(mapi_lite.auth_token.as_deref(), Some("Bearer secret"));
+        assert_eq!(mapi_lite.auth_token.as_deref(), Some("secret"));
+        assert_eq!(mapi_lite.authorization().as_deref(), Some("Bearer secret"));
         assert_eq!(mapi_lite.timeout(), std::time::Duration::from_secs(5));
         assert_eq!(
             mapi_lite.health_timeout(),
@@ -1835,12 +1859,12 @@ filename = "./data/dynamic.toml"
     #[test]
     fn sr_sec_015_mapi_lite_auth_token_resolves_from_an_env_reference() {
         let _env = env_lock();
-        unsafe { env::set_var("FS_TEST_MAPI_TOKEN", "Bearer from-env") };
+        unsafe { env::set_var("FS_TEST_MAPI_TOKEN", "from-env") };
         let config = config_with_mapi_lite(Some("env:FS_TEST_MAPI_TOKEN"));
         let resolved = config.resolve_secrets().unwrap();
         assert_eq!(
             resolved.mapi_lite.unwrap().auth_token.as_deref(),
-            Some("Bearer from-env")
+            Some("from-env")
         );
         unsafe { env::remove_var("FS_TEST_MAPI_TOKEN") };
     }
@@ -1851,12 +1875,42 @@ filename = "./data/dynamic.toml"
             "mapi-lite-token",
             &with_mapi_lite_section("base_url = \"http://127.0.0.1:8080\"\n"),
         );
-        let config = with_env(&[("FS__MAPI_LITE__AUTH_TOKEN", "Bearer override")], || {
+        let config = with_env(&[("FS__MAPI_LITE__AUTH_TOKEN", "override")], || {
             load_config(path.to_str().unwrap()).unwrap()
         });
         assert_eq!(
             config.mapi_lite.unwrap().auth_token.as_deref(),
-            Some("Bearer override")
+            Some("override")
+        );
+    }
+
+    /// The token is the token alone; the scheme is added when it is sent. A
+    /// value written for the old verbatim header would go out as
+    /// `Bearer Bearer ...` and fail only at the first request, so it stops
+    /// startup, without the message repeating it (CS-624).
+    #[test]
+    fn sr_sec_015_a_token_with_a_scheme_or_spaces_is_refused() {
+        let _env = env_lock();
+        unsafe { env::set_var("FS_TEST_MAPI_TOKEN", "Bearer hunter2") };
+        for token in [
+            "Bearer hunter2",
+            "env:FS_TEST_MAPI_TOKEN",
+            " hunter2",
+            "hun ter2",
+        ] {
+            let err = config_with_mapi_lite(Some(token))
+                .resolve_secrets()
+                .unwrap_err();
+            assert!(err.contains("token alone"), "{token:?}: {err}");
+            assert!(!err.contains("hunter2"), "{token:?}: {err}");
+        }
+        unsafe { env::remove_var("FS_TEST_MAPI_TOKEN") };
+        let config = config_with_mapi_lite(Some("hunter2"))
+            .resolve_secrets()
+            .unwrap();
+        assert_eq!(
+            config.mapi_lite.unwrap().authorization().as_deref(),
+            Some("Bearer hunter2")
         );
     }
 
