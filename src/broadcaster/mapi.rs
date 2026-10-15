@@ -42,10 +42,6 @@ use chain_gang::util::Serializable;
 use uls_client::{Broadcast, BroadcastOptions, ClientError, MapiClient};
 use uls_core::wire::FeeAmount;
 
-/// The fee quote entry that applies to ordinary transactions. mapi quotes a
-/// "standard" and a "data" rate; funding transactions are the former.
-const STANDARD_FEE_TYPE: &str = "standard";
-
 use super::{BroadcastError, TxBroadcaster, MAPI_LITE};
 use crate::config::MapiLiteConfig;
 
@@ -447,12 +443,15 @@ impl TxBroadcaster for MapiBroadcaster {
         ready.and(signer)
     }
 
-    /// The standard mining fee from mapi-lite's quote, converted to satoshis
-    /// per kilobyte (CS-451).
+    /// The standard mining fee from mapi-lite's quote, in satoshis per
+    /// kilobyte (CS-451), as uls-client reads it (CS-627): `standard_mining_fee`
+    /// and `satoshis_per_kb`, which rounds up so the service never charges
+    /// itself less than the miner asked for.
     ///
-    /// The quote states a rate as a pair -- so many satoshis per so many bytes
-    /// -- rather than per kilobyte, so it is scaled here, rounding up so the
-    /// service never charges itself less than the miner asked for.
+    /// Fetched afresh each time, not through `cached_fee_quote`: this is
+    /// called once per sweep, not per request, and a fresh quote is what lets
+    /// a fee change reach funding within one sweep rather than once the old
+    /// quote expires.
     ///
     /// `None` on any failure, which leaves the configured rate standing: a
     /// quote that cannot be fetched, is unsigned, names no standard fee, or
@@ -470,24 +469,22 @@ impl TxBroadcaster for MapiBroadcaster {
             }
         };
         let standard = quote
-            .fees
-            .iter()
-            .find(|fee| fee.fee_type.eq_ignore_ascii_case(STANDARD_FEE_TYPE))
+            .standard_mining_fee()
             // A quote that names only one fee is taken to mean it for
             // everything, rather than discarding a usable answer on a label.
-            .or_else(|| quote.fees.first())?;
+            .or_else(|| quote.fees.first().map(|fee| fee.mining_fee))?;
 
-        let FeeAmount { satoshis, bytes } = &standard.mining_fee;
-        if *bytes == 0 || *satoshis == 0 {
-            log::warn!(
-                "fee quote gave {} satoshis per {} bytes, which is not a usable rate; \
-                 keeping the current one",
-                satoshis,
-                bytes
-            );
-            return None;
+        match standard.satoshis_per_kb() {
+            Some(rate) if rate > 0 => Some(rate),
+            _ => {
+                let FeeAmount { satoshis, bytes } = standard;
+                log::warn!(
+                    "fee quote gave {satoshis} satoshis per {bytes} bytes, which is not a usable \
+                     rate; keeping the current one"
+                );
+                None
+            }
         }
-        Some(satoshis.saturating_mul(1000).div_ceil(*bytes))
     }
 
     /// `GET /query/tx/{txid}`, which asks mapi-lite's nodes (CS-619). `None`
@@ -1640,5 +1637,80 @@ mod tests {
             matches!(error, BroadcastError::Upstream(_)),
             "a refused connection delivered nothing, got {error:?}"
         );
+    }
+
+    /// A fee quote naming `fees`, as `(feeType, satoshis, bytes)`.
+    fn quoting(fees: &[(&str, u64, u64)]) -> Value {
+        let fees: Vec<Value> = fees
+            .iter()
+            .map(|(fee_type, satoshis, bytes)| {
+                json!({
+                    "feeType": fee_type,
+                    "miningFee": { "satoshis": satoshis, "bytes": bytes },
+                    "relayFee": { "satoshis": satoshis, "bytes": bytes },
+                })
+            })
+            .collect();
+        signed(&json!({
+            "apiVersion": "1.5.0",
+            "timestamp": "2026-09-16T00:00:00Z",
+            "expiryTime": "2026-09-16T00:10:00Z",
+            "minerId": "02abc",
+            "currentHighestBlockHash": "0000abc",
+            "currentHighestBlockHeight": 812_345,
+            "fees": fees,
+        }))
+    }
+
+    async fn rate_from(fees: &[(&str, u64, u64)]) -> (Option<u64>, MockServer) {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/mapi/feeQuote"))
+            .respond_with(ok(quoting(fees)))
+            .mount(&server)
+            .await;
+        let rate = broadcaster(&server).fee_satoshis_per_kb().await;
+        (rate, server)
+    }
+
+    /// CS-627: the standard mining rate, per kilobyte, rounded up -- as
+    /// uls-client reads it.
+    #[tokio::test]
+    async fn cs_627_the_fee_rate_is_the_standard_mining_fee_per_kb_rounded_up() {
+        assert_eq!(rate_from(&[("standard", 50, 1000)]).await.0, Some(50));
+        // 1 satoshi per 300 bytes is 3.33 per kilobyte: 4, never 3.
+        assert_eq!(rate_from(&[("standard", 1, 300)]).await.0, Some(4));
+        // The data rate does not price a funding transaction.
+        assert_eq!(
+            rate_from(&[("data", 9, 1000), ("standard", 5, 1000)])
+                .await
+                .0,
+            Some(5)
+        );
+    }
+
+    /// A quote naming one fee under another label is taken for everything;
+    /// a zero rate is not a usable answer, and leaves the current rate.
+    #[tokio::test]
+    async fn cs_627_one_fee_under_another_name_is_used_and_a_zero_rate_is_not() {
+        assert_eq!(rate_from(&[("other", 7, 1000)]).await.0, Some(7));
+        assert_eq!(rate_from(&[("standard", 0, 1000)]).await.0, None);
+        assert_eq!(rate_from(&[("standard", 5, 0)]).await.0, None);
+    }
+
+    /// CS-627: asked afresh on every sweep, not cached until the quote
+    /// expires, so a fee change reaches funding within one sweep.
+    #[tokio::test]
+    async fn cs_627_the_fee_quote_is_asked_afresh_each_time() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/mapi/feeQuote"))
+            .respond_with(ok(quoting(&[("standard", 50, 1000)])))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let broadcaster = broadcaster(&server);
+        broadcaster.fee_satoshis_per_kb().await;
+        broadcaster.fee_satoshis_per_kb().await;
     }
 }
