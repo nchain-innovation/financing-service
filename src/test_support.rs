@@ -741,6 +741,8 @@ pub struct StubMapiBroadcaster {
     /// cannot be had -- the case that must leave the configured rate alone.
     quoted_fee: Option<u64>,
     quotes: AtomicU32,
+    /// What `knows_tx` answers for every txid (CS-619).
+    knows: Option<bool>,
 }
 
 impl StubMapiBroadcaster {
@@ -751,6 +753,20 @@ impl StubMapiBroadcaster {
             probes: AtomicU32::new(0),
             quoted_fee: None,
             quotes: AtomicU32::new(0),
+            knows: None,
+        })
+    }
+
+    /// A healthy stub whose nodes answer `knows` for every transaction
+    /// (CS-619).
+    pub fn knowing(knows: Option<bool>) -> Arc<Self> {
+        Arc::new(Self {
+            healthy: true,
+            broadcasts: AtomicU32::new(0),
+            probes: AtomicU32::new(0),
+            quoted_fee: None,
+            quotes: AtomicU32::new(0),
+            knows,
         })
     }
 
@@ -763,6 +779,7 @@ impl StubMapiBroadcaster {
             probes: AtomicU32::new(0),
             quoted_fee,
             quotes: AtomicU32::new(0),
+            knows: None,
         })
     }
 
@@ -805,6 +822,10 @@ impl TxBroadcaster for StubMapiBroadcaster {
     async fn fee_satoshis_per_kb(&self) -> Option<u64> {
         self.quotes.fetch_add(1, Ordering::SeqCst);
         self.quoted_fee
+    }
+
+    async fn knows_tx(&self, _txid: &str) -> Option<bool> {
+        self.knows
     }
 }
 

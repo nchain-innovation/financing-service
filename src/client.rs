@@ -666,6 +666,19 @@ impl Client {
         balance_from_unspent(&self.unspent)
     }
 
+    /// The confirmed UTXO with the lowest height in this wallet, as the chain
+    /// interface reports it: its transaction and height (CS-619). The oldest,
+    /// because it is the one any node on the same chain has had longest to
+    /// see. Unconfirmed outputs, the service's own change among them, are
+    /// left out.
+    pub fn oldest_confirmed_utxo(&self) -> Option<(String, i32)> {
+        self.unspent
+            .iter()
+            .filter(|utxo| utxo.height > 0)
+            .min_by_key(|utxo| utxo.height)
+            .map(|utxo| (utxo.tx_hash.clone(), utxo.height))
+    }
+
     pub fn get_address(&self) -> String {
         self.address.to_string()
     }
@@ -1662,6 +1675,33 @@ mod tests {
             multiple_tx: false,
             locking_scripts: vec![hex::decode(LOCKING_SCRIPT_HEX).unwrap()],
         }
+    }
+
+    /// CS-619: the oldest confirmed UTXO, unconfirmed ones left out.
+    #[test]
+    fn cs_619_oldest_confirmed_utxo_skips_unconfirmed_outputs() {
+        let mut client = Client::try_new(
+            &crate::test_support::test_config(&crate::test_support::unique_dynamic_config_path())
+                .client
+                .unwrap()[0],
+        )
+        .unwrap();
+        let utxo = |height, seed: char| UtxoEntry {
+            height,
+            tx_pos: 0,
+            tx_hash: seed.to_string().repeat(64),
+            value: 1_000,
+        };
+        assert_eq!(client.oldest_confirmed_utxo(), None);
+        client.apply_chain_state(vec![
+            utxo(-1, 'u'),
+            utxo(130, 'b'),
+            utxo(120, 'a'),
+            utxo(0, 'z'),
+        ]);
+        assert_eq!(client.oldest_confirmed_utxo(), Some(("a".repeat(64), 120)));
+        client.apply_chain_state(vec![utxo(-1, 'u')]);
+        assert_eq!(client.oldest_confirmed_utxo(), None);
     }
 
     #[test]

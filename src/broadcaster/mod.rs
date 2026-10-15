@@ -127,6 +127,15 @@ pub trait TxBroadcaster: Send + Sync {
     async fn fee_satoshis_per_kb(&self) -> Option<u64> {
         None
     }
+
+    /// Whether the nodes behind this upstream know transaction `txid`
+    /// (CS-619): `Some(false)` when they answer that they do not. `None` for
+    /// an upstream with no such question to ask -- broadcasting through the
+    /// blockchain interface reads the same chain as the wallet, so it cannot
+    /// disagree with it -- or when the question could not be answered.
+    async fn knows_tx(&self, _txid: &str) -> Option<bool> {
+        None
+    }
 }
 
 #[cfg(test)]
