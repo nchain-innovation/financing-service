@@ -1934,6 +1934,14 @@ fn coded_broadcast_error(error: &BroadcastError) -> CodedError {
             "The funding transaction was sent and its outcome is unknown; it may be on the \
              network. Do not retry with a new idempotency_key, which would risk funding twice.",
         ),
+        // Not sent, so nothing was spent, but a retry cannot help until the
+        // key list or mapi-lite's key changes (CS-618).
+        BroadcastError::Untrusted(_) => CodedError::new(
+            ErrorCode::BroadcasterUntrusted,
+            "Nothing was sent: the broadcaster signs with a key that [mapi_lite] \
+             miner_id_public_keys does not list, so its answers cannot be believed. \
+             Nothing was spent. An operator has to fix the key list or the broadcaster's key.",
+        ),
         // The upstream looked at this transaction and will not take it however
         // many times it is offered.
         BroadcastError::Rejected {
@@ -1964,6 +1972,7 @@ fn broadcast_failure_class(code: ErrorCode) -> &'static str {
     match code {
         ErrorCode::BroadcastRejected => "rejected",
         ErrorCode::BroadcastOutcomeUnknown => "indeterminate",
+        ErrorCode::BroadcasterUntrusted => "untrusted",
         _ => "failed",
     }
 }
@@ -2777,6 +2786,59 @@ mod tests {
             handed[0], handed[1],
             "the second funding transaction spends the same input as the first, which the \
              network can only treat as a conflict"
+        );
+    }
+
+    /// CS-618: a funding refused because the broadcaster is untrusted sent
+    /// nothing, so it is answered 503 `broadcaster_untrusted` and its inputs
+    /// stay available: the next funding, once the broadcaster is trusted
+    /// again, spends the same input.
+    #[tokio::test]
+    async fn cs_618_an_untrusted_broadcaster_is_503_and_reserves_nothing() {
+        use crate::test_support::{blockchain_listing, ScriptedBroadcaster};
+
+        let config = test_config(&unique_dynamic_config_path());
+        let utxo = chain_gang::interface::UtxoEntry {
+            height: 1,
+            tx_pos: 0,
+            tx_hash: "a".repeat(64),
+            value: 10_000,
+        };
+        let blockchain = blockchain_listing(&config, &[utxo]).await;
+        let broadcaster = ScriptedBroadcaster::new(vec![
+            Some(BroadcastError::Untrusted(
+                "mapi-lite signs with 02ab…, which [mapi_lite] miner_id_public_keys does not list"
+                    .to_string(),
+            )),
+            None,
+        ]);
+        let service = service_with(&config, blockchain, broadcaster.clone()).await;
+        let request = FundRequest {
+            satoshi: 1_000,
+            ..sample_fund_request(TEST_CLIENT_ID)
+        };
+
+        let refused = fund_single_transaction(&service, &request)
+            .await
+            .expect_err("refused");
+        assert_eq!(refused.code, ErrorCode::BroadcasterUntrusted);
+        assert_eq!(
+            refused.code.status(),
+            actix_web::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(
+            refused.description.contains("miner_id_public_keys"),
+            "{}",
+            refused.description
+        );
+
+        fund_single_transaction(&service, &request)
+            .await
+            .expect("the input was not held");
+        let sent = broadcaster.sent();
+        assert_eq!(
+            sent[0].inputs[0].prev_output.hash, sent[1].inputs[0].prev_output.hash,
+            "the second funding spends the input the first did not"
         );
     }
 

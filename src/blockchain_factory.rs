@@ -7,6 +7,7 @@ use chain_gang::interface::{
 use crate::address_watcher::AddressWatcher;
 use crate::config::Config;
 use crate::interface_timeout::Bounded;
+use crate::mapi_lite_interface::MapiLiteInterface;
 use crate::outbound_rate_limit::RateLimited;
 
 /// A configured backend, plus the means to tell it which addresses to watch
@@ -30,7 +31,8 @@ pub struct Backend {
 ///
 /// The other interfaces talk to a server the operator runs, so the published
 /// limit that prompted this does not apply to them; they keep the decorator,
-/// which is the only thing available.
+/// which is the only thing available. `mapi_lite` among them: mapi-lite paces
+/// its own WhatsOnChain requests, so nothing is limited here unless set.
 fn paces_its_own_requests(interface_type: &str) -> bool {
     interface_type == "woc"
 }
@@ -122,6 +124,21 @@ fn build_backend(config: &Config, limit: Option<u32>) -> Result<Backend, String>
                 .ok_or_else(|| "Config blockchain interface url not found.".to_string())?;
             let mut interface = UaaSInterface::new(uaas_url)
                 .map_err(|e| format!("Unable to create UaaS interface: {e}"))?;
+            interface.set_network(&network);
+            Ok(Backend {
+                interface: Arc::new(interface),
+                address_watcher: None,
+            })
+        }
+        "mapi_lite" => {
+            // Chain reads through mapi-lite's address queries (CS-601), so
+            // mapi-lite holds the deployment's only WhatsOnChain client.
+            // `Config::check_chain_reads` has made sure [mapi_lite] is there.
+            let mapi_lite = config.mapi_lite.as_ref().ok_or_else(|| {
+                "interface_type = \"mapi_lite\" needs a [mapi_lite] section".to_string()
+            })?;
+            let mut interface =
+                MapiLiteInterface::new(mapi_lite, config.blockchain_interface.call_timeout())?;
             interface.set_network(&network);
             Ok(Backend {
                 interface: Arc::new(interface),
@@ -222,6 +239,22 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    /// CS-601: `mapi_lite` builds from the [mapi_lite] section, watches no
+    /// addresses, and is not paced here: mapi-lite paces its own WhatsOnChain.
+    #[test]
+    fn sr_bchn_019_mapi_lite_reads_build_from_the_mapi_lite_section() {
+        let mut config = base_config("mapi_lite", None);
+        config.mapi_lite = Some(crate::config::MapiLiteConfig::for_base_url(
+            "http://mapi:8080",
+        ));
+        let backend = blockchain_factory(&config).expect("builds");
+        assert!(backend.address_watcher.is_none());
+        assert_eq!(config.blockchain_interface.outbound_rate_limit(), None);
+
+        let without = base_config("mapi_lite", None);
+        assert!(blockchain_factory(&without).is_err());
     }
 
     fn rpc_config(
