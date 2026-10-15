@@ -8,7 +8,7 @@ The file is composed of the following sections:
 
 ## [blockchain_interface]
 
-Configures the blockchain interface. Supported `interface_type` values: `woc`, `uaas`, `rpc`, `test`.
+Configures the blockchain interface. Supported `interface_type` values: `woc`, `mapi_lite`, `uaas`, `rpc`, `test`.
 
 ```toml
 [blockchain_interface]
@@ -31,13 +31,32 @@ The interface you choose constrains which networks you can reach, and this is us
 | `interface_type` | Reaches | mainnet | testnet | stn | regtest |
 |---|---|---|---|---|---|
 | `woc` | WhatsOnChain, a public API | ✅ | ✅ | ✅ | ❌ |
+| `mapi_lite` | the [`[mapi_lite]`](#mapi_lite) server's address reads, which it answers from WhatsOnChain | ✅ | ✅ | ❌ | ❌ |
 | `uaas` | a UTXO as a Service instance (set `url`) | ✅ | ✅ | ✅ | ❌ |
 | `rpc` | a node's JSON-RPC endpoint, directly | ✅ | ✅ | ✅ | ✅ |
 | `test` | nothing — an in-process stub | — | — | — | — |
 
 **`rpc` is the only interface that reaches regtest**, because no public explorer indexes a private chain. It also works against a node you control on any other network, which removes the dependency on a third-party API being up.
 
-The interface serves both chain *reads* (balances, UTXOs) and, by default, the *broadcast* of funding transactions. The broadcast alone can be moved to a mapi-lite server with the optional [`[mapi_lite]`](#mapi_lite) section; reads stay here.
+The interface serves both chain *reads* (balances, UTXOs) and, by default, the *broadcast* of funding transactions. The broadcast alone can be moved to a mapi-lite server with the optional [`[mapi_lite]`](#mapi_lite) section; with `interface_type = "mapi_lite"` the reads go there too.
+
+### The `mapi_lite` interface
+
+```toml
+[blockchain_interface]
+interface_type = "mapi_lite"
+network_type = "testnet"
+
+[mapi_lite]
+base_url = "http://127.0.0.1:8080"
+```
+
+Reads each client's UTXO set and balance through the `[mapi_lite]` server's `/query/address/*` endpoints, with the same `base_url`, `auth_token` and `miner_id_public_keys` as broadcasts (CS-601, SR-BCHN-019). mapi-lite then makes every WhatsOnChain request for the deployment, paced by its one limit (`[woc] max_requests_per_second` there) against WhatsOnChain's one quota. With `woc` here as well, this service and mapi-lite each pace their own requests against that same quota and can exceed it between them.
+
+* Needs a `[mapi_lite]` section, and mapi-lite needs `[woc]` configured: without it mapi-lite answers address reads with `503`, which this service reports as `chain_unavailable`, never as an empty wallet.
+* mainnet and testnet only, since mapi-lite answers these reads from WhatsOnChain. Startup refuses `regtest` and `stn`; use `rpc` for a private chain.
+* `max_requests_per_second` is unset by default, as mapi-lite paces its own requests. `timeout_seconds` bounds each read as for any interface, and a read is one request to mapi-lite however many WhatsOnChain pages it takes there, so leave room for the largest address.
+* Broadcasts go through `[mapi_lite]` as before. `/status`'s connectivity check and the startup probe use mapi-lite's signed fee quote, which costs mapi-lite no WhatsOnChain request.
 
 ### The `rpc` interface
 
@@ -467,7 +486,7 @@ auth_token = "env:FS_MAPI_LITE_AUTH_TOKEN"
 * `max_retries` — how many times a submit is retried after a transient failure (an HTTP 5xx, a transport error, or an attempt that ran out of `timeout_seconds`). Default `2`, so three attempts, with linear back-off of 1s then 2s (capped at 5s). Resubmitting is safe: mapi-lite answers an already-known transaction with success — which is also how a retry can *settle* an attempt that timed out, turning `broadcast_outcome_unknown` back into a plain success.
 
   Raising this only buys attempts that fit inside `total_timeout_seconds`. If they do not, the service logs a warning at startup naming how many will actually start, and carries on — the combination is legal, it just does less than it asks for.
-* `miner_id_public_keys` — mapi-lite's miner-ID public keys, as hex (33-byte compressed or 65-byte uncompressed): the `minerId` in every response it signs (CS-523, SR-SEC-019). **Set this.** A signed response is otherwise checked only against the key *it carries*, which shows it was not altered, not who sent it. Anyone able to answer in mapi-lite's place — over plain HTTP, anyone on the path — could then forge an "accepted" or a fee quote. A response signed by any other key is refused: a fee quote is ignored, and a submit is reported as `broadcast_outcome_unknown`, because what the real mapi-lite did is hidden. List more than one key to cover a rotation. Default empty, which accepts any valid signature as before and is warned about at startup. Invalid hex or length is refused at startup.
+* `miner_id_public_keys` — mapi-lite's miner-ID public keys, as hex (33-byte compressed or 65-byte uncompressed): the `minerId` in every response it signs (CS-523, SR-SEC-019). **Set this.** A signed response is otherwise checked only against the key *it carries*, which shows it was not altered, not who sent it. Anyone able to answer in mapi-lite's place — over plain HTTP, anyone on the path — could then forge an "accepted" or a fee quote. A response signed by any other key is refused: a fee quote is ignored, and a submit is reported as `broadcast_outcome_unknown`, because what the real mapi-lite did is hidden. Once any signed answer has shown mapi-lite signing with an unlisted key, `GET /ready` reports mapi-lite not ready and `POST /fund` sends nothing, answering 503 `broadcaster_untrusted`, until a signed answer verifies again (CS-618, SR-SEC-033): otherwise each funding would land and be reported as an unknown outcome, holding its inputs for 600s. List more than one key to cover a rotation. Default empty, which accepts any valid signature as before and is warned about at startup. Invalid hex or length is refused at startup.
 * `total_timeout_seconds` — ceiling on a whole submit: every attempt and every back-off between them. Default `45`; must be at least `timeout_seconds`. This is the worst case a `POST /fund` caller — and the actix worker serving it — can be held by an unresponsive mapi-lite, so it is the number to set first and then fit the other two inside.
 
   On expiry the caller gets `broadcast_outcome_unknown` (HTTP 504) if an attempt was still in flight, because cancelling a request says nothing about what the server did with it and the transaction may be on the network; the service reserves that transaction's inputs in response — see [When the outcome is unknown](SupportedEndpoints.md#when-the-outcome-is-unknown). If instead the deadline was consumed by back-off between attempts that were all refused outright, nothing was ever delivered and the caller gets `broadcast_failed` (HTTP 502) with no reservation.

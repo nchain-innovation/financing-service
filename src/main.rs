@@ -14,6 +14,7 @@ mod dynamic_config;
 mod funding_limits;
 mod idempotency;
 mod interface_timeout;
+mod mapi_lite_interface;
 mod metrics;
 mod outbound_rate_limit;
 mod private_file;

@@ -61,6 +61,12 @@ pub enum ErrorCode {
     /// record expires, which is the honest answer -- the service does not know
     /// the outcome either, and the chain is where to look for it.
     BroadcastOutcomeUnknown,
+    /// Nothing was sent: the broadcaster (mapi-lite) signs with a key that
+    /// `[mapi_lite] miner_id_public_keys` does not list, so its answers cannot
+    /// be believed (CS-618). Nothing was spent. Retrying unchanged will not
+    /// help until an operator fixes the key list or mapi-lite's key;
+    /// `GET /ready` reports the same.
+    BroadcasterUntrusted,
     /// Some of the requested funding transactions broadcast and some did not.
     /// The successful ones are in the response body.
     PartialBroadcast,
@@ -96,6 +102,7 @@ impl ErrorCode {
             ErrorCode::BroadcastFailed => "broadcast_failed",
             ErrorCode::BroadcastRejected => "broadcast_rejected",
             ErrorCode::BroadcastOutcomeUnknown => "broadcast_outcome_unknown",
+            ErrorCode::BroadcasterUntrusted => "broadcaster_untrusted",
             ErrorCode::PartialBroadcast => "partial_broadcast",
             ErrorCode::ChainUnavailable => "chain_unavailable",
             ErrorCode::Internal => "internal",
@@ -144,6 +151,10 @@ impl ErrorCode {
             ErrorCode::ChainUnavailable | ErrorCode::FundsInFlight => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
+            // Not this request's fault, and not the wallet's: the service
+            // cannot fund through its broadcaster until it is reconfigured,
+            // which /ready reports too (CS-618).
+            ErrorCode::BroadcasterUntrusted => StatusCode::SERVICE_UNAVAILABLE,
             ErrorCode::Internal => StatusCode::INTERNAL_SERVER_ERROR,
             ErrorCode::Unauthorized => StatusCode::UNAUTHORIZED,
             ErrorCode::RateLimited => StatusCode::TOO_MANY_REQUESTS,
@@ -496,6 +507,7 @@ mod tests {
             ErrorCode::BroadcastFailed,
             ErrorCode::BroadcastRejected,
             ErrorCode::BroadcastOutcomeUnknown,
+            ErrorCode::BroadcasterUntrusted,
             ErrorCode::PartialBroadcast,
             ErrorCode::ChainUnavailable,
             ErrorCode::Internal,
