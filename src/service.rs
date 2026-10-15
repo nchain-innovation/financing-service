@@ -138,6 +138,8 @@ pub struct Service {
     /// How long a probe verdict is reused for. Zero without `[mapi_lite]`,
     /// where nothing is ever probed.
     mapi_health_ttl: Duration,
+    /// `Config::fund_worst_case`, for `GET /status` (CS-624).
+    fund_worst_case: Option<Duration>,
     /// Consecutive failures reaching the blockchain interface, so a run of
     /// them reads as a run and recovery from one is announced.
     chain_health: Mutex<ChainHealth>,
@@ -403,11 +405,12 @@ impl Service {
             inflight_commits: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             inflight_writes: std::sync::atomic::AtomicU64::new(0),
-            mapi_health_ttl: config
-                .mapi_lite
-                .as_ref()
-                .map(|mapi_lite| mapi_lite.health_timeout())
-                .unwrap_or_default(),
+            fund_worst_case: config.fund_worst_case(),
+            mapi_health_ttl: if config.mapi_lite.is_some() {
+                crate::config::MAPI_LITE_PROBE_TIMEOUT
+            } else {
+                Duration::ZERO
+            },
         })
     }
 
@@ -855,6 +858,7 @@ impl Service {
             blockchain_status: *self.blockchain_status.read().await,
             blockchain_update_time: update_time,
             broadcaster: self.broadcaster.name().to_string(),
+            fund_worst_case_seconds: self.fund_worst_case.map(|bound| bound.as_secs()),
         }
     }
 
@@ -1276,7 +1280,7 @@ impl Service {
     /// `None` when mapi-lite is not configured: there is then nothing to
     /// probe, and `/ready` reports chain reads alone.
     ///
-    /// The verdict is cached for `mapi_lite.health_timeout_seconds`, because
+    /// The verdict is cached for [`crate::config::MAPI_LITE_PROBE_TIMEOUT`], because
     /// `/ready` is unauthenticated *and* exempt from the rate limiter
     /// (SR-SEC-013), so without a cache anyone who can reach the port can turn
     /// readiness traffic into an unbounded stream of requests to mapi-lite and
@@ -1290,7 +1294,7 @@ impl Service {
 
         // Held across the probe on purpose: concurrent callers wait for the
         // one in flight rather than each starting their own, which is the
-        // point of the cache. The probe is bounded by health_timeout.
+        // point of the cache. The probe is bounded by MAPI_LITE_PROBE_TIMEOUT.
         let mut cached = self.mapi_health.lock().await;
         if let Some(entry) = cached.as_ref() {
             if entry.taken_at.elapsed() < self.mapi_health_ttl {
@@ -1299,7 +1303,7 @@ impl Service {
         }
 
         // At the same time, not one after the other: each is bounded by
-        // health_timeout, which the whole probe has to fit inside.
+        // MAPI_LITE_PROBE_TIMEOUT, which the whole probe has to fit inside.
         let (health, same_chain) = tokio::join!(
             self.broadcaster.health_check(),
             self.same_chain_as_mapi_lite()
@@ -3291,7 +3295,7 @@ mod tests {
     }
 
     /// CS-619: the chain check runs alongside mapi-lite's `/ready`, not after
-    /// it, so the probe still fits inside one `health_timeout`: with both
+    /// it, so the probe still fits inside one probe timeout: with both
     /// answers taking 1.5s of a 2s timeout it takes about 1.5s, not 3.
     #[tokio::test]
     async fn cs_619_the_chain_check_keeps_the_probe_within_one_timeout() {
@@ -3325,7 +3329,10 @@ mod tests {
 
         let config = test_config(&unique_dynamic_config_path());
         let mapi = MapiLiteConfig::for_base_url(server.uri());
-        assert_eq!(mapi.health_timeout(), Duration::from_secs(2));
+        assert_eq!(
+            crate::config::MAPI_LITE_PROBE_TIMEOUT,
+            Duration::from_secs(2)
+        );
         let broadcaster: Arc<dyn TxBroadcaster> = Arc::new(MapiBroadcaster::new(&mapi).unwrap());
         let blockchain = test_blockchain_interface(&config).await;
         let service = service_with(&config, blockchain, broadcaster).await;
@@ -3366,13 +3373,13 @@ mod tests {
     /// not reach mapi-lite once per request. Within the TTL the verdict is
     /// reused; past it a fresh probe is taken.
     #[tokio::test]
-    async fn sr_bchn_011_mapi_lite_health_is_cached_for_the_health_timeout() {
+    async fn sr_bchn_011_mapi_lite_health_is_cached_for_the_probe_timeout() {
         use crate::test_support::StubMapiBroadcaster;
 
         let mut config = test_config(&unique_dynamic_config_path());
-        let mut mapi_lite = crate::config::MapiLiteConfig::for_base_url("http://127.0.0.1:8080");
-        mapi_lite.health_timeout_seconds = 1;
-        config.mapi_lite = Some(mapi_lite);
+        config.mapi_lite = Some(crate::config::MapiLiteConfig::for_base_url(
+            "http://127.0.0.1:8080",
+        ));
 
         let blockchain = test_blockchain_interface(&config).await;
         let broadcaster = StubMapiBroadcaster::new(true);
@@ -3383,7 +3390,8 @@ mod tests {
         }
         assert_eq!(broadcaster.probe_count(), 1, "the verdict should be reused");
 
-        tokio::time::sleep(Duration::from_millis(1100)).await;
+        tokio::time::sleep(crate::config::MAPI_LITE_PROBE_TIMEOUT + Duration::from_millis(100))
+            .await;
         assert_eq!(service.mapi_lite_health().await, Some(Ok(())));
         assert_eq!(
             broadcaster.probe_count(),

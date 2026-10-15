@@ -244,7 +244,7 @@ pub fn register_gauges(meter: &Meter, samples: SharedSamples) -> Gauges {
 /// Read the service into `samples` once: every client's cached balance and
 /// last chain read, and the `GET /ready` verdict. Reads the caches only; the
 /// one upstream call is the mapi-lite probe `GET /ready` itself makes, whose
-/// verdict is cached for `mapi_lite.health_timeout_seconds`.
+/// verdict is cached for [`crate::config::MAPI_LITE_PROBE_TIMEOUT`].
 pub async fn sample(service: &Service, samples: &SharedSamples) {
     let clients = service.client_samples().await;
     let health = readiness(service, false).await;

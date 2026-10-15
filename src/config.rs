@@ -1,4 +1,4 @@
-use std::{env, net::SocketAddr};
+use std::{env, net::SocketAddr, time::Duration};
 
 use chain_gang::network::Network;
 use log::debug;
@@ -341,8 +341,9 @@ impl IdempotencyConfig {
 /// the named mapi-lite server instead of through the `[blockchain_interface]`;
 /// chain reads (balances, UTXOs) are unaffected. The two settings that select
 /// and authenticate the server mirror the ones teranode-event-rs uses for the
-/// same integration (`mapi_base_url`, `auth_token`); the rest bound how long a
-/// funding call may wait on mapi-lite.
+/// same integration (`mapi_base_url`, `auth_token`). One setting bounds how
+/// long a funding call may wait on mapi-lite, `total_timeout_seconds`; the
+/// rest of the timing is derived (CS-624).
 #[derive(Debug, Deserialize, Clone, PartialEq)]
 pub struct MapiLiteConfig {
     /// Base URL of the mapi-lite server, e.g. `http://127.0.0.1:8080`.
@@ -357,26 +358,13 @@ pub struct MapiLiteConfig {
     /// `FS__MAPI_LITE__AUTH_TOKEN`.
     #[serde(default)]
     pub auth_token: Option<String>,
-    /// Per-request timeout for transaction submits, in seconds.
-    #[serde(default = "default_mapi_lite_timeout_seconds")]
-    pub timeout_seconds: u64,
-    /// Timeout for the mapi-lite probe behind `GET /ready`, in seconds. Must
-    /// be under three seconds, and is rejected at startup otherwise: a probe
-    /// slower than the few seconds a readiness probe allows
-    /// would mark the container unhealthy even while mapi-lite is fine.
-    #[serde(default = "default_mapi_lite_health_timeout_seconds")]
-    pub health_timeout_seconds: u64,
-    /// How many times a submit is retried after a transient failure (an HTTP
-    /// 5xx or a transport error) before `/fund` reports `broadcast_failed`.
-    /// Resubmitting is safe: mapi-lite answers a known transaction with
-    /// success.
-    #[serde(default = "default_mapi_lite_max_retries")]
-    pub max_retries: u32,
     /// Upper bound on a whole submit -- every attempt and every back-off
-    /// between them -- in seconds. Without it the worst case is
-    /// `timeout_seconds * (max_retries + 1)` plus back-off, which against a
-    /// wedged mapi-lite holds a `/fund` request, and the worker serving it,
-    /// open for minutes. Must be at least `timeout_seconds`.
+    /// between them -- in seconds: the one timing setting for this hop
+    /// (CS-624). Each attempt outlasts the submit ceiling mapi-lite publishes
+    /// by [`SUBMIT_CEILING_MARGIN`], and as many retries run as fit inside
+    /// it: see [`SubmitBudget`]. It is what a `/fund` caller, and the worker
+    /// serving it, can be held by a wedged mapi-lite, and part of the worst
+    /// case `GET /status` publishes.
     #[serde(default = "default_mapi_lite_total_timeout_seconds")]
     pub total_timeout_seconds: u64,
     /// mapi-lite's miner-ID public keys, as hex: the `minerId` in every
@@ -388,41 +376,82 @@ pub struct MapiLiteConfig {
     pub miner_id_public_keys: Vec<String>,
 }
 
-/// One attempt's ceiling.
-///
-/// Chosen with `max_retries` and `total_timeout_seconds` so all three attempts
-/// actually fit: 3 x 13s of attempts plus 3s of back-off is 42s, inside the
-/// 45s deadline. It was 30s, which made the deadline cut the sequence off
-/// after one attempt and part of a second, so the stated retry count was not
-/// what ran. The worst case a `/fund` caller waits is unchanged at 45s; what
-/// changed is that the retries inside it are real.
-fn default_mapi_lite_timeout_seconds() -> u64 {
-    13
-}
-
-fn default_mapi_lite_health_timeout_seconds() -> u64 {
-    2
-}
-
-fn default_mapi_lite_max_retries() -> u32 {
-    2
-}
-
 fn default_mapi_lite_total_timeout_seconds() -> u64 {
     45
 }
 
-/// Back-off between submit attempts, mirrored from `broadcaster::mapi` so the
-/// budget arithmetic below describes what the broadcaster actually does.
-const RETRY_BACKOFF_BASE_SECONDS: u64 = 1;
-const RETRY_BACKOFF_CAP_SECONDS: u64 = 5;
+/// mapi-lite's own default submit ceiling (its `submit_timeout_sec`),
+/// assumed until its `/ready` publishes the one it runs with (CS-624).
+pub const ASSUMED_SUBMIT_CEILING: Duration = Duration::from_secs(10);
 
-/// `/ready` answers orchestrator readiness probes, which allow a probe a few
-/// seconds at most (Docker's health check defaults to `--timeout=3s`). A
-/// mapi-lite probe slower than that is killed by the caller rather than
-/// answered, marking the instance unready on every check even while mapi-lite
-/// is fine -- so the bound is rejected at startup rather than only documented.
-const MAPI_LITE_HEALTH_TIMEOUT_LIMIT_SECONDS: u64 = 3;
+/// How far an attempt outlasts mapi-lite's submit ceiling, so that its `504`
+/// for a hung node arrives before this side gives up: the answer still has to
+/// cross the network. uls-client warns below one second; three keeps the 13s
+/// attempt the defaults have always had against mapi-lite's default 10s.
+pub const SUBMIT_CEILING_MARGIN: Duration = Duration::from_secs(3);
+
+/// The bound on the mapi-lite probe behind `GET /ready`, and how long its
+/// verdict is cached (CS-624, as Event's). Under the three seconds a readiness
+/// probe allows (Docker's `--timeout=3s` default): a slower probe is killed
+/// by the caller rather than answered, marking the instance unready on every
+/// check even while mapi-lite is fine.
+pub const MAPI_LITE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The wait before submit retry `n` is `n` times this, capped at
+/// [`RETRY_BACKOFF_CAP`]: uls-client's own default since v0.5.0, set here so
+/// it does not change under this service with a later release.
+pub const RETRY_BACKOFF_BASE: Duration = Duration::from_secs(1);
+pub const RETRY_BACKOFF_CAP: Duration = Duration::from_secs(5);
+
+/// The wait before submit retry `n` (from 1).
+pub fn retry_backoff(n: u32) -> Duration {
+    (RETRY_BACKOFF_BASE * n).min(RETRY_BACKOFF_CAP)
+}
+
+/// How a submit spends `mapi_lite.total_timeout_seconds` (CS-624).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubmitBudget {
+    /// The bound on each attempt.
+    pub attempt: Duration,
+    /// Attempts after the first.
+    pub retries: u32,
+    /// The bound on the whole submit, back-off included.
+    pub deadline: Duration,
+}
+
+impl SubmitBudget {
+    /// The budget against mapi-lite's submit `ceiling`: each attempt outlasts
+    /// it by [`SUBMIT_CEILING_MARGIN`], cut to the deadline if it must be, and
+    /// as many retries as fit inside the deadline when every attempt runs to
+    /// its bound and every back-off is waited out. Each retry it buys is a
+    /// real one; none starts that the deadline would cut off.
+    pub fn new(ceiling: Duration, deadline: Duration) -> Self {
+        let attempt = (ceiling + SUBMIT_CEILING_MARGIN).min(deadline);
+        let mut elapsed = attempt;
+        let mut retries = 0;
+        loop {
+            let next = elapsed + retry_backoff(retries + 1) + attempt;
+            if next > deadline {
+                break;
+            }
+            elapsed = next;
+            retries += 1;
+        }
+        SubmitBudget {
+            attempt,
+            retries,
+            deadline,
+        }
+    }
+
+    /// Whether the deadline leaves an attempt less time than mapi-lite needs
+    /// to answer a hung node itself, at `ceiling`: the node is then reported
+    /// as this side's deadline rather than mapi-lite's `504`. The outcome is
+    /// unknown either way; it is only reported by the wrong layer.
+    pub fn cuts_attempts_short(&self, ceiling: Duration) -> bool {
+        self.attempt < ceiling + SUBMIT_CEILING_MARGIN
+    }
+}
 
 impl MapiLiteConfig {
     /// A section naming only `base_url`, with every other field at its default.
@@ -431,9 +460,6 @@ impl MapiLiteConfig {
         MapiLiteConfig {
             base_url: base_url.into(),
             auth_token: None,
-            timeout_seconds: default_mapi_lite_timeout_seconds(),
-            health_timeout_seconds: default_mapi_lite_health_timeout_seconds(),
-            max_retries: default_mapi_lite_max_retries(),
             total_timeout_seconds: default_mapi_lite_total_timeout_seconds(),
             miner_id_public_keys: Vec::new(),
         }
@@ -456,64 +482,35 @@ impl MapiLiteConfig {
         self.base_url.trim().trim_end_matches('/')
     }
 
-    pub fn timeout(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(self.timeout_seconds)
-    }
-
-    pub fn health_timeout(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(self.health_timeout_seconds)
-    }
-
     pub fn total_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.total_timeout_seconds)
     }
 
-    /// How many submit attempts can actually start before the deadline cuts
-    /// the sequence off.
-    ///
-    /// The three fields interact and nothing makes that obvious: an operator
-    /// who raises `max_retries` for resilience may get no extra attempts at
-    /// all. This walks the sequence the broadcaster runs -- attempt, back-off,
-    /// attempt -- against `total_timeout_seconds` and reports what will
-    /// really happen, assuming the worst case where every attempt runs to its
-    /// full timeout.
-    pub fn attempts_within_deadline(&self) -> u32 {
-        let mut elapsed = 0u64;
-        let mut started = 0u32;
-        for attempt in 1..=(self.max_retries + 1) {
-            if elapsed >= self.total_timeout_seconds {
-                break;
-            }
-            started = attempt;
-            elapsed += self
-                .timeout_seconds
-                .min(self.total_timeout_seconds - elapsed);
-            let backoff =
-                (RETRY_BACKOFF_BASE_SECONDS * attempt as u64).min(RETRY_BACKOFF_CAP_SECONDS);
-            elapsed += backoff;
-        }
-        started
+    /// The submit budget against mapi-lite's published submit `ceiling`, or
+    /// [`ASSUMED_SUBMIT_CEILING`] until it has published one.
+    pub fn submit_budget(&self, ceiling: Option<Duration>) -> SubmitBudget {
+        SubmitBudget::new(
+            ceiling.unwrap_or(ASSUMED_SUBMIT_CEILING),
+            self.total_timeout(),
+        )
     }
 
-    /// A warning for a section whose retry budget cannot fit its deadline, or
-    /// `None` when the three fields agree.
-    ///
-    /// Warn rather than reject: the combination still works, it just does
-    /// fewer attempts than it says, and refusing to start would break
-    /// deployments that have been running on it.
-    pub fn retry_budget_warning(&self) -> Option<String> {
-        let configured = self.max_retries + 1;
-        let actual = self.attempts_within_deadline();
-        if actual >= configured {
-            return None;
-        }
-        Some(format!(
-            "mapi_lite: max_retries = {} asks for {configured} submit attempts, but only {actual} \
-             can start within total_timeout_seconds = {}s at timeout_seconds = {}s (plus \
-             back-off). Raise total_timeout_seconds or lower timeout_seconds/max_retries so the \
-             three agree.",
-            self.max_retries, self.total_timeout_seconds, self.timeout_seconds
-        ))
+    /// Why the deadline cuts every attempt short against mapi-lite's
+    /// `ceiling`, or `None` when an attempt can wait for its answer.
+    pub fn deadline_warning(&self, ceiling: Option<Duration>) -> Option<String> {
+        let ceiling = ceiling.unwrap_or(ASSUMED_SUBMIT_CEILING);
+        let budget = self.submit_budget(Some(ceiling));
+        budget.cuts_attempts_short(ceiling).then(|| {
+            format!(
+                "mapi_lite.total_timeout_seconds is {}s, but mapi-lite answers a submit it cannot \
+                 finish at {}s: every attempt is cut to {}s, so a hung node is reported as this \
+                 service's deadline instead of mapi-lite's answer. Raise it to at least {}s",
+                self.total_timeout_seconds,
+                ceiling.as_secs(),
+                budget.attempt.as_secs(),
+                (ceiling + SUBMIT_CEILING_MARGIN).as_secs()
+            )
+        })
     }
 
     /// Reject a section the broadcaster cannot work with, at startup rather
@@ -528,29 +525,8 @@ impl MapiLiteConfig {
                 "mapi_lite.base_url must start with http:// or https://, got '{base_url}'"
             ));
         }
-        if self.timeout_seconds == 0 {
-            return Err("mapi_lite.timeout_seconds must be greater than zero".to_string());
-        }
-        if self.health_timeout_seconds == 0 {
-            return Err("mapi_lite.health_timeout_seconds must be greater than zero".to_string());
-        }
-        if self.health_timeout_seconds >= MAPI_LITE_HEALTH_TIMEOUT_LIMIT_SECONDS {
-            return Err(format!(
-                "mapi_lite.health_timeout_seconds must be less than \
-                 {MAPI_LITE_HEALTH_TIMEOUT_LIMIT_SECONDS}, so GET /ready answers inside a \
-                 readiness probe's own timeout, got {}",
-                self.health_timeout_seconds
-            ));
-        }
         if self.total_timeout_seconds == 0 {
             return Err("mapi_lite.total_timeout_seconds must be greater than zero".to_string());
-        }
-        if self.total_timeout_seconds < self.timeout_seconds {
-            return Err(format!(
-                "mapi_lite.total_timeout_seconds ({}) must be at least timeout_seconds ({}), \
-                 otherwise not even the first attempt can finish",
-                self.total_timeout_seconds, self.timeout_seconds
-            ));
         }
         for key in &self.miner_id_public_keys {
             if !is_public_key_hex(key) {
@@ -788,6 +764,28 @@ impl Config {
             ));
         }
         Ok(())
+    }
+
+    /// The longest a single-transaction `POST /fund` can take, published in
+    /// `GET /status` so a caller can give up later than this service does
+    /// (CS-624): a chain read already running for the client, which it
+    /// queues behind, then its own; the broadcast; and the chain read after a
+    /// commit is refused. Chain reads are bounded by
+    /// `blockchain_interface.timeout_seconds`, the broadcast by
+    /// `mapi_lite.total_timeout_seconds`, or the same per-call bound without
+    /// `[mapi_lite]`. `None` when chain reads have no deadline, so nothing
+    /// bounds it.
+    ///
+    /// Requests queued behind a failing chain read each wait their turn, so
+    /// during an outage a request can take longer; and `multiple_tx` repeats
+    /// the broadcast and its reads per transaction.
+    pub fn fund_worst_case(&self) -> Option<Duration> {
+        let read = self.blockchain_interface.call_timeout()?;
+        let broadcast = match &self.mapi_lite {
+            Some(mapi_lite) => mapi_lite.total_timeout(),
+            None => read,
+        };
+        Some(read * 3 + broadcast)
     }
 
     /// On mainnet and testnet, `[mapi_lite]` must name the keys its answers
@@ -1667,59 +1665,126 @@ filename = "./data/dynamic.toml"
         let mapi_lite = config.mapi_lite.expect("section present");
         assert_eq!(mapi_lite.base_url, "http://127.0.0.1:8080");
         assert_eq!(mapi_lite.auth_token, None);
-        assert_eq!(mapi_lite.timeout_seconds, 13);
-        assert_eq!(mapi_lite.health_timeout_seconds, 2);
-        assert_eq!(mapi_lite.max_retries, 2);
         assert_eq!(mapi_lite.total_timeout_seconds, 45);
         assert!(mapi_lite.validate().is_ok());
     }
 
-    /// The defaults have to be a set that can all happen at once, or
-    /// `max_retries` is describing attempts that never run.
+    /// Against mapi-lite's default 10s ceiling and the default 45s deadline,
+    /// the budget the three settings it replaces used to give: 13s attempts,
+    /// two retries (CS-624).
     #[test]
-    fn sr_cfg_009_the_default_retry_budget_fits_the_default_deadline() {
+    fn sr_cfg_009_the_default_budget_is_13s_attempts_and_two_retries() {
         let config = MapiLiteConfig::for_base_url("http://127.0.0.1:8080");
-        assert_eq!(
-            config.attempts_within_deadline(),
-            config.max_retries + 1,
-            "all {} attempts should fit in {}s",
-            config.max_retries + 1,
-            config.total_timeout_seconds
-        );
-        assert_eq!(config.retry_budget_warning(), None);
+        let budget = config.submit_budget(None);
+        assert_eq!(budget, config.submit_budget(Some(ASSUMED_SUBMIT_CEILING)));
+        assert_eq!(budget.attempt, Duration::from_secs(13));
+        assert_eq!(budget.retries, 2);
+        assert_eq!(budget.deadline, Duration::from_secs(45));
+        assert_eq!(config.deadline_warning(None), None);
     }
 
-    /// The combination the issue describes: three attempts asked for, one and
-    /// a bit delivered. It is legal, so it still starts -- but it says so.
+    /// The attempt follows the ceiling mapi-lite publishes, and the retries
+    /// are what then fit: every one of them can run to its bound, with its
+    /// back-off, inside the deadline (CS-624).
     #[test]
-    fn sr_cfg_009_a_budget_that_cannot_fit_is_warned_about() {
-        let mut config = MapiLiteConfig::for_base_url("http://127.0.0.1:8080");
-        config.timeout_seconds = 30;
-        config.max_retries = 2;
-        config.total_timeout_seconds = 45;
-
-        assert_eq!(config.attempts_within_deadline(), 2);
-        let warning = config
-            .retry_budget_warning()
-            .expect("an unfittable budget is warned about");
-        assert!(warning.contains("3 submit attempts"), "{warning}");
-        assert!(warning.contains("only 2"), "{warning}");
-        // still a legal section: warn, do not refuse to start
-        assert!(config.validate().is_ok());
+    fn sr_cfg_009_the_budget_follows_mapi_lite_s_ceiling() {
+        let secs = Duration::from_secs;
+        for (ceiling, deadline, attempt, retries) in [
+            (10, 45, 13, 2),
+            (20, 45, 23, 0),
+            (2, 45, 5, 5),
+            (10, 13, 13, 0),
+            (10, 120, 13, 6),
+        ] {
+            let budget = SubmitBudget::new(secs(ceiling), secs(deadline));
+            assert_eq!(
+                (budget.attempt, budget.retries),
+                (secs(attempt), retries),
+                "{ceiling}s ceiling, {deadline}s deadline"
+            );
+        }
+        for ceiling in 0..40 {
+            for deadline in 1..120 {
+                let budget = SubmitBudget::new(secs(ceiling), secs(deadline));
+                let worst = budget.attempt * (budget.retries + 1)
+                    + (1..=budget.retries).map(retry_backoff).sum::<Duration>();
+                assert!(
+                    worst <= budget.deadline,
+                    "{ceiling}s/{deadline}s: {budget:?} takes {worst:?}"
+                );
+                let one_more = worst + retry_backoff(budget.retries + 1) + budget.attempt;
+                assert!(
+                    one_more > budget.deadline,
+                    "{ceiling}s/{deadline}s: {budget:?}"
+                );
+            }
+        }
     }
 
-    /// Raising `max_retries` alone is the trap the issue names: without more
-    /// deadline it buys nothing, and the operator is told so.
+    /// A deadline shorter than one attempt against the ceiling cuts every
+    /// attempt short, so a hung node is reported as this side's deadline. It
+    /// still works, so it is warned about, naming the value that would not.
     #[test]
-    fn sr_cfg_009_raising_max_retries_alone_is_warned_about() {
+    fn sr_cfg_010_a_deadline_shorter_than_an_attempt_is_warned_about() {
         let mut config = MapiLiteConfig::for_base_url("http://127.0.0.1:8080");
-        config.max_retries = 10;
-        let attempts = config.attempts_within_deadline();
+        config.total_timeout_seconds = 12;
+        let warning = config.deadline_warning(None).expect("12s < 10s + 3s");
         assert!(
-            attempts < 11,
-            "11 attempts cannot fit 45s at 13s each, got {attempts}"
+            warning.contains("total_timeout_seconds is 12s"),
+            "{warning}"
         );
-        assert!(config.retry_budget_warning().is_some());
+        assert!(warning.contains("at least 13s"), "{warning}");
+        let budget = config.submit_budget(None);
+        assert_eq!(
+            (budget.attempt, budget.retries),
+            (Duration::from_secs(12), 0)
+        );
+        assert!(config.validate().is_ok());
+
+        let warning = MapiLiteConfig::for_base_url("http://127.0.0.1:8080")
+            .deadline_warning(Some(Duration::from_secs(60)))
+            .expect("45s < 60s + 3s");
+        assert!(warning.contains("at 60s"), "{warning}");
+        assert!(warning.contains("at least 63s"), "{warning}");
+    }
+
+    /// What `GET /status` publishes: three chain reads and the broadcast, or
+    /// nothing when chain reads have no deadline (CS-624).
+    #[test]
+    fn sr_cfg_011_the_fund_worst_case_is_three_reads_and_the_broadcast() {
+        let mut config: Config = toml::from_str(MINIMAL_TOML).unwrap();
+        // Without [mapi_lite] the broadcast is one more interface call.
+        assert_eq!(config.fund_worst_case(), Some(Duration::from_secs(4 * 30)));
+        config.mapi_lite = Some(MapiLiteConfig::for_base_url("http://mapi"));
+        assert_eq!(
+            config.fund_worst_case(),
+            Some(Duration::from_secs(3 * 30 + 45))
+        );
+        config.blockchain_interface.timeout_seconds = Some(5);
+        assert_eq!(
+            config.fund_worst_case(),
+            Some(Duration::from_secs(3 * 5 + 45))
+        );
+        config.blockchain_interface.timeout_seconds = Some(0);
+        assert_eq!(config.fund_worst_case(), None);
+    }
+
+    /// The settings the budget replaces are refused, not ignored (CS-624).
+    #[test]
+    fn sr_cfg_009_the_retired_timings_are_refused() {
+        for key in [
+            "timeout_seconds = 5",
+            "max_retries = 1",
+            "health_timeout_seconds = 1",
+        ] {
+            let path = write_temp_config(
+                "retired-timing",
+                &with_mapi_lite_section(&format!("base_url = \"http://mapi\"\n{key}\n")),
+            );
+            let err = with_env(&[], || load_config(path.to_str().unwrap()).unwrap_err());
+            let name = key.split(' ').next().unwrap();
+            assert!(err.contains(&format!("mapi_lite.{name}")), "{err}");
+        }
     }
 
     /// Whatever `validate` checked has to be what the client requests, so the
@@ -1752,19 +1817,14 @@ filename = "./data/dynamic.toml"
     #[test]
     fn sr_cfg_008_mapi_lite_section_accepts_every_field() {
         let content = with_mapi_lite_section(
-            "base_url = \"https://mapi.example:8443/\"\nauth_token = \"secret\"\ntimeout_seconds = 5\nhealth_timeout_seconds = 1\nmax_retries = 0\n",
+            "base_url = \"https://mapi.example:8443/\"\nauth_token = \"secret\"\ntotal_timeout_seconds = 30\n",
         );
         let config: Config = toml::from_str(&content).unwrap();
         let mapi_lite = config.mapi_lite.expect("section present");
         assert_eq!(mapi_lite.base_url, "https://mapi.example:8443/");
         assert_eq!(mapi_lite.auth_token.as_deref(), Some("secret"));
         assert_eq!(mapi_lite.authorization().as_deref(), Some("Bearer secret"));
-        assert_eq!(mapi_lite.timeout(), std::time::Duration::from_secs(5));
-        assert_eq!(
-            mapi_lite.health_timeout(),
-            std::time::Duration::from_secs(1)
-        );
-        assert_eq!(mapi_lite.max_retries, 0);
+        assert_eq!(mapi_lite.total_timeout(), Duration::from_secs(30));
         assert!(mapi_lite.validate().is_ok());
     }
 
@@ -1784,67 +1844,13 @@ filename = "./data/dynamic.toml"
     }
 
     #[test]
-    fn sr_cfg_008_mapi_lite_validate_rejects_zero_timeouts() {
-        let mut config = MapiLiteConfig::for_base_url("http://127.0.0.1:8080");
-        config.timeout_seconds = 0;
-        assert!(config
-            .validate()
-            .unwrap_err()
-            .contains("mapi_lite.timeout_seconds"));
-
-        let mut config = MapiLiteConfig::for_base_url("http://127.0.0.1:8080");
-        config.health_timeout_seconds = 0;
-        assert!(config
-            .validate()
-            .unwrap_err()
-            .contains("mapi_lite.health_timeout_seconds"));
-
+    fn sr_cfg_008_mapi_lite_validate_rejects_a_zero_deadline() {
         let mut config = MapiLiteConfig::for_base_url("http://127.0.0.1:8080");
         config.total_timeout_seconds = 0;
         assert!(config
             .validate()
             .unwrap_err()
             .contains("mapi_lite.total_timeout_seconds"));
-    }
-
-    /// A mapi-lite probe slower than the few seconds a readiness probe allows
-    /// is killed by the caller rather than answered, marking the instance
-    /// unready on every check even while mapi-lite is fine. So the documented
-    /// ceiling is enforced rather than just written down.
-    #[test]
-    fn sr_cfg_008_mapi_lite_validate_rejects_a_health_timeout_a_probe_cannot_wait_for() {
-        for seconds in [3, 4, 10] {
-            let mut config = MapiLiteConfig::for_base_url("http://127.0.0.1:8080");
-            config.health_timeout_seconds = seconds;
-            let error = config
-                .validate()
-                .expect_err("a health timeout at or above 3s is rejected");
-            assert!(
-                error.contains("must be less than 3"),
-                "for {seconds}s: {error}"
-            );
-        }
-
-        let mut config = MapiLiteConfig::for_base_url("http://127.0.0.1:8080");
-        config.health_timeout_seconds = 2;
-        assert!(config.validate().is_ok());
-    }
-
-    /// The retry budget multiplies `timeout_seconds`, so the total deadline
-    /// has to leave room for at least one attempt.
-    #[test]
-    fn sr_cfg_008_mapi_lite_validate_rejects_a_total_timeout_below_one_attempt() {
-        let mut config = MapiLiteConfig::for_base_url("http://127.0.0.1:8080");
-        config.timeout_seconds = 30;
-        config.total_timeout_seconds = 10;
-        let error = config.validate().expect_err("no attempt can finish");
-        assert!(
-            error.contains("must be at least timeout_seconds"),
-            "{error}"
-        );
-
-        config.total_timeout_seconds = 30;
-        assert!(config.validate().is_ok());
     }
 
     #[test]
@@ -1879,14 +1885,14 @@ filename = "./data/dynamic.toml"
         let config = with_env(
             &[
                 ("FS__MAPI_LITE__BASE_URL", "http://mapi:8080"),
-                ("FS__MAPI_LITE__MAX_RETRIES", "1"),
+                ("FS__MAPI_LITE__TOTAL_TIMEOUT_SECONDS", "30"),
             ],
             || load_config(path.to_str().unwrap()).unwrap(),
         );
         let mapi_lite = config.mapi_lite.expect("section supplied");
         assert_eq!(mapi_lite.base_url, "http://mapi:8080");
-        assert_eq!(mapi_lite.max_retries, 1);
-        assert_eq!(mapi_lite.total_timeout_seconds, 45);
+        assert_eq!(mapi_lite.total_timeout_seconds, 30);
+        assert_eq!(mapi_lite.auth_token, None);
     }
 
     #[test]

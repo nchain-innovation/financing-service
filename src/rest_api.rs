@@ -167,8 +167,8 @@ pub async fn health() -> impl Responder {
 /// both at this endpoint reintroduces exactly the restart loop the split
 /// exists to avoid.
 ///
-/// The probe is bounded by `mapi_lite.health_timeout_seconds` and its verdict
-/// cached for that long, so this unauthenticated, rate-limit-exempt endpoint
+/// The probe is bounded by [`crate::config::MAPI_LITE_PROBE_TIMEOUT`] and its
+/// verdict cached for that long, so this unauthenticated, rate-limit-exempt endpoint
 /// cannot be used to flood mapi-lite (see [`Service::mapi_lite_health`]).
 ///
 /// The failure detail is logged, not returned: this endpoint answers anyone
@@ -1167,6 +1167,9 @@ mod tests {
         // The test config's interface_type, which is what broadcasts go
         // through when mapi-lite is not configured.
         assert_eq!(body["broadcaster"], "test");
+        // Three chain reads and the broadcast, each one interface call at
+        // the default 30s (CS-624).
+        assert_eq!(body["fund_worst_case_seconds"], 120);
     }
 
     #[actix_web::test]

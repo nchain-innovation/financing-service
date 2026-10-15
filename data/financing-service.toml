@@ -90,13 +90,12 @@ filename = "./data/dynamic.toml"
 # still use [blockchain_interface]. GET /ready then probes mapi-lite too;
 # GET /health stays a pure liveness check.
 # base_url is required, and on mainnet and testnet so is miner_id_public_keys;
-# the rest are the defaults.
+# total_timeout_seconds shows its default.
 # [mapi_lite]
 # base_url = "http://127.0.0.1:8080"
 # auth_token = "env:MAPI_AUTH_TOKEN"   # the token alone; sent as "Bearer <token>"
-# timeout_seconds = 13
-# health_timeout_seconds = 2
-# max_retries = 2
+# The whole submit, retries included. Each attempt is mapi-lite's published
+# submit ceiling plus 3s, and as many retries run as fit (CS-624).
 # total_timeout_seconds = 45
 # mapi-lite's miner-ID public key(s), hex. Required on mainnet and testnet
 # (CS-624); elsewhere, left empty, a response signed by any key is believed
