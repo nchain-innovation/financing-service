@@ -226,7 +226,12 @@ impl MapiBroadcaster {
             .submit
             .submit_budget_warning(Duration::from_secs(ceiling))
         {
-            Some(warning) => log::warn!("[mapi_lite] timeout_seconds: {warning}"),
+            // Named as the operator sets it, with both values (SR-CFG-010).
+            Some(warning) => log::warn!(
+                "[mapi_lite] timeout_seconds is {}s, mapi-lite's submit ceiling {ceiling}s: \
+                 {warning}",
+                self.attempt_timeout.as_secs()
+            ),
             None => log::info!(
                 "mapi-lite answers a slow submit at {ceiling}s, inside this service's {}s attempt",
                 self.attempt_timeout.as_secs()
