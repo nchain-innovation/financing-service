@@ -89,7 +89,8 @@ filename = "./data/dynamic.toml"
 # instead of the [blockchain_interface] above; chain reads (balances, UTXOs)
 # still use [blockchain_interface]. GET /ready then probes mapi-lite too;
 # GET /health stays a pure liveness check.
-# Only base_url is required; the rest are the defaults.
+# base_url is required, and on mainnet and testnet so is miner_id_public_keys;
+# the rest are the defaults.
 # [mapi_lite]
 # base_url = "http://127.0.0.1:8080"
 # auth_token = "env:MAPI_AUTH_TOKEN"   # the token alone; sent as "Bearer <token>"
@@ -97,8 +98,9 @@ filename = "./data/dynamic.toml"
 # health_timeout_seconds = 2
 # max_retries = 2
 # total_timeout_seconds = 45
-# mapi-lite's miner-ID public key(s), hex. Set this: left empty, a response
-# signed by any key is believed (CS-523).
+# mapi-lite's miner-ID public key(s), hex. Required on mainnet and testnet
+# (CS-624); elsewhere, left empty, a response signed by any key is believed
+# (CS-523).
 # miner_id_public_keys = ["02..."]
 
 # The fee the service pays on the transactions it builds. Optional; these are

@@ -564,14 +564,17 @@ impl MapiLiteConfig {
     }
 
     /// The startup warning for a section that names no miner ID (CS-523).
+    /// On mainnet and testnet it is an error instead: see
+    /// [`Config::check_miner_id_pin`].
     pub fn unpinned_warning(&self) -> Option<&'static str> {
-        self.miner_id_public_keys.is_empty().then_some(
-            "mapi_lite.miner_id_public_keys is empty: responses from mapi-lite are signed, but \
-             by a key nothing checks, so anyone able to answer in its place can forge an \
-             'accepted' or a fee quote. Set it to mapi-lite's minerId.",
-        )
+        self.miner_id_public_keys.is_empty().then_some(UNPINNED)
     }
 }
+
+/// Why an empty `miner_id_public_keys` is warned about, or refused.
+const UNPINNED: &str = "mapi_lite.miner_id_public_keys is empty: responses from mapi-lite are \
+     signed, but by a key nothing checks, so anyone able to answer in its place can forge an \
+     'accepted' or a fee quote. Set it to mapi-lite's minerId.";
 
 /// A secp256k1 public key in hex: compressed (33 bytes, `02`/`03`) or
 /// uncompressed (65 bytes, `04`). The shape only; whether it is on the curve is
@@ -787,6 +790,23 @@ impl Config {
         Ok(())
     }
 
+    /// On mainnet and testnet, `[mapi_lite]` must name the keys its answers
+    /// are signed with (CS-624). Unpinned, a forged "accepted" spends real or
+    /// shared coins on a transaction that never left; elsewhere it is still
+    /// allowed, with a warning.
+    pub fn check_miner_id_pin(&self) -> Result<(), String> {
+        match &self.mapi_lite {
+            Some(mapi_lite) if self.is_production_network() => match mapi_lite.unpinned_warning() {
+                Some(why) => Err(format!(
+                    "{why} It is required on {}.",
+                    self.blockchain_interface.network_type
+                )),
+                None => Ok(()),
+            },
+            _ => Ok(()),
+        }
+    }
+
     /// Return the configured network as Network type
     /// Refuse a chain-read backend this configuration cannot serve (CS-601).
     ///
@@ -934,6 +954,7 @@ pub fn load_config(path: &str) -> Result<Config, String> {
     if let Some(mapi_lite) = &config.mapi_lite {
         mapi_lite.validate()?;
     }
+    config.check_miner_id_pin()?;
     config.resolve_secrets()
 }
 
@@ -1606,9 +1627,16 @@ filename = "./data/dynamic.toml"
         path
     }
 
-    /// The minimal config plus a `[mapi_lite]` section holding `fields`.
+    /// The minimal config plus a `[mapi_lite]` section holding `fields`,
+    /// pinned to a miner ID unless `fields` names its own: the minimal config
+    /// is testnet, where an unpinned section is refused (CS-624).
     fn with_mapi_lite_section(fields: &str) -> String {
-        format!("{MINIMAL_TOML}\n[mapi_lite]\n{fields}")
+        let pin = if fields.contains("miner_id_public_keys") {
+            String::new()
+        } else {
+            format!("miner_id_public_keys = [\"{PINNED_KEY}\"]\n")
+        };
+        format!("{MINIMAL_TOML}\n[mapi_lite]\n{fields}{pin}")
     }
 
     fn config_with_mapi_lite(auth_token: Option<&str>) -> Config {
@@ -1842,7 +1870,12 @@ filename = "./data/dynamic.toml"
     /// defaults for everything it leaves out.
     #[test]
     fn sr_cfg_008_overrides_can_supply_the_mapi_lite_section() {
-        let path = write_temp_config("mapi-lite-env", MINIMAL_TOML);
+        // Regtest: an override cannot give a list, and on testnet the section
+        // needs miner_id_public_keys.
+        let path = write_temp_config(
+            "mapi-lite-env",
+            &MINIMAL_TOML.replace("\"testnet\"", "\"regtest\""),
+        );
         let config = with_env(
             &[
                 ("FS__MAPI_LITE__BASE_URL", "http://mapi:8080"),
@@ -2066,14 +2099,47 @@ filename = "./data/dynamic.toml"
         }
     }
 
-    /// Unpinned is allowed, and said so.
+    /// Unpinned is allowed off the public networks, and said so.
     #[test]
     fn sr_sec_019_an_unpinned_section_is_warned_about() {
         let mut config = MapiLiteConfig::for_base_url("http://mapi-lite");
         assert!(config.unpinned_warning().is_some());
-        config.miner_id_public_keys =
-            vec!["0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".to_string()];
+        config.miner_id_public_keys = vec![PINNED_KEY.to_string()];
         assert!(config.unpinned_warning().is_none());
+    }
+
+    const PINNED_KEY: &str = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+
+    /// On mainnet and testnet an unpinned section stops startup (CS-624).
+    #[test]
+    fn sr_sec_019_an_unpinned_section_is_refused_on_a_public_network() {
+        let config = |network: &str, keys: &[&str]| {
+            let mut mapi_lite = MapiLiteConfig::for_base_url("http://mapi-lite");
+            mapi_lite.miner_id_public_keys = keys.iter().map(|k| k.to_string()).collect();
+            Config {
+                blockchain_interface: BlockchainInterfaceConfig {
+                    interface_type: "woc".to_string(),
+                    network_type: network.to_string(),
+                    ..Default::default()
+                },
+                mapi_lite: Some(mapi_lite),
+                ..Default::default()
+            }
+        };
+        for network in ["mainnet", "testnet"] {
+            let err = config(network, &[]).check_miner_id_pin().unwrap_err();
+            assert!(err.contains("miner_id_public_keys"), "{err}");
+            assert!(err.contains(network), "{err}");
+            assert!(config(network, &[PINNED_KEY]).check_miner_id_pin().is_ok());
+        }
+        for network in ["regtest", "stn"] {
+            assert!(config(network, &[]).check_miner_id_pin().is_ok());
+        }
+        let without_mapi_lite = Config {
+            mapi_lite: None,
+            ..config("mainnet", &[])
+        };
+        assert!(without_mapi_lite.check_miner_id_pin().is_ok());
     }
 
     /// The fee ceiling may not sit below the rate it caps.
