@@ -8,7 +8,7 @@ The file is composed of the following sections:
 
 ## [blockchain_interface]
 
-Configures the blockchain interface. Supported `interface_type` values: `woc`, `uaas`, `rpc`, `test`.
+Configures the blockchain interface. Supported `interface_type` values: `woc`, `mapi_lite`, `uaas`, `rpc`, `test`.
 
 ```toml
 [blockchain_interface]
@@ -31,13 +31,32 @@ The interface you choose constrains which networks you can reach, and this is us
 | `interface_type` | Reaches | mainnet | testnet | stn | regtest |
 |---|---|---|---|---|---|
 | `woc` | WhatsOnChain, a public API | ✅ | ✅ | ✅ | ❌ |
+| `mapi_lite` | the [`[mapi_lite]`](#mapi_lite) server's address reads, which it answers from WhatsOnChain | ✅ | ✅ | ❌ | ❌ |
 | `uaas` | a UTXO as a Service instance (set `url`) | ✅ | ✅ | ✅ | ❌ |
 | `rpc` | a node's JSON-RPC endpoint, directly | ✅ | ✅ | ✅ | ✅ |
 | `test` | nothing — an in-process stub | — | — | — | — |
 
 **`rpc` is the only interface that reaches regtest**, because no public explorer indexes a private chain. It also works against a node you control on any other network, which removes the dependency on a third-party API being up.
 
-The interface serves both chain *reads* (balances, UTXOs) and, by default, the *broadcast* of funding transactions. The broadcast alone can be moved to a mapi-lite server with the optional [`[mapi_lite]`](#mapi_lite) section; reads stay here.
+The interface serves both chain *reads* (balances, UTXOs) and, by default, the *broadcast* of funding transactions. The broadcast alone can be moved to a mapi-lite server with the optional [`[mapi_lite]`](#mapi_lite) section; with `interface_type = "mapi_lite"` the reads go there too.
+
+### The `mapi_lite` interface
+
+```toml
+[blockchain_interface]
+interface_type = "mapi_lite"
+network_type = "testnet"
+
+[mapi_lite]
+base_url = "http://127.0.0.1:8080"
+```
+
+Reads each client's UTXO set and balance through the `[mapi_lite]` server's `/query/address/*` endpoints, with the same `base_url`, `auth_token` and `miner_id_public_keys` as broadcasts (CS-601, SR-BCHN-019). mapi-lite then makes every WhatsOnChain request for the deployment, paced by its one limit (`[woc] max_requests_per_second` there) against WhatsOnChain's one quota. With `woc` here as well, this service and mapi-lite each pace their own requests against that same quota and can exceed it between them.
+
+* Needs a `[mapi_lite]` section, and mapi-lite needs `[woc]` configured: without it mapi-lite answers address reads with `503`, which this service reports as `chain_unavailable`, never as an empty wallet.
+* mainnet and testnet only, since mapi-lite answers these reads from WhatsOnChain. Startup refuses `regtest` and `stn`; use `rpc` for a private chain.
+* `max_requests_per_second` is unset by default, as mapi-lite paces its own requests. `timeout_seconds` bounds each read as for any interface, and a read is one request to mapi-lite however many WhatsOnChain pages it takes there, so leave room for the largest address.
+* Broadcasts go through `[mapi_lite]` as before. `/status`'s connectivity check and the startup probe use mapi-lite's signed fee quote, which costs mapi-lite no WhatsOnChain request.
 
 ### The `rpc` interface
 
@@ -235,7 +254,7 @@ WARN  broadcast failed: funding tx <txid> (class=rejected, broadcaster=mapi-lite
 
 ## [telemetry]
 
-Optional OpenTelemetry trace export via OTLP (gRPC). Disabled by default.
+Optional OpenTelemetry export via OTLP (gRPC): traces, and metrics (see [Metrics](#metrics)). Both are disabled by default; logs are not exported over OTLP.
 
 ```toml
 [telemetry]
@@ -244,7 +263,7 @@ service_name = "financing-service"
 otlp_endpoint = "http://localhost:4317"
 ```
 
-* `enabled` — export traces to an OTLP collector (default: `false`)
+* `enabled` — export traces and metrics to an OTLP collector (default: `false`)
 * `service_name` — `service.name` resource attribute (default: `financing-service`)
 * `otlp_endpoint` — OTLP gRPC endpoint (default: `http://localhost:4317`)
 
@@ -253,15 +272,21 @@ When enabled, the service:
 * Creates a span per HTTP request via `tracing-actix-web` (OpenTelemetry semantic conventions)
 * Exports traces in batches to the configured collector
 * Bridges existing `log` crate output through `tracing` to include `trace_id` in logs
+* Exports the [metrics](#metrics) periodically to the same collector
 
 Standard OpenTelemetry environment variables are also supported:
 
 | Variable | Purpose |
 |----------|---------|
-| `OTEL_TRACES_EXPORTER=otlp` | Enable export when `telemetry.enabled` is `false` |
+| `OTEL_TRACES_EXPORTER=otlp` | Enable trace export when `telemetry.enabled` is `false` |
+| `OTEL_METRICS_EXPORTER=otlp` | Enable metrics export when `telemetry.enabled` is `false` |
 | `OTEL_SERVICE_NAME` | Overrides `telemetry.service_name` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | Overrides `telemetry.otlp_endpoint` |
 | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | Trace-specific OTLP endpoint |
+| `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | Metrics-specific OTLP endpoint |
+| `OTEL_METRIC_EXPORT_INTERVAL` | Metrics export interval in milliseconds (SDK default: 60000) |
+
+Traces and metrics have separate switches: `OTEL_TRACES_EXPORTER=otlp` turns on traces only and `OTEL_METRICS_EXPORTER=otlp` metrics only; `enabled = true` turns on both.
 
 Example with the OpenTelemetry Collector:
 
@@ -270,6 +295,33 @@ docker run -p 4317:4317 otel/opentelemetry-collector:latest
 ```
 
 Then enable telemetry in config or set `OTEL_TRACES_EXPORTER=otlp` and `OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317`.
+
+## Metrics
+
+The service pushes metrics over OTLP (CS-608). There is no `/metrics` endpoint to scrape: point the export at an OpenTelemetry Collector and let it forward to Prometheus (or any other backend).
+
+**Enabling.** Off by default. Set `OTEL_METRICS_EXPORTER=otlp`, or `[telemetry] enabled = true` (which also turns on traces). The endpoint is `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`, else `OTEL_EXPORTER_OTLP_ENDPOINT`, else `telemetry.otlp_endpoint`, else `http://localhost:4317`; the resource carries `service.name` (`OTEL_SERVICE_NAME`, default `financing-service`) and `service.version`. With export off no meter provider is installed and recording costs nothing. Startup logs one line, `OpenTelemetry metrics export on (...)` or `... off`, naming the endpoint without any credential or query string. Metrics are flushed on shutdown.
+
+Names follow OpenTelemetry conventions: counters have no `_total` and units are set on the instrument, not in the name. An OTLP-to-Prometheus conversion adds both, so `http_requests` becomes `http_requests_total` and `http_request_duration` (unit `s`) becomes `http_request_duration_seconds`. Attribute values come from fixed sets -- never raw paths, addresses, txids or keys -- so cardinality is bounded by the routes and clients configured.
+
+| Metric | Type | Unit | Attributes | Meaning | Prometheus name |
+|--------|------|------|------------|---------|-----------------|
+| `http_requests` | Counter | — | `route`, `status_class` | Requests answered. `route` is the matched route template (`/client/{client_id}/balance`, never the raw path), `unmatched` for a path no route matches; `status_class` is `2xx`/`3xx`/`4xx`/`5xx`. `/health`, `/ready` and `/status` count like any other route, and so do requests the rate limiter refuses. | `http_requests_total` |
+| `http_request_duration` | Histogram | `s` | `route` | Time to answer a request. Buckets from 5 ms to 60 s. | `http_request_duration_seconds` (`_bucket`, `_sum`, `_count`) |
+| `ready` | Gauge (0/1) | — | `check` | The `GET /ready` verdict: one series per check (`chain`, and `mapi_lite` when `[mapi_lite]` is configured) plus `check="overall"`. Sampled every 15 s. | `ready` |
+| `fs_fund_requests` | Counter | — | `code` | `POST /fund` answers: `funded`, or the [error code](SupportedEndpoints.md) the caller got (`insufficient_balance`, `no_suitable_utxo`, `funds_in_flight`, `broadcast_rejected`, `broadcast_failed`, `broadcast_outcome_unknown`, `partial_broadcast`, `chain_unavailable`, `invalid_request`, `unknown_client`, `unauthorized`, `rate_limited`, `key_in_progress`, `idempotency_key_reused`, `internal`). A replayed `idempotency_key` answer counts as the outcome it replays. A body that is not valid JSON is refused before the handler and appears only in `http_requests`. | `fs_fund_requests_total` |
+| `fs_client_balance` | Gauge | `sat` | `client_id`, `kind` | Each client's balance from the service's cache, `kind` = `confirmed` or `unconfirmed`. Sampled every 15 s. | `fs_client_balance_sat` |
+| `fs_client_chain_state_age` | Gauge | `s` | `client_id` | Seconds since the client's unspent set was last read from the chain -- what `service.ready_max_chain_read_age_seconds` is measured against. No series until the first read. | `fs_client_chain_state_age_seconds` |
+
+The gauges are read from a snapshot a background task takes every 15 s while export is on; the one upstream call it makes is the mapi-lite readiness probe `GET /ready` already makes, cached for `mapi_lite.health_timeout_seconds`.
+
+**Suggested alerts** (CS-608 phase 1), in PromQL over the converted names:
+
+1. Not ready: `ready{check="overall"} == 0` for 2m.
+2. Outcome unknown, so funds may be spent without the caller knowing: `increase(fs_fund_requests_total{code="broadcast_outcome_unknown"}[5m]) > 0`. Across the stack, also Event's `increase(event_funding_outputs_stranded_total[5m]) > 0` and its `*outcome_unknown` outcomes.
+3. A client running dry: `fs_client_balance_sat{kind="confirmed"} < <threshold>` (per client; pick the threshold from its spend rate).
+4. mapi-lite (exported by mapi-lite): `mapi_nodes_live < <min_live_nodes>` or `mapi_block_ingest_lag > 3`.
+5. Errors or latency, for 5m: `sum(rate(http_requests_total{status_class="5xx"}[5m])) / sum(rate(http_requests_total[5m])) > 0.01`, or `histogram_quantile(0.95, sum by (le, route) (rate(http_request_duration_seconds_bucket[5m]))) > <target>`.
 
 ## [service]
 
@@ -436,7 +488,7 @@ auth_token = "env:FS_MAPI_LITE_AUTH_TOKEN"
 * `max_retries` — how many times a submit is retried after a transient failure (an HTTP 5xx, a transport error, or an attempt that ran out of `timeout_seconds`). Default `2`, so three attempts, with linear back-off of 1s then 2s (capped at 5s). Resubmitting is safe: mapi-lite answers an already-known transaction with success — which is also how a retry can *settle* an attempt that timed out, turning `broadcast_outcome_unknown` back into a plain success.
 
   Raising this only buys attempts that fit inside `total_timeout_seconds`. If they do not, the service logs a warning at startup naming how many will actually start, and carries on — the combination is legal, it just does less than it asks for.
-* `miner_id_public_keys` — mapi-lite's miner-ID public keys, as hex (33-byte compressed or 65-byte uncompressed): the `minerId` in every response it signs (CS-523, SR-SEC-019). **Set this.** A signed response is otherwise checked only against the key *it carries*, which shows it was not altered, not who sent it. Anyone able to answer in mapi-lite's place — over plain HTTP, anyone on the path — could then forge an "accepted" or a fee quote. A response signed by any other key is refused: a fee quote is ignored, and a submit is reported as `broadcast_outcome_unknown`, because what the real mapi-lite did is hidden. List more than one key to cover a rotation. Default empty, which accepts any valid signature as before and is warned about at startup. Invalid hex or length is refused at startup.
+* `miner_id_public_keys` — mapi-lite's miner-ID public keys, as hex (33-byte compressed or 65-byte uncompressed): the `minerId` in every response it signs (CS-523, SR-SEC-019). **Set this.** A signed response is otherwise checked only against the key *it carries*, which shows it was not altered, not who sent it. Anyone able to answer in mapi-lite's place — over plain HTTP, anyone on the path — could then forge an "accepted" or a fee quote. A response signed by any other key is refused: a fee quote is ignored, and a submit is reported as `broadcast_outcome_unknown`, because what the real mapi-lite did is hidden. Once any signed answer has shown mapi-lite signing with an unlisted key, `GET /ready` reports mapi-lite not ready and `POST /fund` sends nothing, answering 503 `broadcaster_untrusted`, until a signed answer verifies again (CS-618, SR-SEC-033): otherwise each funding would land and be reported as an unknown outcome, holding its inputs for 600s. List more than one key to cover a rotation. Default empty, which accepts any valid signature as before and is warned about at startup. Invalid hex or length is refused at startup.
 * `total_timeout_seconds` — ceiling on a whole submit: every attempt and every back-off between them. Default `45`; must be at least `timeout_seconds`. This is the worst case a `POST /fund` caller — and the actix worker serving it — can be held by an unresponsive mapi-lite, so it is the number to set first and then fit the other two inside.
 
   On expiry the caller gets `broadcast_outcome_unknown` (HTTP 504) if an attempt was still in flight, because cancelling a request says nothing about what the server did with it and the transaction may be on the network; the service reserves that transaction's inputs in response — see [When the outcome is unknown](SupportedEndpoints.md#when-the-outcome-is-unknown). If instead the deadline was consumed by back-off between attempts that were all refused outright, nothing was ever delivered and the caller gets `broadcast_failed` (HTTP 502) with no reservation.

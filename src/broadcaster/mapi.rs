@@ -31,6 +31,7 @@
 //! worker serving it, for `timeout * (max_retries + 1)`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -75,6 +76,23 @@ pub struct MapiBroadcaster {
     /// plus one, so 0 means "not seen" (CS-510). Kept so a misaligned budget
     /// is warned about once per value rather than on every probe.
     seen_ceiling: AtomicU64,
+    /// Whether `[mapi_lite] miner_id_public_keys` is set. With none, any key's
+    /// signature verifies, so no answer can come from an untrusted one.
+    pins_miner_ids: bool,
+    /// The key mapi-lite last signed with when the list does not name it, set
+    /// by any signed answer that fails that check and cleared by any that
+    /// passes (CS-618). An answer from it is never believed, so a broadcast
+    /// through it can only end in an unknown outcome.
+    untrusted_signer: Mutex<Option<String>>,
+}
+
+/// Why mapi-lite cannot be used while it signs with `key` (CS-618), for the
+/// log and for the error naming the setting an operator has to change.
+fn untrusted_signer_detail(key: &str) -> String {
+    format!(
+        "mapi-lite signs with {key}, which [mapi_lite] miner_id_public_keys does not list, so \
+         none of its answers can be believed"
+    )
 }
 
 /// How far a submit attempt has to outlast mapi-lite's own ceiling for
@@ -146,7 +164,118 @@ impl MapiBroadcaster {
             max_retries: config.max_retries,
             submit_deadline: config.total_timeout(),
             seen_ceiling: AtomicU64::new(0),
+            pins_miner_ids: !config.miner_id_public_keys.is_empty(),
+            untrusted_signer: Mutex::new(None),
         })
+    }
+
+    /// The key mapi-lite signs with when `[mapi_lite] miner_id_public_keys`
+    /// does not list it, as last seen (CS-618); `None` when its last signed
+    /// answer verified, or none has been seen.
+    pub fn untrusted_signer(&self) -> Option<String> {
+        self.untrusted_signer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// mapi-lite's own `GET /ready`: the half of [`TxBroadcaster::health_check`]
+    /// that asks whether a broadcast through it can work at all.
+    async fn mapi_lite_ready(&self) -> Result<(), BroadcastError> {
+        let response = self
+            .ready_http
+            .get(&self.ready_url)
+            .send()
+            .await
+            .map_err(|e| BroadcastError::Upstream(format!("mapi-lite /ready: {e}")))?;
+        let status = response.status();
+        // Read whatever the answer, ready or not: it is also where mapi-lite
+        // publishes its submit ceiling (CS-510).
+        let body = response
+            .bytes()
+            .await
+            .ok()
+            .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok());
+        if let Some(body) = &body {
+            self.note_ceiling(body);
+        }
+        if status.is_success() {
+            return Ok(());
+        }
+        let failing = body
+            .and_then(|body| {
+                body.get("checks")?.as_object().map(|checks| {
+                    checks
+                        .iter()
+                        .filter(|(_, check)| {
+                            check.get("ok") == Some(&serde_json::Value::Bool(false))
+                        })
+                        .map(
+                            |(name, check)| match check.get("detail").and_then(|d| d.as_str()) {
+                                Some(detail) => format!("{name}: {detail}"),
+                                None => name.clone(),
+                            },
+                        )
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                })
+            })
+            .filter(|failing| !failing.is_empty());
+        Err(BroadcastError::Upstream(match failing {
+            Some(failing) => format!("mapi-lite /ready answered {status}: {failing}"),
+            None => format!("mapi-lite /ready answered {status}"),
+        }))
+    }
+
+    /// With miner IDs pinned, whether mapi-lite signs with one of them
+    /// (CS-618). Its `/ready` is unsigned, so on its own it cannot tell: a
+    /// mapi-lite answering ready while signing with an unlisted key had this
+    /// service report ready while every funding through it ended in an unknown
+    /// outcome. The signed fee quote settles it, at no cost to mapi-lite's
+    /// node pool. A quote that cannot be fetched leaves the last verdict.
+    async fn check_signer(&self) -> Result<(), BroadcastError> {
+        if !self.pins_miner_ids {
+            return Ok(());
+        }
+        let quote = self.probe.fee_quote().await;
+        self.note_signature(quote.as_ref().err());
+        match self.untrusted_signer() {
+            Some(key) => Err(BroadcastError::Upstream(untrusted_signer_detail(&key))),
+            None => Ok(()),
+        }
+    }
+
+    /// Records what a signed answer said about mapi-lite's key: `None` for an
+    /// answer that verified, the client's error otherwise. Only an untrusted
+    /// signer changes anything among the errors -- a transport failure says
+    /// nothing about the key.
+    fn note_signature(&self, error: Option<&ClientError>) {
+        let mut untrusted = self
+            .untrusted_signer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match error {
+            None => {
+                if let Some(key) = untrusted.take() {
+                    log::info!(
+                        "mapi-lite's answers verify again (it no longer signs with {key}); \
+                         funding through it resumes"
+                    );
+                }
+            }
+            Some(ClientError::UntrustedSigner { public_key }) => {
+                if untrusted.as_deref() != Some(public_key.as_str()) {
+                    log::error!(
+                        "mapi-lite signs with {public_key}, which [mapi_lite] \
+                         miner_id_public_keys does not list: none of its answers can be \
+                         believed, so funding through it is refused until it signs with a \
+                         listed key (CS-618)"
+                    );
+                }
+                *untrusted = Some(public_key.clone());
+            }
+            Some(_) => {}
+        }
     }
 
     /// mapi-lite's submit ceiling, as its last `/ready` published it.
@@ -376,6 +505,18 @@ impl TxBroadcaster for MapiBroadcaster {
         };
         let expected = tx.hash().encode();
 
+        // Refused before anything is sent while mapi-lite signs with an
+        // unlisted key (CS-618): its answer could not be believed, so the
+        // transaction would land and this service would report an unknown
+        // outcome and hold the inputs for the record's TTL, on every request.
+        // The verdict is checked afresh first, so a mapi-lite that has gone
+        // back to a listed key is used again at once.
+        if self.pins_miner_ids && self.untrusted_signer().is_some() {
+            if let Err(BroadcastError::Upstream(detail)) = self.check_signer().await {
+                return Err(BroadcastError::Untrusted(detail));
+            }
+        }
+
         let started = Instant::now();
         let mut attempt: u32 = 0;
         // Set the moment an attempt might have reached the server: a request
@@ -395,13 +536,16 @@ impl TxBroadcaster for MapiBroadcaster {
             // the deadline it sits inside.
             let bound = self.attempt_timeout.min(remaining);
 
-            let error = match tokio::time::timeout(
+            let outcome = tokio::time::timeout(
                 bound,
                 self.submit
                     .submit_transactions(std::slice::from_ref(&request)),
             )
-            .await
-            {
+            .await;
+            if let Ok(answer) = &outcome {
+                self.note_signature(answer.as_ref().err());
+            }
+            let error = match outcome {
                 // Accepted by the node but not recorded by mapi-lite (CS-501):
                 // the transaction is on the network, and resubmitting it is
                 // how mapi-lite records it -- the node answers "already
@@ -462,49 +606,11 @@ impl TxBroadcaster for MapiBroadcaster {
     /// A `503` carries the names of mapi-lite's failing checks into the error,
     /// for the log line; the `/ready` body this service returns stays generic.
     async fn health_check(&self) -> Result<(), BroadcastError> {
-        let response = self
-            .ready_http
-            .get(&self.ready_url)
-            .send()
-            .await
-            .map_err(|e| BroadcastError::Upstream(format!("mapi-lite /ready: {e}")))?;
-        let status = response.status();
-        // Read whatever the answer, ready or not: it is also where mapi-lite
-        // publishes its submit ceiling (CS-510).
-        let body = response
-            .bytes()
-            .await
-            .ok()
-            .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok());
-        if let Some(body) = &body {
-            self.note_ceiling(body);
-        }
-        if status.is_success() {
-            return Ok(());
-        }
-        let failing = body
-            .and_then(|body| {
-                body.get("checks")?.as_object().map(|checks| {
-                    checks
-                        .iter()
-                        .filter(|(_, check)| {
-                            check.get("ok") == Some(&serde_json::Value::Bool(false))
-                        })
-                        .map(
-                            |(name, check)| match check.get("detail").and_then(|d| d.as_str()) {
-                                Some(detail) => format!("{name}: {detail}"),
-                                None => name.clone(),
-                            },
-                        )
-                        .collect::<Vec<_>>()
-                        .join("; ")
-                })
-            })
-            .filter(|failing| !failing.is_empty());
-        Err(BroadcastError::Upstream(match failing {
-            Some(failing) => format!("mapi-lite /ready answered {status}: {failing}"),
-            None => format!("mapi-lite /ready answered {status}"),
-        }))
+        // Both at once, not one after the other: each is bounded by
+        // health_timeout, and the whole probe has to fit inside one, since
+        // readiness probes allow under 3s (CS-618).
+        let (ready, signer) = tokio::join!(self.mapi_lite_ready(), self.check_signer());
+        ready.and(signer)
     }
 
     /// The standard mining fee from mapi-lite's quote, converted to satoshis
@@ -520,7 +626,9 @@ impl TxBroadcaster for MapiBroadcaster {
     /// probe client is used because, like the health check, this wants a short
     /// timeout and no retries.
     async fn fee_satoshis_per_kb(&self) -> Option<u64> {
-        let quote = match self.probe.fee_quote().await {
+        let quote = self.probe.fee_quote().await;
+        self.note_signature(quote.as_ref().err());
+        let quote = match quote {
             Ok(quote) => quote,
             Err(e) => {
                 log::warn!("fee quote failed, keeping the current fee rate: {e}");
@@ -546,6 +654,18 @@ impl TxBroadcaster for MapiBroadcaster {
             return None;
         }
         Some(satoshis.saturating_mul(1000).div_ceil(*bytes))
+    }
+
+    /// `GET /query/tx/{txid}`, which asks mapi-lite's nodes (CS-619). `None`
+    /// on any failure: an unanswered question is not evidence of anything.
+    async fn knows_tx(&self, txid: &str) -> Option<bool> {
+        match self.probe.tx_status(txid).await {
+            Ok(status) => Some(status.known),
+            Err(e) => {
+                log::debug!("mapi-lite /query/tx/{txid} failed: {e}");
+                None
+            }
+        }
     }
 }
 
@@ -754,14 +874,228 @@ mod tests {
             .mount(&server)
             .await;
 
+        // The submit first: once any answer has shown the key untrusted, a
+        // submit is not sent at all (CS-618, below). Before anything is known,
+        // one is, and its answer cannot be believed.
         let broadcaster = pinned_to(&server, OTHER_MINER_ID);
-        assert_eq!(broadcaster.fee_satoshis_per_kb().await, None);
         match broadcaster.broadcast_tx(&tx).await {
             Err(BroadcastError::Indeterminate(detail)) => {
                 assert!(detail.contains("not a trusted miner ID"), "{detail}")
             }
             other => panic!("expected an unknown outcome, got {other:?}"),
         }
+        assert_eq!(broadcaster.fee_satoshis_per_kb().await, None);
+    }
+
+    /// CS-618: an answer signed by an unlisted key marks the key untrusted,
+    /// and an answer that verifies clears it.
+    #[tokio::test]
+    async fn cs_618_an_untrusted_signer_is_remembered_until_an_answer_verifies() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/mapi/feeQuote"))
+            .respond_with(ok(fee_quote_payload()))
+            .mount(&server)
+            .await;
+
+        let untrusted = pinned_to(&server, OTHER_MINER_ID);
+        assert_eq!(untrusted.untrusted_signer(), None, "nothing seen yet");
+        untrusted.fee_satoshis_per_kb().await;
+        assert_eq!(untrusted.untrusted_signer().as_deref(), Some(MOCK_MINER_ID));
+
+        let trusted = pinned_to(&server, MOCK_MINER_ID);
+        trusted.fee_satoshis_per_kb().await;
+        assert_eq!(trusted.untrusted_signer(), None);
+
+        // A verified answer clears an earlier verdict.
+        trusted.note_signature(Some(&ClientError::UntrustedSigner {
+            public_key: OTHER_MINER_ID.to_string(),
+        }));
+        assert!(trusted.untrusted_signer().is_some());
+        trusted.fee_satoshis_per_kb().await;
+        assert_eq!(trusted.untrusted_signer(), None);
+    }
+
+    /// CS-618: a submit answered by an unlisted key marks it too.
+    #[tokio::test]
+    async fn cs_618_a_submit_signed_by_an_untrusted_key_marks_it() {
+        let server = MockServer::start().await;
+        let tx = sample_tx();
+        Mock::given(method("POST"))
+            .and(path("/mapi/txs"))
+            .respond_with(ok(txs_payload(success(&tx.hash().encode(), ""))))
+            .mount(&server)
+            .await;
+        let broadcaster = pinned_to(&server, OTHER_MINER_ID);
+        let _ = broadcaster.broadcast_tx(&tx).await;
+        assert_eq!(
+            broadcaster.untrusted_signer().as_deref(),
+            Some(MOCK_MINER_ID)
+        );
+    }
+
+    /// CS-618: with miner IDs pinned, a mapi-lite that answers ready but signs
+    /// with an unlisted key is not ready; signing with a listed one, it is.
+    #[tokio::test]
+    async fn cs_618_a_mapi_lite_signing_with_an_unlisted_key_is_not_ready() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ready"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ready": true})))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/mapi/feeQuote"))
+            .respond_with(ok(fee_quote_payload()))
+            .mount(&server)
+            .await;
+
+        match pinned_to(&server, OTHER_MINER_ID).health_check().await {
+            Err(BroadcastError::Upstream(detail)) => {
+                assert!(detail.contains("miner_id_public_keys"), "{detail}");
+                assert!(detail.contains(MOCK_MINER_ID), "{detail}");
+            }
+            other => panic!("expected not ready, got {other:?}"),
+        }
+        pinned_to(&server, MOCK_MINER_ID)
+            .health_check()
+            .await
+            .expect("a listed key is ready");
+    }
+
+    /// CS-618: the signer check runs alongside mapi-lite's `/ready`, so with
+    /// miner IDs pinned the probe still fits inside one `health_timeout`:
+    /// with both answers taking 1.5s of a 2s timeout it takes about 1.5s.
+    #[tokio::test]
+    async fn cs_618_the_signer_check_keeps_the_probe_within_one_timeout() {
+        let server = MockServer::start().await;
+        let slow = Duration::from_millis(1_500);
+        Mock::given(method("GET"))
+            .and(path("/ready"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"ready": true}))
+                    .set_delay(slow),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/mapi/feeQuote"))
+            .respond_with(ok(fee_quote_payload()).set_delay(slow))
+            .mount(&server)
+            .await;
+
+        let broadcaster = pinned_to(&server, MOCK_MINER_ID);
+        let started = Instant::now();
+        broadcaster.health_check().await.expect("ready");
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_millis(2_500),
+            "the probe took {took:?}"
+        );
+    }
+
+    /// CS-618: once mapi-lite is known to sign with an unlisted key, a
+    /// broadcast is refused before anything is sent -- after checking again,
+    /// so the refusal is never on a stale verdict.
+    #[tokio::test]
+    async fn cs_618_an_untrusted_mapi_lite_is_not_sent_the_transaction() {
+        let server = MockServer::start().await;
+        let tx = sample_tx();
+        Mock::given(method("GET"))
+            .and(path("/mapi/feeQuote"))
+            .respond_with(ok(fee_quote_payload()))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/mapi/txs"))
+            .respond_with(ok(txs_payload(success(&tx.hash().encode(), ""))))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let broadcaster = pinned_to(&server, OTHER_MINER_ID);
+        broadcaster.fee_satoshis_per_kb().await;
+        match broadcaster.broadcast_tx(&tx).await {
+            Err(BroadcastError::Untrusted(detail)) => {
+                assert!(detail.contains("miner_id_public_keys"), "{detail}")
+            }
+            other => panic!("expected a refusal before sending, got {other:?}"),
+        }
+    }
+
+    /// CS-618: a verdict that has gone stale -- mapi-lite signs with a listed
+    /// key again -- is cleared by the re-check, and the transaction is sent.
+    #[tokio::test]
+    async fn cs_618_a_stale_untrusted_verdict_does_not_block_a_broadcast() {
+        let server = MockServer::start().await;
+        let tx = sample_tx();
+        Mock::given(method("GET"))
+            .and(path("/mapi/feeQuote"))
+            .respond_with(ok(fee_quote_payload()))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/mapi/txs"))
+            .respond_with(ok(txs_payload(success(&tx.hash().encode(), ""))))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let broadcaster = pinned_to(&server, MOCK_MINER_ID);
+        broadcaster.note_signature(Some(&ClientError::UntrustedSigner {
+            public_key: OTHER_MINER_ID.to_string(),
+        }));
+        broadcaster
+            .broadcast_tx(&tx)
+            .await
+            .expect("sent and accepted");
+        assert_eq!(broadcaster.untrusted_signer(), None);
+    }
+
+    /// With no miner IDs pinned, any key verifies: nothing is ever untrusted.
+    #[tokio::test]
+    async fn cs_618_without_pinned_miner_ids_nothing_is_untrusted() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/mapi/feeQuote"))
+            .respond_with(ok(fee_quote_payload()))
+            .mount(&server)
+            .await;
+        let broadcaster = broadcaster(&server);
+        broadcaster.fee_satoshis_per_kb().await;
+        assert_eq!(broadcaster.untrusted_signer(), None);
+    }
+
+    /// CS-619: mapi-lite's `/query/tx` says whether its nodes know a
+    /// transaction; a failure says nothing.
+    #[tokio::test]
+    async fn cs_619_knows_tx_asks_mapi_lite_s_nodes() {
+        let server = MockServer::start().await;
+        let (known, unknown) = ("aa".repeat(32), "bb".repeat(32));
+        Mock::given(method("GET"))
+            .and(path(format!("/query/tx/{known}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"txid": known, "known": true, "confirmed": true, "block_height": 120}),
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/query/tx/{unknown}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"txid": unknown, "known": false, "confirmed": false})),
+            )
+            .mount(&server)
+            .await;
+        let broadcaster = broadcaster(&server);
+        assert_eq!(broadcaster.knows_tx(&known).await, Some(true));
+        assert_eq!(broadcaster.knows_tx(&unknown).await, Some(false));
+        assert_eq!(
+            broadcaster.knows_tx(&"cc".repeat(32)).await,
+            None,
+            "a 404 says nothing"
+        );
     }
 
     #[tokio::test]

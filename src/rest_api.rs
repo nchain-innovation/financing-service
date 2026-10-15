@@ -13,6 +13,7 @@ use crate::{
     idempotency::{
         request_fingerprint, Outcome, RecordKey, Reservation, MAX_IDEMPOTENCY_KEY_BYTES,
     },
+    metrics::Metrics,
     responses::{
         coded_error_response, error_response, error_response_with_status, json_ok,
         partial_funding_error_response, AddressResponse, BalanceResponse, CheckResult, CodedError,
@@ -116,6 +117,19 @@ impl ClientAddRequest {
 /// Application State Data
 pub struct AppState {
     pub service: Arc<Service>,
+    /// The CS-608 instruments; no-ops when metrics export is off.
+    pub metrics: Metrics,
+}
+
+impl AppState {
+    /// With instruments from the global meter provider, so build it after
+    /// `telemetry::init`.
+    pub fn new(service: Arc<Service>) -> Self {
+        Self {
+            service,
+            metrics: Metrics::global(),
+        }
+    }
 }
 
 /// Get Index endpoint
@@ -162,29 +176,40 @@ pub async fn health() -> impl Responder {
 /// mapi-lite URL that a public 503 body has no business disclosing.
 #[get("/ready")]
 pub async fn ready(data: web::Data<AppState>) -> impl Responder {
-    let mapi_lite = match data.service.mapi_lite_health().await {
-        None => None,
-        Some(Ok(())) => Some(CheckResult::passed()),
-        Some(Err(error)) => {
-            log::warn!("mapi-lite readiness probe failed: {error}");
-            Some(CheckResult::failed("mapi-lite probe failed"))
-        }
-    };
-    // Its detail is an age and a client id, which a caller of /status can
-    // already see; nothing in it names an upstream.
-    let chain = match data.service.chain_readiness().await {
-        Ok(()) => CheckResult::passed(),
-        Err(detail) => {
-            log::warn!("chain readiness failed: {detail}");
-            CheckResult::failed(detail)
-        }
-    };
-    let response = HealthResponse::from_checks(mapi_lite, Some(chain));
+    let response = readiness(&data.service, true).await;
     if response.is_ok() {
         json_ok(&response)
     } else {
         HttpResponse::ServiceUnavailable().json(response)
     }
+}
+
+/// The `GET /ready` verdict, shared with the `ready` gauge's sampler
+/// (CS-608), which passes `log_failures = false` so sampling adds no log
+/// lines of its own.
+pub async fn readiness(service: &Service, log_failures: bool) -> HealthResponse {
+    let mapi_lite = match service.mapi_lite_health().await {
+        None => None,
+        Some(Ok(())) => Some(CheckResult::passed()),
+        Some(Err(error)) => {
+            if log_failures {
+                log::warn!("mapi-lite readiness probe failed: {error}");
+            }
+            Some(CheckResult::failed("mapi-lite probe failed"))
+        }
+    };
+    // Its detail is an age and a client id, which a caller of /status can
+    // already see; nothing in it names an upstream.
+    let chain = match service.chain_readiness().await {
+        Ok(()) => CheckResult::passed(),
+        Err(detail) => {
+            if log_failures {
+                log::warn!("chain readiness failed: {detail}");
+            }
+            CheckResult::failed(detail)
+        }
+    };
+    HealthResponse::from_checks(mapi_lite, Some(chain))
 }
 
 /// Get Service Status endpoint
@@ -216,6 +241,17 @@ pub async fn get_funds(
     data: web::Data<AppState>,
     info: web::Json<FundingRequest>,
 ) -> impl Responder {
+    let response = fund(req, &data, info).await;
+    // Every answer the handler gives, replays included (CS-608).
+    data.metrics.record_fund(&response);
+    response
+}
+
+async fn fund(
+    req: HttpRequest,
+    data: &web::Data<AppState>,
+    info: web::Json<FundingRequest>,
+) -> HttpResponse {
     log::info!("get_funds");
 
     let client_id = &info.client_id;
@@ -787,9 +823,7 @@ mod tests {
         let governor_config = rate_limit::build_governor_config(&config.web_interface.rate_limit);
         let blockchain = test_blockchain_interface(&config).await;
         let financing_service = Arc::new(Service::new_for_test(&config, blockchain).await);
-        let app_state = web::Data::new(AppState {
-            service: financing_service,
-        });
+        let app_state = web::Data::new(AppState::new(financing_service));
 
         test::init_service(
             App::new()
@@ -820,9 +854,7 @@ mod tests {
             test_config_with_keys(&unique_dynamic_config_path(), client_api_key, admin_api_key);
         let blockchain = test_blockchain_interface(&config).await;
         let financing_service = Arc::new(Service::new_for_test(&config, blockchain).await);
-        let app_state = web::Data::new(AppState {
-            service: financing_service,
-        });
+        let app_state = web::Data::new(AppState::new(financing_service));
 
         test::init_service(
             App::new()
@@ -849,9 +881,7 @@ mod tests {
         let config = test_config(&unique_dynamic_config_path());
         let blockchain = CountingBlockchain::new(&config).await;
         let financing_service = Arc::new(Service::new_for_test(&config, blockchain.clone()).await);
-        let app_state = web::Data::new(AppState {
-            service: financing_service,
-        });
+        let app_state = web::Data::new(AppState::new(financing_service));
 
         let app = test::init_service(
             App::new()
@@ -883,9 +913,7 @@ mod tests {
         let stub = StubMapiBroadcaster::new(healthy);
         let service =
             Service::new_for_test_with_broadcaster(&config, blockchain, stub.clone()).await;
-        let app_state = web::Data::new(AppState {
-            service: Arc::new(service),
-        });
+        let app_state = web::Data::new(AppState::new(Arc::new(service)));
 
         let app = test::init_service(
             App::new()
@@ -928,9 +956,7 @@ mod tests {
     ) {
         let blockchain = test_blockchain_interface(&config).await;
         let service = Arc::new(Service::new_for_test(&config, blockchain).await);
-        let app_state = web::Data::new(AppState {
-            service: Arc::clone(&service),
-        });
+        let app_state = web::Data::new(AppState::new(Arc::clone(&service)));
         let app = test::init_service(
             App::new()
                 .app_data(app_state)
@@ -990,9 +1016,7 @@ mod tests {
     ) {
         let service =
             Arc::new(Service::new_for_test_with_broadcaster(config, blockchain, broadcaster).await);
-        let app_state = web::Data::new(AppState {
-            service: Arc::clone(&service),
-        });
+        let app_state = web::Data::new(AppState::new(Arc::clone(&service)));
         let app = test::init_service(
             App::new()
                 .app_data(app_state)

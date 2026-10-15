@@ -20,8 +20,8 @@ The FS is designed to be as simple as possible, in that light it:
 * FS only accesses the funding key required to sign the transaction that provides the funds the client wishes to spend.
 * FS does not access the client's key, instead the client provides the locking script (script_pubkey).
 
-* FS accesses the blockchain through WhatsOnChain, UTXO as a Service (UaaS), or a node's JSON-RPC endpoint. The first two reach mainnet, testnet and STN; the `rpc` interface additionally reaches regtest, and works against any node you control. See [which interface reaches which network](docs/Configuration.md#which-interface-reaches-which-network).
-* FS can optionally broadcast funding transactions through [mapi-lite](https://github.com/nchain-innovation/mapi-lite) instead of the blockchain interface. Configure a `[mapi_lite]` section and transactions go to mapi-lite while chain reads stay where they were; leave it out and nothing changes. When configured, mapi-lite's own readiness is part of `GET /ready`, the readiness probe, alongside chain-read health; `GET /health` stays a pure liveness check. See [Configuration](docs/Configuration.md#mapi_lite). Building with this integration needs SSH access to the private mapi-lite repository — see [Dependencies](docs/Dependencies.md).
+* FS accesses the blockchain through WhatsOnChain, mapi-lite, UTXO as a Service (UaaS), or a node's JSON-RPC endpoint. WhatsOnChain and UaaS reach mainnet, testnet and STN, and mapi-lite mainnet and testnet; the `rpc` interface additionally reaches regtest, and works against any node you control. See [which interface reaches which network](docs/Configuration.md#which-interface-reaches-which-network).
+* FS can optionally broadcast funding transactions through [mapi-lite](https://github.com/nchain-innovation/mapi-lite) instead of the blockchain interface. Configure a `[mapi_lite]` section and transactions go to mapi-lite while chain reads stay where they were, unless `interface_type = "mapi_lite"` sends them there too, leaving mapi-lite the deployment's only WhatsOnChain client; leave it out and nothing changes. When configured, mapi-lite's own readiness is part of `GET /ready`, the readiness probe, alongside chain-read health; `GET /health` stays a pure liveness check. See [Configuration](docs/Configuration.md#mapi_lite). Building with this integration needs SSH access to the private mapi-lite repository — see [Dependencies](docs/Dependencies.md).
 * FS maintains an in-memory UTXO cache per client, refreshed periodically from the blockchain, and again by a funding or balance request that finds it older than `service.chain_state_max_age_seconds`. Clients added at runtime are persisted to a dynamic config file.
 * FS is configurable; it reads its configuration on startup.
 
@@ -35,6 +35,7 @@ The FS is designed to be as simple as possible, in that light it:
 * FS supports secret references (`env:VAR`), environment variable overrides, and `wif_env` / `api_key_env` when adding clients at runtime. See [Configuration](docs/Configuration.md#secret-management).
 * FS supports optional per-IP HTTP rate limiting (disabled by default). See [Configuration](docs/Configuration.md#rate-limiting).
 * FS supports optional OpenTelemetry trace export via OTLP (disabled by default). Each HTTP request creates a span; traces include resource metadata and request fields but not secrets or request bodies. See [Configuration](docs/Configuration.md#telemetry).
+* FS can also push metrics over OTLP (disabled by default; `OTEL_METRICS_EXPORTER=otlp`): requests by route and status, request duration, readiness, `/fund` outcomes, and each client's balance and chain-state age. See [Metrics](docs/Configuration.md#metrics).
 
 ## Use cases
 

@@ -1,6 +1,9 @@
 [blockchain_interface]
 interface_type = "woc"
 network_type = "testnet"
+# Or read through the [mapi_lite] server below, so it is the deployment's only
+# WhatsOnChain client (mainnet and testnet only; needs [mapi_lite]):
+# interface_type = "mapi_lite"
 # For a local node, the only way to reach regtest. The service imports each
 # client's address into the node's wallet so their balances are visible.
 # interface_type = "rpc"

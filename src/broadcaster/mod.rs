@@ -51,6 +51,12 @@ pub enum BroadcastError {
     /// transaction that may have left may have spent its inputs, and the
     /// service must not offer those inputs to the next funding request.
     Indeterminate(String),
+    /// Not sent: the upstream signs with a key `[mapi_lite]
+    /// miner_id_public_keys` does not list, so its answer could not be
+    /// believed and a broadcast could only end in an unknown outcome
+    /// (CS-618). Nothing reached the network; an operator has to fix the key
+    /// list or mapi-lite's key.
+    Untrusted(String),
 }
 
 impl BroadcastError {
@@ -84,6 +90,7 @@ impl std::fmt::Display for BroadcastError {
             BroadcastError::Indeterminate(detail) => {
                 write!(f, "outcome unknown: {detail}")
             }
+            BroadcastError::Untrusted(detail) => write!(f, "not sent: {detail}"),
         }
     }
 }
@@ -118,6 +125,15 @@ pub trait TxBroadcaster: Send + Sync {
     /// and leaves the configured rate standing. The default is `None` so that
     /// a broadcaster only implements this if it genuinely has a quote.
     async fn fee_satoshis_per_kb(&self) -> Option<u64> {
+        None
+    }
+
+    /// Whether the nodes behind this upstream know transaction `txid`
+    /// (CS-619): `Some(false)` when they answer that they do not. `None` for
+    /// an upstream with no such question to ask -- broadcasting through the
+    /// blockchain interface reads the same chain as the wallet, so it cannot
+    /// disagree with it -- or when the question could not be answered.
+    async fn knows_tx(&self, _txid: &str) -> Option<bool> {
         None
     }
 }
