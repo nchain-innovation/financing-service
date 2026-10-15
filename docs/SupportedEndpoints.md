@@ -1,6 +1,6 @@
 # Supported endpoints
 
-The service listens on the port configured in `data/financing-service.toml` (`[web_interface] port`, which is required; the sample config and the examples below use `8080`).
+The service listens on `listen_addr` (default `127.0.0.1:8080`; the examples below use port `8080`). See [Configuration](Configuration.md#listen_addr).
 
 When a client has an `api_key` configured, that client's endpoints require authentication via either:
 

@@ -92,6 +92,13 @@ mod tests {
     }
 
     #[test]
+    fn sr_cfg_003_the_image_listens_on_every_interface() {
+        let dockerfile = std::fs::read_to_string("Dockerfile").unwrap();
+        assert!(dockerfile.contains("ENV FS__LISTEN_ADDR=0.0.0.0:8080"));
+        assert!(!dockerfile.contains("APP_ENV"));
+    }
+
+    #[test]
     fn sr_nfr_009_docker_build_mounts_ssh_for_the_dependency_fetch() {
         let dockerfile = std::fs::read_to_string("Dockerfile").unwrap();
         assert!(dockerfile.contains("--mount=type=ssh"));

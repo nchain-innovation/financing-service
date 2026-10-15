@@ -2,7 +2,7 @@
 
 Configuration for this service is a TOML file, read when the service starts: the file `FS_CONFIG` names, or `data/financing-service.toml` when it is unset. `FS_CONFIG` names a file, as `TE_CONFIG` and `MAPI_CONFIG` do for Event and mapi-lite; it no longer holds JSON (CS-624).
 
-Any setting can then be overridden from the environment with `FS__<TABLE>__<KEY>`, two underscores between each part: `FS__WEB_INTERFACE__PORT=9090` sets `[web_interface] port`. See [Environment overrides](#environment-overrides).
+Any setting can then be overridden from the environment with `FS__<TABLE>__<KEY>`, two underscores between each part: `FS__SERVICE__UTXO_REFRESH_PERIOD=30` sets `[service] utxo_refresh_period`, and `FS__LISTEN_ADDR=0.0.0.0:9090` sets the top-level `listen_addr`. See [Environment overrides](#environment-overrides).
 
 **A key no setting reads stops startup**, naming it: a misspelling, a key written under the wrong `[table]`, an override with a typo, or a setting this version has removed. Before CS-624 such a key was silently ignored and the setting kept its default.
 
@@ -148,36 +148,43 @@ It bounds a whole call, and WhatsOnChain's UTXO listing is one call made of seve
 
 ### A note on the port
 
-`[web_interface] port` has no default and must be set. The sample config uses `8080`, which several other nChain services also default to — mapi-lite among them. If you are running this alongside one of those, change the port here or there; nothing will respond on a port that another process already holds.
+`listen_addr` defaults to `127.0.0.1:8080`. Port `8080` is also mapi-lite's default, among other nChain services. If you are running this alongside one of those, change the port here or there; nothing will respond on a port that another process already holds.
 
 ### Required keys
 
 Most keys have defaults, and most sections can be left out. These cannot, and the service refuses to start without them:
 
 * `blockchain_interface.interface_type` and `blockchain_interface.network_type`
-* `web_interface.address` and `web_interface.port`
 * `logging.level`
 * `service.utxo_refresh_period`
 * `dynamic_config.filename`
 
 Within an optional section, `mapi_lite.base_url` is required when `[mapi_lite]` is present, and `client_id` and `wif_key` in each `[[client]]`.
 
+## listen_addr
+
+Where the REST API listens, as `host:port`. A top-level key, before any `[table]`, named as it is in Event and mapi-lite (CS-624).
+
+```toml
+listen_addr = "127.0.0.1:8080"
+```
+
+Default `127.0.0.1:8080`. It replaces `[web_interface] address` and `port`, which are now refused, and the `APP_ENV=docker` switch, which is no longer read.
+
+mapi-lite also defaults to port 8080. Running both on one host, as a local regtest setup does, move this service to another port: Event's regtest config expects it on 8081.
+
+The Docker image sets `FS__LISTEN_ADDR=0.0.0.0:8080`: a container's own loopback cannot be reached from the host. Which host interfaces then see the port is set where it is published — `run.sh` publishes it on the host's loopback. A container run with `--network host` that should bind one address takes `-e FS__LISTEN_ADDR=10.1.2.3:8080`; the image's health check expects port 8080.
+
+Listen on loopback, or place the service behind a reverse proxy on a private network, when exposing funding endpoints.
+
 ## [web_interface]
 
-Configures the REST API endpoint for the service.
+Configures who may call the REST API.
 
 ```toml
 [web_interface]
-address = "127.0.0.1"
-port = 8080
 # admin_api_key = "your-admin-secret"
 ```
-
-mapi-lite also defaults to port 8080. Running both on one host, as a local regtest setup does, move this service to another port: Event's regtest config expects it on 8081. The Docker image keeps 8080, which its health check and the uls-rs compose file use.
-
-When `APP_ENV=docker` (set by the image) and `address` is a loopback address, the service listens on `0.0.0.0` instead: a container's own loopback cannot be reached from the host. Which host interfaces then see the port is set where it is published — `run.sh` publishes it on the host's loopback. Any other `address` is honoured, so a container run with `--network host` and a specific address binds only that one.
-
-Bind to `127.0.0.1` or place the service behind a reverse proxy on a private network when exposing funding endpoints.
 
 ### Admin authentication
 
@@ -590,7 +597,7 @@ If a referenced variable is not set, startup fails with a clear error.
 | `FS__WEB_INTERFACE__ADMIN_API_KEY` | `web_interface.admin_api_key` |
 | `FS__BLOCKCHAIN_INTERFACE__RPC_USER` / `FS__BLOCKCHAIN_INTERFACE__RPC_PASSWORD` | `blockchain_interface.rpc_user` / `rpc_password` |
 | `FS__MAPI_LITE__AUTH_TOKEN` | `mapi_lite.auth_token` (include the scheme, e.g. `Bearer <secret>`) |
-| `FS__WEB_INTERFACE__PORT` | `web_interface.port` |
+| `FS__LISTEN_ADDR` | `listen_addr` |
 
 A `[[client]]` entry sits in an array, which an override cannot address: give its `wif_key` and `api_key` as `env:` references.
 

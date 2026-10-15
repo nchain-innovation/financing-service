@@ -85,8 +85,6 @@ pub fn test_config_with_keys(
             ..Default::default()
         },
         web_interface: crate::config::WebInterfaceConfig {
-            address: std::net::Ipv4Addr::LOCALHOST,
-            port: 8080,
             admin_api_key: admin_api_key.map(str::to_string),
             rate_limit: crate::config::RateLimitConfig::default(),
             // The test network is testnet, where keys are otherwise required

@@ -1,3 +1,8 @@
+# Where the REST API listens (default "127.0.0.1:8080"). mapi-lite defaults
+# to 8080 too: running both on one host, move this one; Event's regtest config
+# expects 8081. The Docker image sets FS__LISTEN_ADDR=0.0.0.0:8080.
+listen_addr = "127.0.0.1:8080"
+
 [blockchain_interface]
 interface_type = "woc"
 network_type = "testnet"
@@ -21,10 +26,6 @@ network_type = "testnet"
 # url = "http://localhost:5010"
 
 [web_interface]
-address = "127.0.0.1"
-# mapi-lite defaults to 8080 too: running both on one host, move this one.
-# Event's regtest config expects 8081. The Docker image keeps 8080.
-port = 8080
 # Shared secret required on POST /client. On mainnet and testnet the service
 # will not start without one, and every client needs an api_key (CS-514);
 # elsewhere, without it POST /client is unauthenticated and a warning is logged

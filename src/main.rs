@@ -30,7 +30,7 @@ mod util;
 mod test_support;
 
 use crate::{
-    config::{config_file, load_config, web_bind_address},
+    config::{config_file, load_config},
     rest_api::{
         add_client, balance, delete_client, get_address, get_funds, health, index, ready, status,
         update_clients, AppState,
@@ -124,7 +124,9 @@ async fn main() -> std::io::Result<()> {
             gauges
         });
     let app_state2 = app_state.clone();
-    let addr = web_bind_address(&config);
+    let addr = config
+        .listen_socket_addr()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
     // Setup periodic task
     let utxo_refresh_period = config.service.utxo_refresh_period;

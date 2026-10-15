@@ -1,4 +1,4 @@
-use std::{env, net::Ipv4Addr};
+use std::{env, net::SocketAddr};
 
 use chain_gang::network::Network;
 use log::debug;
@@ -696,11 +696,10 @@ impl RateLimitConfig {
     }
 }
 
-/// Web Interface Configuration
-#[derive(Debug, Deserialize, Clone)]
+/// Web Interface Configuration. Every key has a default, so the section may
+/// be left out.
+#[derive(Debug, Default, Deserialize, Clone)]
 pub struct WebInterfaceConfig {
-    pub address: Ipv4Addr,
-    pub port: u16,
     /// When set, required for `POST /client`.
     #[serde(default)]
     pub admin_api_key: Option<String>,
@@ -715,22 +714,18 @@ pub struct WebInterfaceConfig {
     pub allow_unauthenticated: bool,
 }
 
-impl Default for WebInterfaceConfig {
-    fn default() -> Self {
-        WebInterfaceConfig {
-            address: Ipv4Addr::new(0, 0, 0, 0),
-            port: 0,
-            admin_api_key: None,
-            rate_limit: RateLimitConfig::default(),
-            allow_unauthenticated: false,
-        }
-    }
-}
-
 /// Service Configuration
 #[derive(Debug, Default, Deserialize, Clone)]
 pub struct Config {
+    /// Where the REST API listens, `host:port` (CS-624), as `listen_addr` is
+    /// in Event and mapi-lite. Default [`DEFAULT_LISTEN_ADDR`], loopback: the
+    /// funding routes are not exposed until an operator chooses to. The
+    /// Docker image sets `FS__LISTEN_ADDR=0.0.0.0:8080`, since a container's
+    /// own loopback cannot be reached from outside it.
+    #[serde(default = "default_listen_addr")]
+    pub listen_addr: String,
     pub blockchain_interface: BlockchainInterfaceConfig,
+    #[serde(default)]
     pub web_interface: WebInterfaceConfig,
     pub logging: LoggingConfig,
     #[serde(default)]
@@ -911,24 +906,22 @@ pub fn config_file() -> String {
         .unwrap_or_else(|| DEFAULT_CONFIG_FILE.to_string())
 }
 
-/// Return the HTTP bind address and port, honouring `APP_ENV=docker`.
-///
-/// In a container a loopback address is replaced with `0.0.0.0`: loopback
-/// there is the container's own, which nothing published from the host can
-/// reach, so a config file written for a bare-metal run would otherwise give a
-/// container that answers nobody. Which host interfaces see the port is then
-/// decided where it is published (`run.sh` publishes it on the host's
-/// loopback). Any other configured address is honoured (CS-527): it used to be
-/// overridden to `0.0.0.0` too, so a container given a specific interface, or
-/// run with `--network host`, listened on every interface instead.
-pub fn web_bind_address(config: &Config) -> (Ipv4Addr, u16) {
-    let port = config.web_interface.port;
-    let address = config.web_interface.address;
-    match env::var_os("APP_ENV") {
-        Some(content) if content == "docker" && address.is_loopback() => {
-            (Ipv4Addr::UNSPECIFIED, port)
-        }
-        Some(_) | None => (address, port),
+/// Where the REST API listens when `listen_addr` is not set.
+pub const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:8080";
+
+fn default_listen_addr() -> String {
+    DEFAULT_LISTEN_ADDR.to_string()
+}
+
+impl Config {
+    /// `listen_addr` as a socket address, or why it is not one.
+    pub fn listen_socket_addr(&self) -> Result<SocketAddr, String> {
+        self.listen_addr.parse().map_err(|e| {
+            format!(
+                "listen_addr {:?} is not host:port, e.g. \"127.0.0.1:8080\": {e}",
+                self.listen_addr
+            )
+        })
     }
 }
 
@@ -937,6 +930,7 @@ pub fn web_bind_address(config: &Config) -> (Ipv4Addr, u16) {
 /// setting reads -- in the file or an override -- is refused, naming it.
 pub fn load_config(path: &str) -> Result<Config, String> {
     let config = get_config(path)?;
+    config.listen_socket_addr()?;
     config.web_interface.rate_limit.validate()?;
     config.telemetry.validate()?;
     config.idempotency.validate()?;
@@ -1013,8 +1007,6 @@ mod tests {
 
         let config = Config {
             web_interface: WebInterfaceConfig {
-                address: Ipv4Addr::new(127, 0, 0, 1),
-                port: 8080,
                 admin_api_key: Some("env:FS_TEST_CONFIG_ADMIN".to_string()),
                 rate_limit: RateLimitConfig::default(),
                 allow_unauthenticated: false,
@@ -1064,14 +1056,14 @@ mod tests {
         std::fs::write(
             &path,
             r#"
+listen_addr = "127.0.0.1:9091"
+
 [blockchain_interface]
 interface_type = "test"
 network_type = "testnet"
 
 [web_interface]
-address = "127.0.0.1"
 allow_unauthenticated = true  # testnet without keys (CS-514)
-port = 9091
 
 [logging]
 level = "info"
@@ -1086,7 +1078,7 @@ filename = "./data/dynamic.toml"
         .unwrap();
 
         let config = load_config(path.to_str().unwrap()).unwrap();
-        assert_eq!(config.web_interface.port, 9091);
+        assert_eq!(config.listen_addr, "127.0.0.1:9091");
         assert_eq!(config.service.utxo_refresh_period, 45);
     }
 
@@ -1101,7 +1093,7 @@ filename = "./data/dynamic.toml"
         unsafe { env::set_var(CONFIG_FILE_ENV, &path) };
         assert_eq!(config_file(), path.to_str().unwrap());
         let config = load_config(&config_file()).unwrap();
-        assert_eq!(config.web_interface.port, 8080);
+        assert_eq!(config.listen_addr, DEFAULT_LISTEN_ADDR);
         unsafe { env::remove_var(CONFIG_FILE_ENV) };
     }
 
@@ -1125,13 +1117,13 @@ filename = "./data/dynamic.toml"
         let path = write_temp_config("override", MINIMAL_TOML);
         let config = with_env(
             &[
-                ("FS__WEB_INTERFACE__PORT", "9093"),
+                ("FS__LISTEN_ADDR", "0.0.0.0:9093"),
                 ("FS__WEB_INTERFACE__ADMIN_API_KEY", "admin-from-env"),
                 ("FS__SERVICE__UTXO_REFRESH_PERIOD", "15"),
             ],
             || load_config(path.to_str().unwrap()).unwrap(),
         );
-        assert_eq!(config.web_interface.port, 9093);
+        assert_eq!(config.listen_addr, "0.0.0.0:9093");
         assert_eq!(
             config.web_interface.admin_api_key.as_deref(),
             Some("admin-from-env")
@@ -1163,7 +1155,7 @@ filename = "./data/dynamic.toml"
     fn sr_cfg_002_a_key_no_setting_reads_is_refused() {
         let path = write_temp_config(
             "unknown",
-            &MINIMAL_TOML.replace("port = 8080", "port = 8080\nprot = 8081"),
+            &MINIMAL_TOML.replace("[web_interface]", "[web_interface]\nprot = 8081"),
         );
         let err = with_env(&[], || load_config(path.to_str().unwrap()).unwrap_err());
         assert!(err.contains("web_interface.prot"), "{err}");
@@ -1221,42 +1213,36 @@ filename = "./data/dynamic.toml"
         assert_eq!(merged.web_interface.admin_api_key.as_deref(), Some("k"));
     }
 
+    /// The REST API listens on loopback unless told otherwise; the address
+    /// is checked at startup, naming the setting (CS-624).
     #[test]
-    fn sr_cfg_003_web_bind_address_uses_all_interfaces_in_docker() {
-        let _env = env_lock();
-        unsafe { env::set_var("APP_ENV", "docker") };
-        let config = Config {
-            web_interface: WebInterfaceConfig {
-                address: Ipv4Addr::new(127, 0, 0, 1),
-                port: 8080,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        assert_eq!(web_bind_address(&config), (Ipv4Addr::new(0, 0, 0, 0), 8080));
-        unsafe { env::remove_var("APP_ENV") };
+    fn sr_cfg_003_listen_addr_defaults_to_loopback_and_is_checked() {
+        let path = write_temp_config("listen", MINIMAL_TOML);
+        let config = with_env(&[], || load_config(path.to_str().unwrap()).unwrap());
+        let addr = config.listen_socket_addr().unwrap();
+        assert!(addr.ip().is_loopback(), "{addr}");
+        assert_eq!(addr.port(), 8080);
+
+        let err = with_env(&[("FS__LISTEN_ADDR", "0.0.0.0")], || {
+            load_config(path.to_str().unwrap()).unwrap_err()
+        });
+        assert!(err.contains("listen_addr"), "{err}");
     }
 
-    /// CS-527: only a loopback address is replaced in a container. One the
-    /// operator chose -- a specific interface, say, under `--network host` --
-    /// is what the service binds.
+    /// The settings `listen_addr` replaced are refused, not ignored, so a
+    /// file written for an earlier version cannot quietly listen elsewhere.
     #[test]
-    fn sr_cfg_003_web_bind_address_honours_a_non_loopback_address_in_docker() {
-        let _env = env_lock();
-        unsafe { env::set_var("APP_ENV", "docker") };
-        let config = Config {
-            web_interface: WebInterfaceConfig {
-                address: Ipv4Addr::new(10, 1, 2, 3),
-                port: 8080,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        assert_eq!(
-            web_bind_address(&config),
-            (Ipv4Addr::new(10, 1, 2, 3), 8080)
+    fn sr_cfg_003_the_retired_address_and_port_are_refused() {
+        let path = write_temp_config(
+            "retired-address",
+            &MINIMAL_TOML.replace(
+                "[web_interface]",
+                "[web_interface]\naddress = \"127.0.0.1\"\nport = 8080",
+            ),
         );
-        unsafe { env::remove_var("APP_ENV") };
+        let err = with_env(&[], || load_config(path.to_str().unwrap()).unwrap_err());
+        assert!(err.contains("web_interface.address"), "{err}");
+        assert!(err.contains("web_interface.port"), "{err}");
     }
 
     #[test]
@@ -1477,6 +1463,15 @@ filename = "./data/dynamic.toml"
         assert_eq!(config.service.utxo_refresh_period, 60);
     }
 
+    /// The shipped sample is read by the real loader, so a key it holds that
+    /// no setting reads -- one a later change retires, say -- fails here
+    /// rather than at an operator's first start.
+    #[test]
+    fn sr_cfg_002_the_sample_config_holds_only_keys_settings_read() {
+        let config = with_env(&[], || get_config(DEFAULT_CONFIG_FILE).unwrap());
+        assert_eq!(config.listen_addr, DEFAULT_LISTEN_ADDR);
+    }
+
     #[test]
     fn sr_cfg_007_load_config_validates_telemetry_config() {
         let _env = env_lock();
@@ -1498,9 +1493,7 @@ interface_type = "test"
 network_type = "testnet"
 
 [web_interface]
-address = "127.0.0.1"
 allow_unauthenticated = true  # testnet without keys (CS-514)
-port = 8080
 
 [logging]
 level = "info"
@@ -1530,9 +1523,7 @@ interface_type = "test"
 network_type = "testnet"
 
 [web_interface]
-address = "127.0.0.1"
 allow_unauthenticated = true  # testnet without keys (CS-514)
-port = 8080
 
 [logging]
 level = "info"
