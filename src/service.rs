@@ -1259,6 +1259,39 @@ impl Service {
         self.broadcaster.name() == MAPI_LITE
     }
 
+    /// Whether mapi-lite's nodes are on the chain this service reads (CS-619).
+    ///
+    /// Neither service checks the other's network, so an FS reading testnet
+    /// and a mapi-lite on mainnet -- or two regtest chains -- answered ready
+    /// while every funding failed as missing inputs, which mapi-lite calls
+    /// worth retrying. The wallet already holds the evidence: the oldest
+    /// confirmed UTXO across the clients is a transaction any node on the
+    /// same chain knows, and mapi-lite's nodes keep `-txindex`. Their saying
+    /// they do not know it is the mismatch. With no confirmed UTXO, or no
+    /// answer, there is no evidence either way, and nothing changes.
+    async fn same_chain_as_mapi_lite(&self) -> Result<(), String> {
+        let mut oldest: Option<(String, i32)> = None;
+        for handle in self.client_handles().await {
+            if let Some((txid, height)) = handle.read().await.oldest_confirmed_utxo() {
+                if oldest.as_ref().is_none_or(|(_, h)| height < *h) {
+                    oldest = Some((txid, height));
+                }
+            }
+        }
+        let Some((txid, height)) = oldest else {
+            return Ok(());
+        };
+        match self.broadcaster.knows_tx(&txid).await {
+            Some(false) => Err(format!(
+                "mapi-lite's nodes do not know transaction {txid}, which the blockchain \
+                 interface reports confirmed at height {height} in a client's wallet: mapi-lite \
+                 is on a different chain, and every funding through it would be refused as \
+                 missing inputs. Check network_type here against mapi-lite's nodes"
+            )),
+            _ => Ok(()),
+        }
+    }
+
     /// Probe mapi-lite for `GET /ready`, reusing a recent verdict.
     ///
     /// `None` when mapi-lite is not configured: there is then nothing to
@@ -1286,11 +1319,16 @@ impl Service {
             }
         }
 
-        let verdict = self
-            .broadcaster
-            .health_check()
-            .await
-            .map_err(|e| e.to_string());
+        // At the same time, not one after the other: each is bounded by
+        // health_timeout, which the whole probe has to fit inside.
+        let (health, same_chain) = tokio::join!(
+            self.broadcaster.health_check(),
+            self.same_chain_as_mapi_lite()
+        );
+        let verdict = match health {
+            Ok(()) => same_chain,
+            Err(e) => Err(e.to_string()),
+        };
         *cached = Some(CachedHealth {
             taken_at: Instant::now(),
             verdict: verdict.clone(),
@@ -3180,6 +3218,102 @@ mod tests {
             matches!(probe, Some(Err(ref detail)) if detail.contains("503")),
             "{probe:?}"
         );
+    }
+
+    /// CS-619: mapi-lite's nodes not knowing the wallet's oldest confirmed
+    /// transaction is a different chain, and mapi-lite is not ready; knowing
+    /// it, or giving no answer, changes nothing.
+    #[tokio::test]
+    async fn cs_619_mapi_lite_on_another_chain_is_not_ready() {
+        use crate::test_support::StubMapiBroadcaster;
+
+        let config = test_config(&unique_dynamic_config_path());
+        for (knows, ready) in [(Some(false), false), (Some(true), true), (None, true)] {
+            let blockchain = test_blockchain_interface(&config).await;
+            let service =
+                service_with(&config, blockchain, StubMapiBroadcaster::knowing(knows)).await;
+            match service.mapi_lite_health().await {
+                Some(Ok(())) => assert!(ready, "{knows:?} answered ready"),
+                Some(Err(detail)) => {
+                    assert!(!ready, "{knows:?}: {detail}");
+                    assert!(detail.contains("different chain"), "{detail}");
+                    assert!(detail.contains("network_type"), "{detail}");
+                }
+                None => panic!("mapi-lite is configured"),
+            }
+        }
+    }
+
+    /// CS-619: the chain check runs alongside mapi-lite's `/ready`, not after
+    /// it, so the probe still fits inside one `health_timeout`: with both
+    /// answers taking 1.5s of a 2s timeout it takes about 1.5s, not 3.
+    #[tokio::test]
+    async fn cs_619_the_chain_check_keeps_the_probe_within_one_timeout() {
+        use crate::broadcaster::mapi::MapiBroadcaster;
+        use crate::config::MapiLiteConfig;
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let slow = Duration::from_millis(1_500);
+        Mock::given(method("GET"))
+            .and(path_regex("^/ready$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"ready": true}))
+                    .set_delay(slow),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex("^/query/tx/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(
+                        serde_json::json!({"txid": "x", "known": true, "confirmed": true}),
+                    )
+                    .set_delay(slow),
+            )
+            .mount(&server)
+            .await;
+
+        let config = test_config(&unique_dynamic_config_path());
+        let mapi = MapiLiteConfig::for_base_url(server.uri());
+        assert_eq!(mapi.health_timeout(), Duration::from_secs(2));
+        let broadcaster: Arc<dyn TxBroadcaster> = Arc::new(MapiBroadcaster::new(&mapi).unwrap());
+        let blockchain = test_blockchain_interface(&config).await;
+        let service = service_with(&config, blockchain, broadcaster).await;
+
+        let started = Instant::now();
+        assert_eq!(service.mapi_lite_health().await, Some(Ok(())));
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_millis(2_500),
+            "the probe took {took:?}"
+        );
+    }
+
+    /// CS-619: a wallet holding nothing confirmed offers no evidence, so the
+    /// check passes whatever mapi-lite's nodes would say.
+    #[tokio::test]
+    async fn cs_619_an_empty_wallet_is_no_evidence_of_a_mismatch() {
+        use crate::test_support::{blockchain_listing, StubMapiBroadcaster};
+
+        let config = test_config(&unique_dynamic_config_path());
+        let unconfirmed = chain_gang::interface::UtxoEntry {
+            height: -1,
+            tx_pos: 0,
+            tx_hash: "d".repeat(64),
+            value: 5_000,
+        };
+        let blockchain = blockchain_listing(&config, &[unconfirmed]).await;
+        let service = service_with(
+            &config,
+            blockchain,
+            StubMapiBroadcaster::knowing(Some(false)),
+        )
+        .await;
+        assert_eq!(service.mapi_lite_health().await, Some(Ok(())));
     }
 
     /// `/health` is unauthenticated and rate-limit exempt, so its probe must

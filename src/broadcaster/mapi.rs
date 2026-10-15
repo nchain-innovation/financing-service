@@ -547,6 +547,18 @@ impl TxBroadcaster for MapiBroadcaster {
         }
         Some(satoshis.saturating_mul(1000).div_ceil(*bytes))
     }
+
+    /// `GET /query/tx/{txid}`, which asks mapi-lite's nodes (CS-619). `None`
+    /// on any failure: an unanswered question is not evidence of anything.
+    async fn knows_tx(&self, txid: &str) -> Option<bool> {
+        match self.probe.tx_status(txid).await {
+            Ok(status) => Some(status.known),
+            Err(e) => {
+                log::debug!("mapi-lite /query/tx/{txid} failed: {e}");
+                None
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -762,6 +774,37 @@ mod tests {
             }
             other => panic!("expected an unknown outcome, got {other:?}"),
         }
+    }
+
+    /// CS-619: mapi-lite's `/query/tx` says whether its nodes know a
+    /// transaction; a failure says nothing.
+    #[tokio::test]
+    async fn cs_619_knows_tx_asks_mapi_lite_s_nodes() {
+        let server = MockServer::start().await;
+        let (known, unknown) = ("aa".repeat(32), "bb".repeat(32));
+        Mock::given(method("GET"))
+            .and(path(format!("/query/tx/{known}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"txid": known, "known": true, "confirmed": true, "block_height": 120}),
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/query/tx/{unknown}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"txid": unknown, "known": false, "confirmed": false})),
+            )
+            .mount(&server)
+            .await;
+        let broadcaster = broadcaster(&server);
+        assert_eq!(broadcaster.knows_tx(&known).await, Some(true));
+        assert_eq!(broadcaster.knows_tx(&unknown).await, Some(false));
+        assert_eq!(
+            broadcaster.knows_tx(&"cc".repeat(32)).await,
+            None,
+            "a 404 says nothing"
+        );
     }
 
     #[tokio::test]
