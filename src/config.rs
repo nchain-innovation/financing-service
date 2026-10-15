@@ -245,15 +245,6 @@ pub struct FeesConfig {
     /// never underpays and risks a rejection.
     #[serde(default = "default_satoshis_per_kb")]
     pub satoshis_per_kb: u64,
-    /// When `[mapi_lite]` is configured, take the rate from its `feeQuote`
-    /// instead of `satoshis_per_kb`, so one server sets the rate for every
-    /// service that broadcasts through it.
-    ///
-    /// `satoshis_per_kb` stays the fallback: it is used before the first quote
-    /// arrives, and whenever a refresh fails. Without `[mapi_lite]` this has
-    /// no effect, because there is nothing to ask.
-    #[serde(default = "default_use_mapi_fee_quote")]
-    pub use_mapi_fee_quote: bool,
     /// The highest rate a mapi-lite fee quote may set, in satoshis per KB
     /// (CS-523, SR-SEC-020). A quote above it is ignored and the current rate
     /// kept, so a forged or mistaken quote cannot make every funding
@@ -268,7 +259,6 @@ impl Default for FeesConfig {
     fn default() -> Self {
         FeesConfig {
             satoshis_per_kb: default_satoshis_per_kb(),
-            use_mapi_fee_quote: default_use_mapi_fee_quote(),
             max_satoshis_per_kb: default_max_satoshis_per_kb(),
         }
     }
@@ -310,10 +300,6 @@ fn default_max_satoshis_per_kb() -> u64 {
 
 fn default_satoshis_per_kb() -> u64 {
     DEFAULT_SATOSHIS_PER_KB
-}
-
-fn default_use_mapi_fee_quote() -> bool {
-    true
 }
 
 impl Default for IdempotencyConfig {
@@ -1512,10 +1498,6 @@ filename = "./data/dynamic.toml"
         let config: Config = toml::from_str(MINIMAL_TOML).unwrap();
         assert_eq!(config.fees.satoshis_per_kb, DEFAULT_SATOSHIS_PER_KB);
         assert_eq!(config.fees.satoshis_per_kb, 100);
-        assert!(
-            config.fees.use_mapi_fee_quote,
-            "the quote is used by default when there is a mapi-lite to ask"
-        );
         assert!(config.fees.validate().is_ok());
     }
 
@@ -1525,17 +1507,32 @@ filename = "./data/dynamic.toml"
         let only_rate: Config =
             toml::from_str(&format!("{MINIMAL_TOML}\n[fees]\nsatoshis_per_kb = 250\n")).unwrap();
         assert_eq!(only_rate.fees.satoshis_per_kb, 250);
-        assert!(only_rate.fees.use_mapi_fee_quote);
+        assert_eq!(
+            only_rate.fees.max_satoshis_per_kb,
+            DEFAULT_MAX_SATOSHIS_PER_KB
+        );
 
-        let only_flag: Config = toml::from_str(&format!(
-            "{MINIMAL_TOML}\n[fees]\nuse_mapi_fee_quote = false\n"
+        let only_ceiling: Config = toml::from_str(&format!(
+            "{MINIMAL_TOML}\n[fees]\nmax_satoshis_per_kb = 500\n"
         ))
         .unwrap();
-        assert_eq!(only_flag.fees.satoshis_per_kb, DEFAULT_SATOSHIS_PER_KB);
-        assert!(!only_flag.fees.use_mapi_fee_quote);
+        assert_eq!(only_ceiling.fees.satoshis_per_kb, DEFAULT_SATOSHIS_PER_KB);
+        assert_eq!(only_ceiling.fees.max_satoshis_per_kb, 500);
 
         // Those are the only two. The dust threshold is derived from the rate
         // rather than configured, so there is no third key (CS-452).
+    }
+
+    /// With `[mapi_lite]` its fee quote always sets the rate; the switch that
+    /// could turn it off is refused rather than ignored (CS-624).
+    #[test]
+    fn sr_fund_024_use_mapi_fee_quote_is_refused() {
+        let path = write_temp_config(
+            "fee-switch",
+            &format!("{MINIMAL_TOML}\n[fees]\nuse_mapi_fee_quote = false\n"),
+        );
+        let err = with_env(&[], || load_config(path.to_str().unwrap()).unwrap_err());
+        assert!(err.contains("fees.use_mapi_fee_quote"), "{err}");
     }
 
     /// A zero rate builds transactions nothing relays, and the service would
@@ -2031,7 +2028,6 @@ filename = "./data/dynamic.toml"
         let fees = |rate, max| FeesConfig {
             satoshis_per_kb: rate,
             max_satoshis_per_kb: max,
-            ..FeesConfig::default()
         };
         assert!(FeesConfig::default().validate().is_ok());
         assert!(fees(100, 100).validate().is_ok());

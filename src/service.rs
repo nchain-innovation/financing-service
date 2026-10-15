@@ -158,8 +158,6 @@ pub struct Service {
     /// starts at the rate in force rather than the one in the config file,
     /// which a fee quote may have superseded.
     fee_satoshis_per_kb: Mutex<u64>,
-    /// Whether to take the rate from mapi-lite's fee quote when there is one.
-    use_mapi_fee_quote: bool,
     /// `fees.max_satoshis_per_kb`: no quote may set a rate above it (CS-523).
     max_satoshis_per_kb: u64,
     /// Where each client's in-flight funding state is kept across a restart
@@ -399,7 +397,6 @@ impl Service {
             ready_max_chain_read_age: config.service.ready_max_chain_read_age(),
             chain_refresh_locks: std::sync::Mutex::new(HashMap::new()),
             fee_satoshis_per_kb: Mutex::new(config.fees.satoshis_per_kb),
-            use_mapi_fee_quote: config.fees.use_mapi_fee_quote,
             max_satoshis_per_kb: config.fees.max_satoshis_per_kb,
             inflight_state_path,
             inflight_save: Mutex::new(0),
@@ -919,9 +916,6 @@ impl Service {
     /// Any failure leaves the current rate alone, so a mapi-lite that is down
     /// stops the rate changing rather than stopping funding.
     pub async fn refresh_fee_rate(&self) {
-        if !self.use_mapi_fee_quote {
-            return;
-        }
         let Some(rate) = self.broadcaster.fee_satoshis_per_kb().await else {
             return;
         };
@@ -3220,29 +3214,6 @@ mod tests {
             config.fees.satoshis_per_kb,
             "and kept the configured rate when there was no answer"
         );
-    }
-
-    /// Turning the quote off means the configured rate is authoritative, and
-    /// mapi-lite is not asked at all.
-    #[tokio::test]
-    async fn cs_451_the_quote_can_be_turned_off() {
-        use crate::test_support::StubMapiBroadcaster;
-
-        let mut config = test_config(&unique_dynamic_config_path());
-        config.fees.use_mapi_fee_quote = false;
-        config.fees.satoshis_per_kb = 175;
-
-        let blockchain = test_blockchain_interface(&config).await;
-        let broadcaster = StubMapiBroadcaster::quoting(Some(250));
-        let handed: Arc<dyn TxBroadcaster> = broadcaster.clone();
-        let service = service_with(&config, blockchain, handed).await;
-
-        service.refresh_fee_rate().await;
-
-        assert_eq!(broadcaster.quote_count(), 0, "not even asked");
-        assert_eq!(service.fee_satoshis_per_kb().await, 175);
-        let client = service.client_handle(TEST_CLIENT_ID).await.expect("client");
-        assert_eq!(client.read().await.fee_satoshis_per_kb(), 175);
     }
 
     /// A client added after a quote has moved the rate must cost its

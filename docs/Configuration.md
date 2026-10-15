@@ -408,12 +408,10 @@ Optional. Sets the fee the service pays on the funding transactions it builds. B
 ```toml
 [fees]
 satoshis_per_kb = 100
-use_mapi_fee_quote = true
 # max_satoshis_per_kb = 1000
 ```
 
 * `satoshis_per_kb` — the rate, in satoshis per kilobyte. The fee for a transaction is `ceil(tx_bytes * satoshis_per_kb / 1000)`, rounded **up** so that rounding never underpays. `tx_bytes` is the transaction's serialised size, counted as an upper bound: every output is its 8-byte value, its script's length prefix and the script, and every input is costed at the longest a signature can be. So a transaction never pays less than the rate on the bytes it actually has — until CS-471 each funded output was counted as its script alone, nine bytes short, and an ordinary transaction paid about 97 sat/KB at a configured 100. Must be greater than zero; the service refuses to start otherwise, because a transaction paying no fee is not relayed. Default `100`.
-* `use_mapi_fee_quote` — when `[mapi_lite]` is configured, take the rate from its `feeQuote` rather than from `satoshis_per_kb`. Default `true`. Without `[mapi_lite]` it has no effect, because there is nothing to ask.
 * `max_satoshis_per_kb` — the highest rate a fee quote may set (CS-523, SR-SEC-020). A quote above it is ignored, with a warning, and the current rate kept. It is not clamped: a rate that high is forged or a mistake. Default `1000`, which is ten times the default `satoshis_per_kb` and a thousand times mapi-lite's own default quote. Must be at least `satoshis_per_kb`.
 
 ### Dust change goes to the fee
@@ -457,9 +455,11 @@ The lower fee also changes which UTXOs get spent. A cheaper transaction can be f
 
 ### Taking the rate from mapi-lite
 
-With `[mapi_lite]` configured and `use_mapi_fee_quote` left at `true`, the service reads the **standard** mining fee from mapi-lite's `feeQuote` and converts it to satoshis per kilobyte, rounding up. One server then sets the rate for every service broadcasting through it, rather than each keeping its own number.
+With `[mapi_lite]` configured, the service reads the **standard** mining fee from mapi-lite's `feeQuote` and converts it to satoshis per kilobyte, rounding up. One server then sets the rate for every service broadcasting through it, rather than each keeping its own number.
 
 `satoshis_per_kb` remains the fallback. It is used before the first quote arrives, and whenever a refresh fails — a quote that cannot be fetched, names no fee, or gives a zero rate leaves the rate in force untouched. A mapi-lite that is down therefore stops the rate *changing* rather than stopping funding.
+
+There is no longer a switch to turn the quote off: `use_mapi_fee_quote` is refused (CS-624). To pin the rate, have mapi-lite quote it; `max_satoshis_per_kb` bounds what any quote can set.
 
 The quote is refreshed on the same sweep that refreshes balances (`service.utxo_refresh_period`), not on the funding path, so costing a transaction never waits on a request to mapi-lite. The rate can therefore be up to one sweep out of date.
 
