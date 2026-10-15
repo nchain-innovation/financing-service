@@ -15,7 +15,11 @@ chrono = "0.4.45"
 hex = "0.4.3"
 async-trait = "0.1.92"
 chain-gang = { version = "0.13.0", features = ["interface"] }
-log = { version = "0.4.34", features = ["max_level_trace", "release_max_level_warn"] }
+# No `max_level_*` or `release_max_level_*` features: Cargo merges them across
+# the dependency graph, and `release_max_level_warn` compiled every level below
+# `warn` out of the release build the Docker image runs, whatever the configured
+# level. chain-gang set it too until 0.13.1, so the bump above is part of this.
+log = "0.4.34"
 opentelemetry = { version = "0.32", features = ["trace", "metrics"] }
 opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic", "trace", "metrics"] }
 opentelemetry_sdk = { version = "0.32", features = ["trace", "metrics", "rt-tokio"] }
