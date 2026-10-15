@@ -51,6 +51,12 @@ pub enum BroadcastError {
     /// transaction that may have left may have spent its inputs, and the
     /// service must not offer those inputs to the next funding request.
     Indeterminate(String),
+    /// Not sent: the upstream signs with a key `[mapi_lite]
+    /// miner_id_public_keys` does not list, so its answer could not be
+    /// believed and a broadcast could only end in an unknown outcome
+    /// (CS-618). Nothing reached the network; an operator has to fix the key
+    /// list or mapi-lite's key.
+    Untrusted(String),
 }
 
 impl BroadcastError {
@@ -84,6 +90,7 @@ impl std::fmt::Display for BroadcastError {
             BroadcastError::Indeterminate(detail) => {
                 write!(f, "outcome unknown: {detail}")
             }
+            BroadcastError::Untrusted(detail) => write!(f, "not sent: {detail}"),
         }
     }
 }

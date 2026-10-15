@@ -505,6 +505,18 @@ impl TxBroadcaster for MapiBroadcaster {
         };
         let expected = tx.hash().encode();
 
+        // Refused before anything is sent while mapi-lite signs with an
+        // unlisted key (CS-618): its answer could not be believed, so the
+        // transaction would land and this service would report an unknown
+        // outcome and hold the inputs for the record's TTL, on every request.
+        // The verdict is checked afresh first, so a mapi-lite that has gone
+        // back to a listed key is used again at once.
+        if self.pins_miner_ids && self.untrusted_signer().is_some() {
+            if let Err(BroadcastError::Upstream(detail)) = self.check_signer().await {
+                return Err(BroadcastError::Untrusted(detail));
+            }
+        }
+
         let started = Instant::now();
         let mut attempt: u32 = 0;
         // Set the moment an attempt might have reached the server: a request
@@ -850,14 +862,17 @@ mod tests {
             .mount(&server)
             .await;
 
+        // The submit first: once any answer has shown the key untrusted, a
+        // submit is not sent at all (CS-618, below). Before anything is known,
+        // one is, and its answer cannot be believed.
         let broadcaster = pinned_to(&server, OTHER_MINER_ID);
-        assert_eq!(broadcaster.fee_satoshis_per_kb().await, None);
         match broadcaster.broadcast_tx(&tx).await {
             Err(BroadcastError::Indeterminate(detail)) => {
                 assert!(detail.contains("not a trusted miner ID"), "{detail}")
             }
             other => panic!("expected an unknown outcome, got {other:?}"),
         }
+        assert_eq!(broadcaster.fee_satoshis_per_kb().await, None);
     }
 
     /// CS-618: an answer signed by an unlisted key marks the key untrusted,
@@ -966,6 +981,64 @@ mod tests {
             took < Duration::from_millis(2_500),
             "the probe took {took:?}"
         );
+    }
+
+    /// CS-618: once mapi-lite is known to sign with an unlisted key, a
+    /// broadcast is refused before anything is sent -- after checking again,
+    /// so the refusal is never on a stale verdict.
+    #[tokio::test]
+    async fn cs_618_an_untrusted_mapi_lite_is_not_sent_the_transaction() {
+        let server = MockServer::start().await;
+        let tx = sample_tx();
+        Mock::given(method("GET"))
+            .and(path("/mapi/feeQuote"))
+            .respond_with(ok(fee_quote_payload()))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/mapi/txs"))
+            .respond_with(ok(txs_payload(success(&tx.hash().encode(), ""))))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let broadcaster = pinned_to(&server, OTHER_MINER_ID);
+        broadcaster.fee_satoshis_per_kb().await;
+        match broadcaster.broadcast_tx(&tx).await {
+            Err(BroadcastError::Untrusted(detail)) => {
+                assert!(detail.contains("miner_id_public_keys"), "{detail}")
+            }
+            other => panic!("expected a refusal before sending, got {other:?}"),
+        }
+    }
+
+    /// CS-618: a verdict that has gone stale -- mapi-lite signs with a listed
+    /// key again -- is cleared by the re-check, and the transaction is sent.
+    #[tokio::test]
+    async fn cs_618_a_stale_untrusted_verdict_does_not_block_a_broadcast() {
+        let server = MockServer::start().await;
+        let tx = sample_tx();
+        Mock::given(method("GET"))
+            .and(path("/mapi/feeQuote"))
+            .respond_with(ok(fee_quote_payload()))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/mapi/txs"))
+            .respond_with(ok(txs_payload(success(&tx.hash().encode(), ""))))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let broadcaster = pinned_to(&server, MOCK_MINER_ID);
+        broadcaster.note_signature(Some(&ClientError::UntrustedSigner {
+            public_key: OTHER_MINER_ID.to_string(),
+        }));
+        broadcaster
+            .broadcast_tx(&tx)
+            .await
+            .expect("sent and accepted");
+        assert_eq!(broadcaster.untrusted_signer(), None);
     }
 
     /// With no miner IDs pinned, any key verifies: nothing is ever untrusted.
