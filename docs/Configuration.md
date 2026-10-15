@@ -155,7 +155,6 @@ It bounds a whole call, and WhatsOnChain's UTXO listing is one call made of seve
 Most keys have defaults, and most sections can be left out. These cannot, and the service refuses to start without them:
 
 * `blockchain_interface.interface_type` and `blockchain_interface.network_type`
-* `logging.level`
 * `service.utxo_refresh_period`
 * `dynamic_config.filename`
 
@@ -232,22 +231,11 @@ When enabled, excess requests receive HTTP 429 with a JSON error body. `/health`
 
 Behind a reverse proxy, list the proxy in `trusted_proxies`; otherwise every caller arrives from the proxy's address and shares one limit. A request from a trusted proxy is limited by the client address it reports in `X-Forwarded-For`: the right-most entry that is not itself a trusted proxy, since entries further left were supplied by the client and could say anything. From any other address the header is ignored, so a caller cannot choose its own key by sending one.
 
-## [logging]
+## Logging
 
-Configures the log level for the service.
+The log level is set by `RUST_LOG`, as it is for Event and mapi-lite (CS-624): `RUST_LOG=debug`, or per module, `RUST_LOG=info,financing_service=debug`. Unset or empty, it is `info`. The levels are `error`, `warn`, `info`, `debug` and `trace`.
 
-```toml
-[logging]
-level = "info"
-```
-
-The logging level can be one of:
-
-* `error` — very serious errors
-* `warn` or `warning` — hazardous situations
-* `info` or `information` — useful information
-* `debug` — detailed information
-* `trace` — very verbose information
+A `RUST_LOG` that does not parse stops startup, naming it. The `[logging]` section is no longer read and is refused: delete it, and set `RUST_LOG` instead of `level`.
 
 Every funding broadcast is logged before it is sent and again with its outcome, each line naming the transaction as `funding tx <txid>`:
 

@@ -158,7 +158,7 @@ cargo run 2>&1 | tee fs.log
 
 **A release build logs only `warn` and above.**
 
-`[logging] level = "info"` is enough for the techniques below. At a few
+`RUST_LOG=info` is enough for the techniques below. At a few
 hundred failures a second this file grows quickly, so send it to disk rather
 than a terminal.
 

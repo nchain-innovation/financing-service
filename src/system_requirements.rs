@@ -37,7 +37,19 @@ mod tests {
     #[test]
     fn sr_nfr_007_main_returns_error_instead_of_panicking_on_config_failure() {
         let source = include_str!("main.rs");
-        assert!(source.contains("load_config(&config_file()).map_err("));
+        assert!(source.contains("load_config(&config_path).map_err("));
+    }
+
+    /// A warning logged before the subscriber is installed goes nowhere, so
+    /// the plaintext-secret warning waits for it.
+    #[test]
+    fn sr_cfg_006_configuration_warnings_follow_logging_setup() {
+        let source = include_str!("main.rs");
+        let init = source.find("telemetry::init(").expect("telemetry::init");
+        let warn = source
+            .find("warn_plaintext_secrets(&file)")
+            .expect("the warning");
+        assert!(init < warn);
     }
 
     /// The line an operator reads to learn where funding transactions go.

@@ -42,8 +42,7 @@ network_type = "testnet"
 # Proxies whose X-Forwarded-For is believed when limiting by client address.
 # trusted_proxies = ["10.0.0.1"]
 
-[logging]
-level = "info"
+# The log level is RUST_LOG's (default "info"), as for Event and mapi-lite.
 
 # [telemetry]
 # enabled = true

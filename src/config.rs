@@ -4,7 +4,7 @@ use chain_gang::network::Network;
 use log::debug;
 use serde::{Deserialize, Serialize};
 
-use crate::secrets::{resolve_secret, warn_plaintext_secrets};
+use crate::secrets::resolve_secret;
 
 /// Blockchain Interface Configuration
 #[derive(Debug, Deserialize, Clone)]
@@ -148,11 +148,6 @@ pub struct ClientConfig {
     /// When set, required for this client's API endpoints.
     #[serde(default)]
     pub api_key: Option<String>,
-}
-
-#[derive(Debug, Default, Deserialize, Clone)]
-pub struct LoggingConfig {
-    pub level: String,
 }
 
 /// OpenTelemetry trace export configuration.
@@ -727,7 +722,6 @@ pub struct Config {
     pub blockchain_interface: BlockchainInterfaceConfig,
     #[serde(default)]
     pub web_interface: WebInterfaceConfig,
-    pub logging: LoggingConfig,
     #[serde(default)]
     pub telemetry: TelemetryConfig,
     pub service: ServiceConfig,
@@ -834,18 +828,6 @@ impl Config {
         }
     }
 
-    // Return the log level (as a log::Level type) from the config
-    pub fn get_log_level(&self) -> Result<log::Level, String> {
-        match self.logging.level.as_str() {
-            "error" => Ok(log::Level::Error),
-            "warn" | "warning" => Ok(log::Level::Warn),
-            "info" | "information" => Ok(log::Level::Info),
-            "debug" => Ok(log::Level::Debug),
-            "trace" => Ok(log::Level::Trace),
-            other => Err(format!("Unknown log level '{other}'")),
-        }
-    }
-
     /// Resolve `env:VAR_NAME` references in the secret fields.
     ///
     /// The named overrides that used to take precedence here --
@@ -943,11 +925,15 @@ pub fn load_config(path: &str) -> Result<Config, String> {
     if let Some(mapi_lite) = &config.mapi_lite {
         mapi_lite.validate()?;
     }
-    // Only what the file itself holds is warned about: a secret set by an
-    // FS__ override is the environment already, which is what the warning
-    // asks for.
-    warn_plaintext_secrets(&read_layers(path, false)?);
     config.resolve_secrets()
+}
+
+/// The configuration in `path` alone, without `FS__` overrides: what the
+/// plaintext-secret warning reads, since a secret an override supplies is in
+/// the environment already, which is what the warning asks for. `main` warns
+/// once logging is up; a warning issued while loading would go nowhere.
+pub fn file_only(path: &str) -> Result<Config, String> {
+    read_layers(path, false)
 }
 
 /// The configuration in `path` with `FS__` overrides applied, before
@@ -1064,9 +1050,6 @@ network_type = "testnet"
 
 [web_interface]
 allow_unauthenticated = true  # testnet without keys (CS-514)
-
-[logging]
-level = "info"
 
 [service]
 utxo_refresh_period = 45
@@ -1245,23 +1228,16 @@ filename = "./data/dynamic.toml"
         assert!(err.contains("web_interface.port"), "{err}");
     }
 
+    /// The level is `RUST_LOG`'s, as in Event and mapi-lite; a `[logging]`
+    /// section is refused rather than silently ignored (CS-624).
     #[test]
-    fn sr_cfg_006_get_log_level_accepts_configured_levels() {
-        for (level, expected) in [
-            ("error", log::Level::Error),
-            ("warn", log::Level::Warn),
-            ("info", log::Level::Info),
-            ("debug", log::Level::Debug),
-            ("trace", log::Level::Trace),
-        ] {
-            let config = Config {
-                logging: LoggingConfig {
-                    level: level.to_string(),
-                },
-                ..Default::default()
-            };
-            assert_eq!(config.get_log_level().unwrap(), expected);
-        }
+    fn sr_cfg_006_a_logging_section_is_refused() {
+        let path = write_temp_config(
+            "logging",
+            &format!("{MINIMAL_TOML}\n[logging]\nlevel = \"debug\"\n"),
+        );
+        let err = with_env(&[], || load_config(path.to_str().unwrap()).unwrap_err());
+        assert!(err.contains("no setting reads: logging"), "{err}");
     }
 
     #[test]
@@ -1495,9 +1471,6 @@ network_type = "testnet"
 [web_interface]
 allow_unauthenticated = true  # testnet without keys (CS-514)
 
-[logging]
-level = "info"
-
 [telemetry]
 enabled = true
 otlp_endpoint = ""
@@ -1524,9 +1497,6 @@ network_type = "testnet"
 
 [web_interface]
 allow_unauthenticated = true  # testnet without keys (CS-514)
-
-[logging]
-level = "info"
 
 [service]
 utxo_refresh_period = 60
