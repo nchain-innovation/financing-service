@@ -5,7 +5,7 @@ network_type = "testnet"
 # client's address into the node's wallet so their balances are visible.
 # interface_type = "rpc"
 # network_type = "regtest"
-# url = "127.0.0.1:18443"
+# url = "127.0.0.1:18332"   # bitcoin-sv's regtest RPC port (Bitcoin Core's is 18443)
 # rpc_user = "rpcuser"
 # rpc_password = "env:FS_RPC_PASSWORD"
 # rpc_import_addresses = true
@@ -13,10 +13,14 @@ network_type = "testnet"
 # woc, which documents "up to 3 requests/sec is free" and answers 429 above it;
 # unset for rpc and uaas, which are your own servers. 0 turns it off.
 # max_requests_per_second = 3
+# Deadline on each call to the interface, in seconds; 0 turns it off.
+# timeout_seconds = 30
 # url = "http://localhost:5010"
 
 [web_interface]
 address = "127.0.0.1"
+# mapi-lite defaults to 8080 too: running both on one host, move this one.
+# Event's regtest config expects 8081. The Docker image keeps 8080.
 port = 8080
 # Shared secret required on POST /client. On mainnet and testnet the service
 # will not start without one, and every client needs an api_key (CS-514);
@@ -29,6 +33,8 @@ port = 8080
 # enabled = true
 # requests_per_second = 10
 # burst_size = 20
+# Proxies whose X-Forwarded-For is believed when limiting by client address.
+# trusted_proxies = ["10.0.0.1"]
 
 [logging]
 level = "info"
@@ -61,6 +67,8 @@ filename = "./data/dynamic.toml"
 # POST /client stores env:VAR references only; a raw wif is refused unless this
 # is set, since the file would then hold the key itself. Development only.
 # allow_plaintext_wif = false
+# The env vars a runtime client's wif_env may name must start with this (CS-521).
+# wif_env_prefix = "FS_RUNTIME_WIF_"
 
 # [[client]]
 # client_id = "id1"
@@ -84,6 +92,9 @@ filename = "./data/dynamic.toml"
 # health_timeout_seconds = 2
 # max_retries = 2
 # total_timeout_seconds = 45
+# mapi-lite's miner-ID public key(s), hex. Set this: left empty, a response
+# signed by any key is believed (CS-523).
+# miner_id_public_keys = ["02..."]
 
 # The fee the service pays on the transactions it builds. Optional; these are
 # the defaults.
@@ -110,6 +121,8 @@ filename = "./data/dynamic.toml"
 # [fees]
 # satoshis_per_kb = 100
 # use_mapi_fee_quote = true
+# A quoted rate above this is ignored, not clamped (CS-523).
+# max_satoshis_per_kb = 1000
 
 # Per-client caps on what POST /fund pays out (satoshi x no_of_outpoints).
 # Off unless set; see docs/Configuration.md.
