@@ -37,9 +37,10 @@ actix-governor = "0.10.0"
 # See docs/Dependencies.md before changing it.
 uls-client = { git = "ssh://git@github.com/nchain-innovation/mapi-lite.git", rev = "e360a2a71b5b5b902e955dd6aa714e20adfdd79c" }
 uls-core = { git = "ssh://git@github.com/nchain-innovation/mapi-lite.git", rev = "e360a2a71b5b5b902e955dd6aa714e20adfdd79c" }
-# Only to build the timeout-bearing HTTP clients handed to uls-client, which
-# has no timeout setting of its own. Same major.minor as mapi-lite's so one
-# reqwest resolves; its TLS backend is whatever uls-client enables.
+# For the HTTP client the mapi-lite chain reader (mapi_lite_interface) hands
+# uls-client; the broadcaster uses uls-client's own timeouts (v0.5.0). Same
+# major.minor as mapi-lite's so one reqwest resolves; its TLS backend is
+# whatever uls-client enables.
 reqwest = { version = "0.13", default-features = false }
 
 [dev-dependencies]
