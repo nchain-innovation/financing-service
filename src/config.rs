@@ -865,6 +865,29 @@ impl Config {
         }
     }
 
+    /// The startup warning for a deployment with two WhatsOnChain clients
+    /// (CS-635), or `None`. With `[mapi_lite]` and `interface_type = "woc"` on
+    /// mainnet or testnet, this service reads WhatsOnChain itself, and so does
+    /// mapi-lite when its `[woc]` is on: each paces for WhatsOnChain's free 3
+    /// requests a second, so together they can exceed it. Not refused, since
+    /// this service cannot tell whether mapi-lite's `[woc]` is on.
+    pub fn shared_woc_budget_warning(&self) -> Option<String> {
+        let shared = self.mapi_lite.is_some()
+            && self.blockchain_interface.interface_type == "woc"
+            && self.is_production_network();
+        shared.then(|| {
+            format!(
+                "blockchain_interface.interface_type = \"woc\" with [mapi_lite] on {}: this \
+                 service reads WhatsOnChain itself, and so does mapi-lite when its [woc] is on, \
+                 each pacing for WhatsOnChain's free 3 requests a second, which the two can \
+                 exceed between them (HTTP 429). Set interface_type = \"mapi_lite\" so mapi-lite \
+                 makes every WhatsOnChain request; keep \"woc\" only if mapi-lite runs without \
+                 [woc].",
+                self.blockchain_interface.network
+            )
+        })
+    }
+
     pub fn get_network(&self) -> Result<Network, &str> {
         match self.blockchain_interface.network.as_str() {
             "mainnet" => Ok(Network::BSV_Mainnet),
@@ -1391,6 +1414,44 @@ filename = "./data/dynamic.toml"
                 .validate()
                 .expect_err("expected validation to fail");
             assert!(error.contains(expected), "should name {expected}: {error}");
+        }
+    }
+
+    /// CS-635: reading WhatsOnChain here while broadcasting through mapi-lite
+    /// on mainnet or testnet is warned about, naming the fix; reading through
+    /// mapi-lite, no `[mapi_lite]`, or a private network is not.
+    #[test]
+    fn sr_bchn_022_two_whatsonchain_clients_are_warned_about() {
+        let config = |interface_type: &str, network: &str, mapi_lite: bool| Config {
+            blockchain_interface: BlockchainInterfaceConfig {
+                interface_type: interface_type.to_string(),
+                network: network.to_string(),
+                ..Default::default()
+            },
+            mapi_lite: mapi_lite.then(|| MapiLiteConfig::for_base_url("http://mapi:8080")),
+            ..Default::default()
+        };
+        for network in ["mainnet", "testnet"] {
+            let warning = config("woc", network, true)
+                .shared_woc_budget_warning()
+                .expect(network);
+            assert!(warning.contains(&format!("on {network}")), "{warning}");
+            assert!(
+                warning.contains("interface_type = \"mapi_lite\""),
+                "{warning}"
+            );
+        }
+        for (interface_type, network, mapi_lite) in [
+            ("mapi_lite", "testnet", true),
+            ("woc", "testnet", false),
+            ("woc", "stn", true),
+            ("rpc", "mainnet", true),
+        ] {
+            assert_eq!(
+                config(interface_type, network, mapi_lite).shared_woc_budget_warning(),
+                None,
+                "{interface_type} on {network}, [mapi_lite] {mapi_lite}"
+            );
         }
     }
 

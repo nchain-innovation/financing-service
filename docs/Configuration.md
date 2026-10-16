@@ -14,7 +14,7 @@ Configures the blockchain interface. Supported `interface_type` values: `woc`, `
 
 ```toml
 [blockchain_interface]
-interface_type = "woc"
+interface_type = "mapi_lite"             # reads through [mapi_lite]; see below
 network = "testnet"
 # url = "http://localhost:5010"  # required for uaas, and for rpc (host:port)
 # rpc_user = "rpcuser"                    # required for rpc
@@ -54,6 +54,8 @@ base_url = "http://127.0.0.1:8080"
 ```
 
 Reads each client's UTXO set and balance through the `[mapi_lite]` server's `/query/address/*` endpoints, with the same `base_url`, `auth_token` and `miner_id_public_keys` as broadcasts (CS-601, SR-BCHN-019). mapi-lite then makes every WhatsOnChain request for the deployment, paced by its one limit (`[woc] max_requests_per_second` there) against WhatsOnChain's one quota. With `woc` here as well, this service and mapi-lite each pace their own requests against that same quota and can exceed it between them.
+
+**This is the interface for mainnet and testnet** (CS-635), and the sample config uses it. With `[mapi_lite]` and `interface_type = "woc"` on mainnet or testnet, startup warns, naming the shared quota and this interface as the fix (SR-BCHN-022). It is a warning, not a refusal: this service cannot tell whether mapi-lite's `[woc]` is on, and with it off, `woc` here is the only WhatsOnChain client. Neither service sends a WhatsOnChain API key, so both are on the free quota.
 
 * Needs a `[mapi_lite]` section, and mapi-lite needs `[woc]` configured: without it mapi-lite answers address reads with `503`, which this service reports as `chain_unavailable`, never as an empty wallet.
 * mainnet and testnet only, since mapi-lite answers these reads from WhatsOnChain. Startup refuses `regtest` and `stn`; use `rpc` for a private chain.
