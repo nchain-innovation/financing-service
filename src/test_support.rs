@@ -81,7 +81,7 @@ pub fn test_config_with_keys(
     Config {
         blockchain_interface: BlockchainInterfaceConfig {
             interface_type: "test".to_string(),
-            network_type: "testnet".to_string(),
+            network: "testnet".to_string(),
             ..Default::default()
         },
         web_interface: crate::config::WebInterfaceConfig {

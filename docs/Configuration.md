@@ -15,7 +15,7 @@ Configures the blockchain interface. Supported `interface_type` values: `woc`, `
 ```toml
 [blockchain_interface]
 interface_type = "woc"
-network_type = "testnet"
+network = "testnet"
 # url = "http://localhost:5010"  # required for uaas, and for rpc (host:port)
 # rpc_user = "rpcuser"                    # required for rpc
 # rpc_password = "env:FS_RPC_PASSWORD"    # required for rpc
@@ -24,7 +24,7 @@ network_type = "testnet"
 # timeout_seconds = 30                    # deadline on each interface call; 0 turns it off
 ```
 
-Supported `network_type` values: `mainnet`, `testnet`, `stn`, `regtest`.
+`network` is one of `mainnet`, `testnet`, `regtest` or `stn`, spelt exactly so: they are the names mapi-lite publishes for its nodes' chain, and Event's. Any other spelling stops startup; one that means the same network (`main`, `livenet`, `test`, `Mainnet`, …) is refused naming the one to write. It was `network_type` until CS-624, and that key is now refused.
 
 ### Which interface reaches which network
 
@@ -47,7 +47,7 @@ The interface serves both chain *reads* (balances, UTXOs) and, by default, the *
 ```toml
 [blockchain_interface]
 interface_type = "mapi_lite"
-network_type = "testnet"
+network = "testnet"
 
 [mapi_lite]
 base_url = "http://127.0.0.1:8080"
@@ -65,7 +65,7 @@ Reads each client's UTXO set and balance through the `[mapi_lite]` server's `/qu
 ```toml
 [blockchain_interface]
 interface_type = "rpc"
-network_type = "regtest"
+network = "regtest"
 url = "127.0.0.1:18332"   # bitcoin-sv's regtest RPC port; Bitcoin Core's is 18443
 rpc_user = "rpcuser"
 rpc_password = "env:FS_RPC_PASSWORD"
@@ -136,7 +136,7 @@ Note that `GET /health` stays `ok` throughout: it is a liveness check and delibe
 
 **An unreachable blockchain interface at startup is a warning, not a fatal error** (CS-505). It used to stop the service — on a single WhatsOnChain 429 — and the restart that followed met the same rate limit. Now the service starts degraded, logs `Unable to reach the blockchain interface at startup`, and `GET /ready` answers 503 until the first chain read succeeds; `/health` and `/status` serve throughout.
 
-**`test` is a fixture, not a backend.** It is an in-process stub used by the unit tests, with a UTXO set injected directly by the test harness. It has no network of its own, so the `network_type` you set alongside it only affects address encoding. It will start and serve requests as a configured backend, but its UTXO set is empty, so balances read zero and funding is refused — useful for exercising the API surface, not for funding anything.
+**`test` is a fixture, not a backend.** It is an in-process stub used by the unit tests, with a UTXO set injected directly by the test harness. It has no network of its own, so the `network` you set alongside it only affects address encoding. It will start and serve requests as a configured backend, but its UTXO set is empty, so balances read zero and funding is refused — useful for exercising the API surface, not for funding anything.
 
 ### Every interface call has a deadline
 
@@ -154,7 +154,7 @@ It bounds a whole call, and WhatsOnChain's UTXO listing is one call made of seve
 
 Most keys have defaults, and most sections can be left out. These cannot, and the service refuses to start without them:
 
-* `blockchain_interface.interface_type` and `blockchain_interface.network_type`
+* `blockchain_interface.interface_type` and `blockchain_interface.network`
 * `service.utxo_refresh_period`
 * `dynamic_config.filename`
 
@@ -196,7 +196,7 @@ When `admin_api_key` is omitted, `POST /client` is unauthenticated. The service 
 
 ### Authentication is required on mainnet and testnet
 
-With `network_type` `mainnet` or `testnet`, the service **refuses to start** (CS-514) when:
+With `network` `mainnet` or `testnet`, the service **refuses to start** (CS-514) when:
 
 * `admin_api_key` is unset — `POST /client` and `DELETE /client` would be open; or
 * any client, static or dynamic, has no `api_key` — its `/fund`, balance and address routes would be open; or
@@ -506,7 +506,7 @@ When the section is present the service:
 * Funds a request from cached chain state that has merely aged, rather than waiting for it to be refreshed through `[blockchain_interface]`, and refreshes it behind the request — see [How often the service reads the chain](#how-often-the-service-reads-the-chain).
 * Submits each funding transaction as a one-element batch to `POST /mapi/txs`, with the merkle proof declined (no callbacks are wanted). A rejection by mapi-lite or the node surfaces to the caller as `broadcast_rejected` (HTTP 409) when the upstream calls it final or names a conflicting transaction, since retrying cannot help, and otherwise as `broadcast_failed` (HTTP 502), as does a mapi-lite `503` (no node can have received it); either way the reason is in the service log. Anything that may have reached the network surfaces as `broadcast_outcome_unknown` (HTTP 504) instead, and the inputs are reserved: an answer that never arrives or cannot be read, a mapi-lite `500`/`502`/`504` (from mapi-lite v0.4.0 a `504` means a node may have received it), and mapi-lite's "accepted by the node but could not be recorded", which is resubmitted first since the resubmission records it (CS-501).
 
-The mapi-lite server must be pointed at the same network as `network_type`, since the funding transactions are signed for that network. Because mapi-lite talks to a node directly, this is also a way to broadcast on regtest while still reading chain state through another interface.
+The mapi-lite server must be pointed at the same network as `network`, since the funding transactions are signed for that network. Because mapi-lite talks to a node directly, this is also a way to broadcast on regtest while still reading chain state through another interface.
 
 Building the service with this integration requires read access to the private `mapi-lite` repository — see [Dependencies.md](Dependencies.md).
 

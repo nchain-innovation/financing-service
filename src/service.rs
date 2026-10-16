@@ -127,7 +127,7 @@ pub struct Service {
     /// `admin_api_key` and every client's `api_key` are required: a
     /// production network without the opt-out (CS-514).
     auth_required: bool,
-    network_type: String,
+    network: String,
     idempotency: Mutex<IdempotencyStore>,
     funding_limits: crate::funding_limits::FundingLimits,
     /// Set only for backends that must be told which addresses to follow.
@@ -384,7 +384,7 @@ impl Service {
                 .filter(|key| !key.is_empty()),
             auth_required: config.is_production_network()
                 && !config.web_interface.allow_unauthenticated,
-            network_type: config.blockchain_interface.network_type.clone(),
+            network: config.blockchain_interface.network.clone(),
             idempotency: Mutex::new(IdempotencyStore::new(
                 config.idempotency.ttl(),
                 config.idempotency.max_entries,
@@ -1269,7 +1269,7 @@ impl Service {
                 "mapi-lite's nodes do not know transaction {txid}, which the blockchain \
                  interface reports confirmed at height {height} in a client's wallet: mapi-lite \
                  is on a different chain, and every funding through it would be refused as \
-                 missing inputs. Check network_type here against mapi-lite's nodes"
+                 missing inputs. Check network here against mapi-lite's nodes"
             )),
             _ => Ok(()),
         }
@@ -1335,7 +1335,7 @@ impl Service {
                  be open on {}. Set it (or FS__WEB_INTERFACE__ADMIN_API_KEY), or set \
                  web_interface.allow_unauthenticated = true if a gateway in front of this service \
                  authenticates callers",
-                self.network_type
+                self.network
             ));
         }
         let mut without = self.clients_without_api_key().await;
@@ -3147,7 +3147,7 @@ mod tests {
 
         let mut config = test_config(&unique_dynamic_config_path());
         config.blockchain_interface.interface_type = "rpc".to_string();
-        config.blockchain_interface.network_type = "regtest".to_string();
+        config.blockchain_interface.network = "regtest".to_string();
         config.blockchain_interface.url = Some(format!("http://127.0.0.1:{port}"));
         config.blockchain_interface.rpc_user = Some("user".to_string());
         config.blockchain_interface.rpc_password = Some("pass".to_string());
@@ -3287,7 +3287,7 @@ mod tests {
                 Some(Err(detail)) => {
                     assert!(!ready, "{knows:?}: {detail}");
                     assert!(detail.contains("different chain"), "{detail}");
-                    assert!(detail.contains("network_type"), "{detail}");
+                    assert!(detail.contains("network"), "{detail}");
                 }
                 None => panic!("mapi-lite is configured"),
             }
@@ -4131,7 +4131,7 @@ mod tests {
         let err = service.check_auth_policy().await.unwrap_err();
         assert!(err.contains("admin_api_key"), "{err}");
 
-        config.blockchain_interface.network_type = "regtest".to_string();
+        config.blockchain_interface.network = "regtest".to_string();
         let blockchain = test_blockchain_interface(&config).await;
         let service = Service::new_for_test(&config, blockchain).await;
         assert!(service.check_auth_policy().await.is_ok());
