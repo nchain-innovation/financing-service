@@ -529,6 +529,11 @@ impl Service {
         // unable to recover on its own. Serving degraded and saying so through
         // GET /ready leaves the operator a service that heals when mapi-lite
         // comes back.
+        //
+        // A network mismatch is the exception (CS-624): it is the
+        // configuration, not mapi-lite being away, and no restart or wait
+        // mends it. When the probe hears which network mapi-lite's nodes are
+        // on and it is not this service's, startup stops.
         let broadcaster = broadcaster_factory(config, Arc::clone(&backend.interface))?;
         if let Some(mapi_lite) = &config.mapi_lite {
             if let Err(e) = broadcaster.health_check().await {
@@ -537,6 +542,12 @@ impl Service {
                      is reachable; GET /ready reports the service unready meanwhile.",
                     mapi_lite.base_url()
                 );
+            }
+            if let Some(why) = network_mismatch(
+                broadcaster.published_network(),
+                &config.blockchain_interface.network,
+            ) {
+                return Err(why);
             }
         }
 
@@ -1308,9 +1319,14 @@ impl Service {
             self.broadcaster.health_check(),
             self.same_chain_as_mapi_lite()
         );
-        let verdict = match health {
-            Ok(()) => same_chain,
-            Err(e) => Err(e.to_string()),
+        // A network mapi-lite publishes that is not this one is reported
+        // first, ready or not: it is the configuration, and the reason
+        // anything else fails (CS-624).
+        let mismatch = network_mismatch(self.broadcaster.published_network(), &self.network);
+        let verdict = match (mismatch, health) {
+            (Some(why), _) => Err(why),
+            (None, Ok(())) => same_chain,
+            (None, Err(e)) => Err(e.to_string()),
         };
         *cached = Some(CachedHealth {
             taken_at: Instant::now(),
@@ -1986,6 +2002,21 @@ fn broadcast_failure_class(code: ErrorCode) -> &'static str {
         ErrorCode::BroadcasterUntrusted => "untrusted",
         _ => "failed",
     }
+}
+
+/// Why mapi-lite cannot fund for this service, when its nodes are on a
+/// network that is not `ours` (CS-624): every funding transaction would be
+/// refused as spending outputs its nodes have never seen. `None` when they
+/// agree, or mapi-lite has not said.
+pub(crate) fn network_mismatch(published: Option<String>, ours: &str) -> Option<String> {
+    let theirs = published?;
+    (theirs != ours).then(|| {
+        format!(
+            "mapi-lite's nodes are on {theirs}, but blockchain_interface.network is {ours}: \
+             every funding through it would be refused as missing inputs. Point one at the \
+             other's network"
+        )
+    })
 }
 
 #[cfg(test)]
@@ -3157,6 +3188,77 @@ mod tests {
             .expect("an unreachable chain no longer stops startup");
         let detail = service.chain_readiness().await.expect_err("not read yet");
         assert!(detail.contains("never been read"), "{detail}");
+    }
+
+    /// CS-624: mapi-lite's published network is checked against this
+    /// service's, and a mismatch makes mapi-lite not ready, naming both.
+    #[tokio::test]
+    async fn cs_624_a_mapi_lite_on_another_network_is_not_ready() {
+        use crate::test_support::StubMapiBroadcaster;
+
+        let config = test_config(&unique_dynamic_config_path());
+        assert_eq!(config.blockchain_interface.network, "testnet");
+        let blockchain = test_blockchain_interface(&config).await;
+        let elsewhere = service_with(
+            &config,
+            Arc::clone(&blockchain),
+            StubMapiBroadcaster::on_network("mainnet"),
+        )
+        .await;
+        let detail = elsewhere
+            .mapi_lite_health()
+            .await
+            .expect("mapi-lite is configured")
+            .expect_err("on another network");
+        assert!(
+            detail.contains("on mainnet") && detail.contains("network is testnet"),
+            "{detail}"
+        );
+
+        let same = service_with(
+            &config,
+            blockchain,
+            StubMapiBroadcaster::on_network("testnet"),
+        )
+        .await;
+        assert_eq!(same.mapi_lite_health().await, Some(Ok(())));
+    }
+
+    /// CS-624: a mapi-lite whose `/ready` names another network stops
+    /// startup, where one that cannot be reached does not (SR-BCHN-018).
+    #[tokio::test]
+    async fn cs_624_a_mapi_lite_on_another_network_stops_startup() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for (chain, starts) in [("mainnet", false), ("testnet", true)] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/ready"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ready": true,
+                    "chain": chain,
+                    "checks": {}
+                })))
+                .mount(&server)
+                .await;
+            let mut config = test_config(&unique_dynamic_config_path());
+            config.mapi_lite = Some(crate::config::MapiLiteConfig::for_base_url(server.uri()));
+            match Service::new(&config).await {
+                Ok(_) => assert!(starts, "started against a mapi-lite on {chain}"),
+                Err(e) => {
+                    assert!(!starts, "{chain}: {e}");
+                    assert!(e.contains("on mainnet") && e.contains("testnet"), "{e}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cs_624_network_mismatch_says_nothing_until_mapi_lite_has_said() {
+        assert_eq!(network_mismatch(None, "testnet"), None);
+        assert_eq!(network_mismatch(Some("testnet".into()), "testnet"), None);
+        assert!(network_mismatch(Some("regtest".into()), "testnet").is_some());
     }
 
     #[tokio::test]
