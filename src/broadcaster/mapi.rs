@@ -37,7 +37,7 @@
 //! client. A funding call is interactive: a wedged mapi-lite must not hold
 //! the caller, and the actix worker serving it, for longer than that.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 use std::time::Duration;
 
@@ -78,7 +78,15 @@ pub struct MapiBroadcaster {
     /// passes (CS-618). An answer from it is never believed, so a broadcast
     /// through it can only end in an unknown outcome.
     untrusted_signer: Mutex<Option<String>>,
+    /// Whether mapi-lite answered the last authenticated probe 401: it
+    /// refuses `mapi_lite.auth_token`, or needs one and none is set (CS-632).
+    token_refused: AtomicBool,
 }
+
+/// Why mapi-lite cannot be used while it refuses the token (CS-632). Names the
+/// setting, never the token.
+const TOKEN_REFUSED: &str = "mapi-lite refuses mapi_lite.auth_token, or needs one and none is set \
+     (401): every funding through it would be refused";
 
 /// Why mapi-lite cannot be used while it signs with `key` (CS-618), for the
 /// log and for the error naming the setting an operator has to change.
@@ -116,6 +124,7 @@ impl MapiBroadcaster {
             chain: Mutex::new(None),
             pins_miner_ids: !config.miner_id_public_keys.is_empty(),
             untrusted_signer: Mutex::new(None),
+            token_refused: AtomicBool::new(false),
         })
     }
 
@@ -160,17 +169,33 @@ impl MapiBroadcaster {
         }))
     }
 
-    /// With miner IDs pinned, whether mapi-lite signs with one of them
-    /// (CS-618). Its `/ready` is unsigned, so on its own it cannot tell: a
-    /// mapi-lite answering ready while signing with an unlisted key had this
-    /// service report ready while every funding through it ended in an unknown
-    /// outcome. The signed fee quote settles it, at no cost to mapi-lite's
-    /// node pool. A quote that cannot be fetched leaves the last verdict.
-    async fn check_signer(&self) -> Result<(), BroadcastError> {
+    /// What mapi-lite's `/ready` cannot say, since it is unauthenticated and
+    /// unsigned, read from the signed fee quote, which is neither, at no cost
+    /// to mapi-lite's node pool:
+    ///
+    /// * **The token** (CS-632). A 401 is a token mapi-lite refuses, or one it
+    ///   needs and was not given; every funding through it would be refused.
+    /// * **The signer**, with miner IDs pinned (CS-618). A mapi-lite answering
+    ///   ready while signing with an unlisted key had this service report
+    ///   ready while every funding through it ended in an unknown outcome.
+    ///
+    /// A quote that cannot be fetched otherwise leaves the last verdicts.
+    async fn check_quote(&self) -> Result<(), BroadcastError> {
+        let quote = self.probe.fee_quote().await;
+        let refused = matches!(quote, Err(ClientError::Status(401)));
+        if self.token_refused.swap(refused, Ordering::Relaxed) != refused {
+            if refused {
+                log::error!("{TOKEN_REFUSED} (CS-632)");
+            } else {
+                log::info!("mapi-lite accepts mapi_lite.auth_token again");
+            }
+        }
+        if refused {
+            return Err(BroadcastError::Upstream(TOKEN_REFUSED.to_string()));
+        }
         if !self.pins_miner_ids {
             return Ok(());
         }
-        let quote = self.probe.fee_quote().await;
         self.note_signature(quote.as_ref().err());
         match self.untrusted_signer() {
             Some(key) => Err(BroadcastError::Upstream(untrusted_signer_detail(&key))),
@@ -365,8 +390,11 @@ impl TxBroadcaster for MapiBroadcaster {
         // The verdict is checked afresh first, so a mapi-lite that has gone
         // back to a listed key is used again at once.
         if self.pins_miner_ids && self.untrusted_signer().is_some() {
-            if let Err(BroadcastError::Upstream(detail)) = self.check_signer().await {
-                return Err(BroadcastError::Untrusted(detail));
+            // Only the signer verdict decides here; a refused token fails the
+            // broadcast on its own, as broadcast_failed.
+            let _ = self.check_quote().await;
+            if let Some(key) = self.untrusted_signer() {
+                return Err(BroadcastError::Untrusted(untrusted_signer_detail(&key)));
             }
         }
 
@@ -428,8 +456,13 @@ impl TxBroadcaster for MapiBroadcaster {
         // Both at once, not one after the other: each is bounded by
         // MAPI_LITE_PROBE_TIMEOUT, and the whole probe has to fit inside one,
         // since readiness probes allow under 3s (CS-618).
-        let (ready, signer) = tokio::join!(self.mapi_lite_ready(), self.check_signer());
-        ready.and(signer)
+        let (ready, quote) = tokio::join!(self.mapi_lite_ready(), self.check_quote());
+        // A refused token is the configuration, and the reason anything else
+        // fails: it comes first.
+        if self.token_refused() {
+            return quote;
+        }
+        ready.and(quote)
     }
 
     /// The standard mining fee from mapi-lite's quote, in satoshis per
@@ -478,6 +511,10 @@ impl TxBroadcaster for MapiBroadcaster {
 
     /// `GET /query/tx/{txid}`, which asks mapi-lite's nodes (CS-619). `None`
     /// on any failure: an unanswered question is not evidence of anything.
+    fn token_refused(&self) -> bool {
+        self.token_refused.load(Ordering::Relaxed)
+    }
+
     fn published_network(&self) -> Option<String> {
         self.chain.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
@@ -1324,6 +1361,8 @@ mod tests {
 
     /// CS-505: the health check asks mapi-lite's own readiness, not the fee
     /// quote -- which mapi-lite serves from configuration with every node down.
+    /// The quote is still fetched, once, for what `/ready` cannot say: whether
+    /// mapi-lite accepts the token (CS-632).
     #[tokio::test]
     async fn sr_bchn_011_mapi_broadcaster_health_check_passes_when_mapi_lite_is_ready() {
         let server = MockServer::start().await;
@@ -1336,11 +1375,50 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/mapi/feeQuote"))
             .respond_with(ok(fee_quote_payload()))
-            .expect(0)
+            .expect(1)
             .mount(&server)
             .await;
 
         broadcaster(&server).health_check().await.expect("healthy");
+    }
+
+    /// CS-632: a fee quote answered 401 is a refused token. The health check
+    /// fails on it, ahead of what `/ready` says, naming the setting and never
+    /// the token, and it is remembered for startup; a quote answered again
+    /// clears it.
+    #[tokio::test]
+    async fn cs_632_a_refused_token_fails_the_health_check() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ready"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ready": true})))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/mapi/feeQuote"))
+            .respond_with(ResponseTemplate::new(401))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/mapi/feeQuote"))
+            .respond_with(ok(fee_quote_payload()))
+            .mount(&server)
+            .await;
+        let mut config = config(&server);
+        config.auth_token = Some("hunter2".to_string());
+        let broadcaster = MapiBroadcaster::new(&config).expect("builds");
+        assert!(!broadcaster.token_refused());
+        let detail = upstream_detail(broadcaster.health_check().await.unwrap_err());
+        assert!(
+            detail.contains("mapi_lite.auth_token") && detail.contains("401"),
+            "{detail}"
+        );
+        assert!(!detail.contains("hunter2"), "{detail}");
+        assert!(broadcaster.token_refused());
+
+        broadcaster.health_check().await.expect("accepted again");
+        assert!(!broadcaster.token_refused());
     }
 
     /// mapi-lite's ceiling, ready or not, is read off `/ready` (CS-510).
