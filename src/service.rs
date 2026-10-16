@@ -329,7 +329,7 @@ impl Service {
         if let Some(clients_config) = &config.client {
             for client_config in clients_config {
                 let resolved = client_config.clone().resolve_secrets()?;
-                let mut client = Client::try_new(&resolved)?;
+                let mut client = Client::try_new(&resolved, &config.blockchain_interface.network)?;
                 client.set_fee_satoshis_per_kb(config.fees.satoshis_per_kb);
                 restore(&client_config.client_id, &mut client);
                 clients.insert(
@@ -347,7 +347,7 @@ impl Service {
                 client_config.api_key.as_deref(),
             );
             let resolved = client_config.clone().resolve_secrets()?;
-            let mut client = Client::try_new(&resolved)?;
+            let mut client = Client::try_new(&resolved, &config.blockchain_interface.network)?;
             client.set_fee_satoshis_per_kb(config.fees.satoshis_per_kb);
             restore(&client_config.client_id, &mut client);
             clients.insert(
@@ -815,7 +815,7 @@ impl Service {
             .clone()
             .resolve_secrets()
             .map_err(|e| CodedError::new(ErrorCode::InvalidRequest, e))?;
-        let mut client = Client::try_new(&resolved)
+        let mut client = Client::try_new(&resolved, &self.network)
             .map_err(|e| CodedError::new(ErrorCode::InvalidRequest, e))?;
         // The rate in force, which a fee quote may have moved on from what the
         // config file says, so a client added now costs its transactions the
@@ -4329,5 +4329,63 @@ mod tests {
                 vec![TEST_CLIENT_ID.to_string(), "twin".to_string()]
             )]
         );
+    }
+
+    /// CS-634: a configured client whose key is for another network than
+    /// `blockchain_interface.network` stops startup, naming it.
+    #[tokio::test]
+    async fn cs_634_a_client_key_for_another_network_stops_startup() {
+        use crate::broadcaster::woc::WocBroadcaster;
+        let mut config = test_config(&unique_dynamic_config_path());
+        config.client.as_mut().unwrap()[0].wif_key =
+            crate::test_support::MAPI_TEST_SIGNER_WIF.to_string();
+        let blockchain = test_blockchain_interface(&config).await;
+        let broadcaster: Arc<dyn TxBroadcaster> = Arc::new(WocBroadcaster::new(
+            Arc::clone(&blockchain),
+            &config.blockchain_interface.interface_type,
+        ));
+        let err = Service::build(
+            &config,
+            Backend {
+                interface: blockchain,
+                address_watcher: None,
+            },
+            broadcaster,
+        )
+        .err()
+        .expect("startup must fail");
+        assert!(err.contains("a mainnet key"), "{err}");
+        assert!(err.contains("network is testnet"), "{err}");
+        assert!(err.contains(TEST_CLIENT_ID), "{err}");
+    }
+
+    /// CS-634: `POST /client` refuses a key for another network as the
+    /// caller's mistake, naming no part of it, and adds nothing.
+    #[tokio::test]
+    async fn cs_634_post_client_refuses_a_key_for_another_network() {
+        let config = test_config(&unique_dynamic_config_path());
+        let blockchain = test_blockchain_interface(&config).await;
+        let service = Service::new_for_test(&config, blockchain).await;
+        let wif = crate::test_support::MAPI_TEST_SIGNER_WIF;
+        let error = service
+            .add_client(&ClientConfig {
+                client_id: "mainnet-key".to_string(),
+                wif_key: wif.to_string(),
+                api_key: Some("k".to_string()),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+        assert!(
+            error.description.contains("a mainnet key"),
+            "{}",
+            error.description
+        );
+        assert!(
+            !error.description.contains(&wif[..8]),
+            "{}",
+            error.description
+        );
+        assert!(!service.clients.read().await.contains_key("mainnet-key"));
     }
 }
