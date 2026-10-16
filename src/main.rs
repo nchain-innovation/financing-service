@@ -30,11 +30,12 @@ mod util;
 mod test_support;
 
 use crate::{
-    config::{load_config, web_bind_address},
+    config::{config_file, file_only, load_config},
     rest_api::{
         add_client, balance, delete_client, get_address, get_funds, health, index, ready, status,
         update_clients, AppState,
     },
+    secrets::warn_plaintext_secrets,
     service::Service,
 };
 
@@ -47,20 +48,20 @@ mod dependency_graph;
 /// Main - Read config and setup Web server.
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let config = load_config("FS_CONFIG", "data/financing-service.toml").map_err(|e| {
+    let config_path = config_file();
+    let config = load_config(&config_path).map_err(|e| {
         eprintln!("Unable to read config: {e}");
         std::io::Error::new(std::io::ErrorKind::InvalidData, e)
     })?;
 
-    let log_level = config.get_log_level().map_err(|e| {
-        eprintln!("Invalid logging configuration: {e}");
-        std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-    })?;
-
-    let telemetry = telemetry::init(&config.telemetry, log_level).map_err(|e| {
+    let telemetry = telemetry::init(&config.telemetry).map_err(|e| {
         eprintln!("Unable to initialise telemetry: {e}");
         std::io::Error::new(std::io::ErrorKind::InvalidData, e)
     })?;
+    // Only now is there a logger to warn through.
+    if let Ok(file) = file_only(&config_path) {
+        warn_plaintext_secrets(&file);
+    }
 
     let service = Service::new(&config).await.map_err(|e| {
         log::error!("Unable to start service: {e}");
@@ -124,7 +125,9 @@ async fn main() -> std::io::Result<()> {
             gauges
         });
     let app_state2 = app_state.clone();
-    let addr = web_bind_address(&config);
+    let addr = config
+        .listen_socket_addr()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
     // Setup periodic task
     let utxo_refresh_period = config.service.utxo_refresh_period;

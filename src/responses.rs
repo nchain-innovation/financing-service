@@ -316,6 +316,10 @@ pub struct StatusResponse {
     /// Where funding transactions are sent: the configured `interface_type`
     /// (`woc` in production) or `mapi-lite`.
     pub broadcaster: String,
+    /// The longest a single-transaction `POST /fund` can take, in seconds,
+    /// so a caller can set its own timeout above it (CS-624); `null` when
+    /// chain reads have no deadline. See [`crate::config::Config::fund_worst_case`].
+    pub fund_worst_case_seconds: Option<u64>,
 }
 
 #[derive(Serialize)]

@@ -49,8 +49,11 @@ USER fs
 # runs it as the invoking user for exactly that reason).
 VOLUME ["/app/bin/data"]
 
-# env var to detect we are in a docker instance
-ENV APP_ENV=docker
+# Listen on every interface: the container's own loopback cannot be reached
+# from outside it. Which host interfaces see the port is set where it is
+# published (run.sh publishes it on the host's loopback). Override it with
+# -e FS__LISTEN_ADDR=... like any other setting (CS-624).
+ENV FS__LISTEN_ADDR=0.0.0.0:8080
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
     CMD curl -f http://127.0.0.1:8080/health || exit 1

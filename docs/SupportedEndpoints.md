@@ -1,6 +1,6 @@
 # Supported endpoints
 
-The service listens on the port configured in `data/financing-service.toml` (`[web_interface] port`, which is required; the sample config and the examples below use `8080`).
+The service listens on `listen_addr` (default `127.0.0.1:8080`; the examples below use port `8080`). See [Configuration](Configuration.md#listen_addr).
 
 When a client has an `api_key` configured, that client's endpoints require authentication via either:
 
@@ -89,11 +89,11 @@ Two checks, and the answer is healthy only if both pass (CS-505):
 
 `/health` is unaffected by that 503 and stays 200, which is the point of the split. Sending a liveness probe to `/ready` puts the restart loop back.
 
-The probe is bounded by `mapi_lite.health_timeout_seconds` (default 2s), which must stay under the few seconds a readiness probe allows before it gives up.
+The probe is bounded at 2s, under the few seconds a readiness probe allows before it gives up.
 
 The `mapi_lite` `detail` is deliberately generic. This endpoint is unauthenticated and exempt from rate limiting, and the underlying transport error names the mapi-lite host and port; the full error — including the names of mapi-lite's failing checks — is written to the service log instead. The `chain` detail names only a client id and an age, which `GET /status` already shows.
 
-The verdict is **cached for `health_timeout_seconds`**, so repeated calls do not each reach mapi-lite. Without that cache an unauthenticated, unmetered endpoint could be used to flood the broadcast path. A readiness probe on a 5s interval therefore reaches mapi-lite at most every 2s.
+The verdict is **cached for 2s**, so repeated calls do not each reach mapi-lite. Without that cache an unauthenticated, unmetered endpoint could be used to flood the broadcast path. A readiness probe on a 5s interval therefore reaches mapi-lite at most every 2s.
 
 Through a 503 here the service keeps running and keeps serving reads (`/status`, balances, UTXOs), which do not depend on mapi-lite, and returns to ready on its own when mapi-lite comes back.
 
@@ -112,7 +112,8 @@ curl http://127.0.0.1:8080/status
     "version": "4.5.0",
     "blockchain_status": "Connected",
     "blockchain_update_time": "2024-11-05 14:42:29",
-    "broadcaster": "woc"
+    "broadcaster": "woc",
+    "fund_worst_case_seconds": 120
 }
 ```
 
@@ -125,6 +126,8 @@ curl http://127.0.0.1:8080/status
 When no update has occurred yet, `blockchain_update_time` is `"None"`.
 
 `broadcaster` names where funding transactions are sent: the configured `interface_type` (`woc`, `uaas`, `rpc`, `test`) or `mapi-lite` when the [`[mapi_lite]`](Configuration.md#mapi_lite) section is present.
+
+`fund_worst_case_seconds` is the longest a single-transaction `POST /fund` can take, so a caller can set its own timeout above it (CS-624): a chain read already running for the client, which the request waits behind, then its own; the broadcast; and the chain read after a commit is refused. Chain reads are bounded by `blockchain_interface.timeout_seconds` (default 30s) and the broadcast by `mapi_lite.total_timeout_seconds` (default 45s), or by one more interface call without `[mapi_lite]`: 135s with mapi-lite at the defaults, 120s without. It is `null` when chain reads have no deadline (`timeout_seconds = 0`). It does not cover requests queued behind a chain read that keeps failing, each of which waits its turn, nor a `multiple_tx` request, which repeats the broadcast and its reads per transaction.
 
 ## Fund transactions
 
@@ -341,7 +344,7 @@ Request body (JSON):
 
 Provide either `wif` or `wif_env`, and either `api_key` or `api_key_env` (not both pairs).
 
-Refused as `invalid_request` (CS-521): a `wif_env` outside the prefix, a `wif` that is an `env:` reference, a key that is already another client's funding key, and a `client_id` that folds onto an existing client's environment variables.
+Refused as `invalid_request` (CS-521): a `wif_env` outside the prefix, a `wif` that is an `env:` reference, and a key that is already another client's funding key.
 
 ```bash
 curl -H "Authorization: Bearer your-admin-api-key" \

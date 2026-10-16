@@ -9,6 +9,11 @@ edition = "2021"
 actix-web = { version = "4.15.0", default-features = false, features = ["macros", "compress-brotli", "compress-gzip", "compress-zstd", "cookies", "unicode", "compat", "ws"] }
 serde = { version = "1.0.229", features =["derive"] }
 toml = "1.1.6"
+# The configuration loader: the TOML file, then FS__ environment overrides
+# (CS-624), as teranode-event-rs (TE__) and mapi-lite (MAPI__) load theirs.
+# serde_ignored names every key no setting reads, which is refused.
+config = "0.15"
+serde_ignored = "0.1"
 serde_json = "1.0.151"
 tokio = { version = "1.53.1", features = ["full"] }
 chrono = "0.4.45"
@@ -36,14 +41,15 @@ actix-governor = "0.10.0"
 # to the system git). They MUST name the same rev, and that rev's chain-gang
 # requirement must be satisfiable by the chain-gang line above, or the graph
 # carries two chain-gangs and their types stop unifying. This is the commit
-# mapi-lite tagged v0.4.0, on chain-gang 0.13 -- pinned by rev, which unlike a
-# tag cannot move; teranode-event-rs takes the same release by tag.
+# mapi-lite tagged v0.5.0, on chain-gang 0.13 -- pinned by rev, which unlike a
+# tag cannot move; teranode-event-rs takes the same release by tag (CS-627).
 # See docs/Dependencies.md before changing it.
-uls-client = { git = "ssh://git@github.com/nchain-innovation/mapi-lite.git", rev = "dd8674c42c14fb41a00431253766e99c15b424d7" }
-uls-core = { git = "ssh://git@github.com/nchain-innovation/mapi-lite.git", rev = "dd8674c42c14fb41a00431253766e99c15b424d7" }
-# Only to build the timeout-bearing HTTP clients handed to uls-client, which
-# has no timeout setting of its own. Same major.minor as mapi-lite's so one
-# reqwest resolves; its TLS backend is whatever uls-client enables.
+uls-client = { git = "ssh://git@github.com/nchain-innovation/mapi-lite.git", rev = "e360a2a71b5b5b902e955dd6aa714e20adfdd79c" }
+uls-core = { git = "ssh://git@github.com/nchain-innovation/mapi-lite.git", rev = "e360a2a71b5b5b902e955dd6aa714e20adfdd79c" }
+# For the HTTP client the mapi-lite chain reader (mapi_lite_interface) hands
+# uls-client; the broadcaster uses uls-client's own timeouts (v0.5.0). Same
+# major.minor as mapi-lite's so one reqwest resolves; its TLS backend is
+# whatever uls-client enables.
 reqwest = { version = "0.13", default-features = false }
 
 [dev-dependencies]

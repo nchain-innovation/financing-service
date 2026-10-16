@@ -1,8 +1,10 @@
 # Financing Service - Configuration
 
-Configuration for this service can be found in `data/financing-service.toml`. The file is read when the service starts.
+Configuration for this service is a TOML file, read when the service starts: the file `FS_CONFIG` names, or `data/financing-service.toml` when it is unset. `FS_CONFIG` names a file, as `TE_CONFIG` and `MAPI_CONFIG` do for Event and mapi-lite; it no longer holds JSON (CS-624).
 
-Alternatively, set the `FS_CONFIG` environment variable to a JSON-encoded config object.
+Any setting can then be overridden from the environment with `FS__<TABLE>__<KEY>`, two underscores between each part: `FS__SERVICE__UTXO_REFRESH_PERIOD=30` sets `[service] utxo_refresh_period`, and `FS__LISTEN_ADDR=0.0.0.0:9090` sets the top-level `listen_addr`. See [Environment overrides](#environment-overrides).
+
+**A key no setting reads stops startup**, naming it: a misspelling, a key written under the wrong `[table]`, an override with a typo, or a setting this version has removed. Before CS-624 such a key was silently ignored and the setting kept its default.
 
 The file is composed of the following sections:
 
@@ -72,7 +74,7 @@ rpc_password = "env:FS_RPC_PASSWORD"
 * `url` — the node's JSON-RPC host and port. A bare `host:port` is treated as `http://`; give a full URL for `https`.
 * `rpc_user` / `rpc_password` — the node's RPC credentials, sent as HTTP basic auth on every call. **Point this only at a node you control**, since the credentials go to whatever host is configured.
 
-`rpc_password` takes an `env:VAR_NAME` reference and is overridden by `FS_RPC_PASSWORD`; `rpc_user` behaves the same way with `FS_RPC_USER`. A plaintext `rpc_password` is reported at startup like any other plaintext secret.
+`rpc_password` and `rpc_user` take an `env:VAR_NAME` reference, or can be set with `FS__BLOCKCHAIN_INTERFACE__RPC_PASSWORD` and `FS__BLOCKCHAIN_INTERFACE__RPC_USER`. A plaintext `rpc_password` is reported at startup like any other plaintext secret.
 
 #### Address imports
 
@@ -146,36 +148,42 @@ It bounds a whole call, and WhatsOnChain's UTXO listing is one call made of seve
 
 ### A note on the port
 
-`[web_interface] port` has no default and must be set. The sample config uses `8080`, which several other nChain services also default to — mapi-lite among them. If you are running this alongside one of those, change the port here or there; nothing will respond on a port that another process already holds.
+`listen_addr` defaults to `127.0.0.1:8080`. Port `8080` is also mapi-lite's default, among other nChain services. If you are running this alongside one of those, change the port here or there; nothing will respond on a port that another process already holds.
 
 ### Required keys
 
 Most keys have defaults, and most sections can be left out. These cannot, and the service refuses to start without them:
 
 * `blockchain_interface.interface_type` and `blockchain_interface.network_type`
-* `web_interface.address` and `web_interface.port`
-* `logging.level`
 * `service.utxo_refresh_period`
 * `dynamic_config.filename`
 
 Within an optional section, `mapi_lite.base_url` is required when `[mapi_lite]` is present, and `client_id` and `wif_key` in each `[[client]]`.
 
+## listen_addr
+
+Where the REST API listens, as `host:port`. A top-level key, before any `[table]`, named as it is in Event and mapi-lite (CS-624).
+
+```toml
+listen_addr = "127.0.0.1:8080"
+```
+
+Default `127.0.0.1:8080`. It replaces `[web_interface] address` and `port`, which are now refused, and the `APP_ENV=docker` switch, which is no longer read.
+
+mapi-lite also defaults to port 8080. Running both on one host, as a local regtest setup does, move this service to another port: Event's regtest config expects it on 8081.
+
+The Docker image sets `FS__LISTEN_ADDR=0.0.0.0:8080`: a container's own loopback cannot be reached from the host. Which host interfaces then see the port is set where it is published — `run.sh` publishes it on the host's loopback. A container run with `--network host` that should bind one address takes `-e FS__LISTEN_ADDR=10.1.2.3:8080`; the image's health check expects port 8080.
+
+Listen on loopback, or place the service behind a reverse proxy on a private network, when exposing funding endpoints.
+
 ## [web_interface]
 
-Configures the REST API endpoint for the service.
+Configures who may call the REST API.
 
 ```toml
 [web_interface]
-address = "127.0.0.1"
-port = 8080
 # admin_api_key = "your-admin-secret"
 ```
-
-mapi-lite also defaults to port 8080. Running both on one host, as a local regtest setup does, move this service to another port: Event's regtest config expects it on 8081. The Docker image keeps 8080, which its health check and the uls-rs compose file use.
-
-When `APP_ENV=docker` (set by the image) and `address` is a loopback address, the service listens on `0.0.0.0` instead: a container's own loopback cannot be reached from the host. Which host interfaces then see the port is set where it is published — `run.sh` publishes it on the host's loopback. Any other `address` is honoured, so a container run with `--network host` and a specific address binds only that one.
-
-Bind to `127.0.0.1` or place the service behind a reverse proxy on a private network when exposing funding endpoints.
 
 ### Admin authentication
 
@@ -223,22 +231,11 @@ When enabled, excess requests receive HTTP 429 with a JSON error body. `/health`
 
 Behind a reverse proxy, list the proxy in `trusted_proxies`; otherwise every caller arrives from the proxy's address and shares one limit. A request from a trusted proxy is limited by the client address it reports in `X-Forwarded-For`: the right-most entry that is not itself a trusted proxy, since entries further left were supplied by the client and could say anything. From any other address the header is ignored, so a caller cannot choose its own key by sending one.
 
-## [logging]
+## Logging
 
-Configures the log level for the service.
+The log level is set by `RUST_LOG`, as it is for Event and mapi-lite (CS-624): `RUST_LOG=debug`, or per module, `RUST_LOG=info,financing_service=debug`. Unset or empty, it is `info`. The levels are `error`, `warn`, `info`, `debug` and `trace`.
 
-```toml
-[logging]
-level = "info"
-```
-
-The logging level can be one of:
-
-* `error` — very serious errors
-* `warn` or `warning` — hazardous situations
-* `info` or `information` — useful information
-* `debug` — detailed information
-* `trace` — very verbose information
+A `RUST_LOG` that does not parse stops startup, naming it. The `[logging]` section is no longer read and is refused: delete it, and set `RUST_LOG` instead of `level`.
 
 Every funding broadcast is logged before it is sent and again with its outcome, each line naming the transaction as `funding tx <txid>`:
 
@@ -250,7 +247,7 @@ WARN  broadcast failed: funding tx <txid> (class=rejected, broadcaster=mapi-lite
 
 `class` is `failed`, `rejected` or `indeterminate`, matching the `broadcast_failed`, `broadcast_rejected` or `broadcast_outcome_unknown` the caller was answered with. At `debug` the transaction's hex is logged too, as `funding tx <txid> hex=...`.
 
-`level` applies to a release build, which is what the Docker image runs, as it does to any other: no level is compiled out. At `debug` and `trace` the dependencies log too, among them chain-gang's blockchain interface calls and the HTTP client's connections.
+`RUST_LOG` applies to a release build, which is what the Docker image runs, as it does to any other: no level is compiled out (CS-630). At `debug` and `trace` the dependencies log too, among them chain-gang's blockchain interface calls and the HTTP client's connections; `RUST_LOG=info,financing_service=debug` keeps them at `info`.
 
 ## [telemetry]
 
@@ -313,7 +310,7 @@ Names follow OpenTelemetry conventions: counters have no `_total` and units are 
 | `fs_client_balance` | Gauge | `sat` | `client_id`, `kind` | Each client's balance from the service's cache, `kind` = `confirmed` or `unconfirmed`. Sampled every 15 s. | `fs_client_balance_sat` |
 | `fs_client_chain_state_age` | Gauge | `s` | `client_id` | Seconds since the client's unspent set was last read from the chain -- what `service.ready_max_chain_read_age_seconds` is measured against. No series until the first read. | `fs_client_chain_state_age_seconds` |
 
-The gauges are read from a snapshot a background task takes every 15 s while export is on; the one upstream call it makes is the mapi-lite readiness probe `GET /ready` already makes, cached for `mapi_lite.health_timeout_seconds`.
+The gauges are read from a snapshot a background task takes every 15 s while export is on; the one upstream call it makes is the mapi-lite readiness probe `GET /ready` already makes, cached for 2s.
 
 **Suggested alerts** (CS-608 phase 1), in PromQL over the converted names:
 
@@ -411,12 +408,10 @@ Optional. Sets the fee the service pays on the funding transactions it builds. B
 ```toml
 [fees]
 satoshis_per_kb = 100
-use_mapi_fee_quote = true
 # max_satoshis_per_kb = 1000
 ```
 
 * `satoshis_per_kb` — the rate, in satoshis per kilobyte. The fee for a transaction is `ceil(tx_bytes * satoshis_per_kb / 1000)`, rounded **up** so that rounding never underpays. `tx_bytes` is the transaction's serialised size, counted as an upper bound: every output is its 8-byte value, its script's length prefix and the script, and every input is costed at the longest a signature can be. So a transaction never pays less than the rate on the bytes it actually has — until CS-471 each funded output was counted as its script alone, nine bytes short, and an ordinary transaction paid about 97 sat/KB at a configured 100. Must be greater than zero; the service refuses to start otherwise, because a transaction paying no fee is not relayed. Default `100`.
-* `use_mapi_fee_quote` — when `[mapi_lite]` is configured, take the rate from its `feeQuote` rather than from `satoshis_per_kb`. Default `true`. Without `[mapi_lite]` it has no effect, because there is nothing to ask.
 * `max_satoshis_per_kb` — the highest rate a fee quote may set (CS-523, SR-SEC-020). A quote above it is ignored, with a warning, and the current rate kept. It is not clamped: a rate that high is forged or a mistake. Default `1000`, which is ten times the default `satoshis_per_kb` and a thousand times mapi-lite's own default quote. Must be at least `satoshis_per_kb`.
 
 ### Dust change goes to the fee
@@ -460,9 +455,11 @@ The lower fee also changes which UTXOs get spent. A cheaper transaction can be f
 
 ### Taking the rate from mapi-lite
 
-With `[mapi_lite]` configured and `use_mapi_fee_quote` left at `true`, the service reads the **standard** mining fee from mapi-lite's `feeQuote` and converts it to satoshis per kilobyte, rounding up. One server then sets the rate for every service broadcasting through it, rather than each keeping its own number.
+With `[mapi_lite]` configured, the service reads the **standard** mining fee from mapi-lite's `feeQuote` and converts it to satoshis per kilobyte, rounding up. One server then sets the rate for every service broadcasting through it, rather than each keeping its own number.
 
 `satoshis_per_kb` remains the fallback. It is used before the first quote arrives, and whenever a refresh fails — a quote that cannot be fetched, names no fee, or gives a zero rate leaves the rate in force untouched. A mapi-lite that is down therefore stops the rate *changing* rather than stopping funding.
+
+There is no longer a switch to turn the quote off: `use_mapi_fee_quote` is refused (CS-624). To pin the rate, have mapi-lite quote it; `max_satoshis_per_kb` bounds what any quote can set.
 
 The quote is refreshed on the same sweep that refreshes balances (`service.utxo_refresh_period`), not on the funding path, so costing a transaction never waits on a request to mapi-lite. The rate can therefore be up to one sweep out of date.
 
@@ -473,43 +470,38 @@ Optional. When this section is present, funding transactions are **broadcast thr
 ```toml
 [mapi_lite]
 base_url = "http://127.0.0.1:8080"
-auth_token = "env:FS_MAPI_LITE_AUTH_TOKEN"
-# timeout_seconds = 13
-# health_timeout_seconds = 2
-# max_retries = 2
+auth_token = "env:MAPI_AUTH_TOKEN"
 # total_timeout_seconds = 45
 # miner_id_public_keys = ["02…"]   # mapi-lite's minerId; see below
 ```
 
 * `base_url` — **required.** Base URL of the mapi-lite server, `http://` or `https://`. Surrounding whitespace and a trailing `/` are stripped before the URL is validated or used, so the value that is checked at startup is the one that is requested.
-* `auth_token` — optional. Sent **verbatim** as the `Authorization` header on every request, so include the scheme the server expects, e.g. `"Bearer <secret>"`. Takes an `env:VAR_NAME` reference and is overridden by `FS_MAPI_LITE_AUTH_TOKEN`. A plaintext value is reported at startup like any other plaintext secret. Never logged.
-* `timeout_seconds` — ceiling on **one** submit attempt. Default `13`. Chosen so the whole retry budget fits the deadline: 3 attempts × 13s plus 3s of back-off is 42s, inside `total_timeout_seconds` of 45. It was 30s, which meant the deadline cut the sequence off after one attempt and part of a second, so `max_retries` described attempts that never ran.
-* `health_timeout_seconds` — timeout for the mapi-lite probe behind `GET /ready`. Default `2`. Must be **less than 3**, and is rejected at startup otherwise: readiness probes allow a few seconds at most (Docker's health check defaults to `--timeout=3s`), and a slower probe would be killed by the caller before it answered, marking the instance unready on every check even while mapi-lite is fine. The probe's verdict is cached for this long, so `/ready` — which is unauthenticated and exempt from rate limiting — cannot be used to flood mapi-lite.
-* `max_retries` — how many times a submit is retried after a transient failure (an HTTP 5xx, a transport error, or an attempt that ran out of `timeout_seconds`). Default `2`, so three attempts, with linear back-off of 1s then 2s (capped at 5s). Resubmitting is safe: mapi-lite answers an already-known transaction with success — which is also how a retry can *settle* an attempt that timed out, turning `broadcast_outcome_unknown` back into a plain success.
-
-  Raising this only buys attempts that fit inside `total_timeout_seconds`. If they do not, the service logs a warning at startup naming how many will actually start, and carries on — the combination is legal, it just does less than it asks for.
-* `miner_id_public_keys` — mapi-lite's miner-ID public keys, as hex (33-byte compressed or 65-byte uncompressed): the `minerId` in every response it signs (CS-523, SR-SEC-019). **Set this.** A signed response is otherwise checked only against the key *it carries*, which shows it was not altered, not who sent it. Anyone able to answer in mapi-lite's place — over plain HTTP, anyone on the path — could then forge an "accepted" or a fee quote. A response signed by any other key is refused: a fee quote is ignored, and a submit is reported as `broadcast_outcome_unknown`, because what the real mapi-lite did is hidden. Once any signed answer has shown mapi-lite signing with an unlisted key, `GET /ready` reports mapi-lite not ready and `POST /fund` sends nothing, answering 503 `broadcaster_untrusted`, until a signed answer verifies again (CS-618, SR-SEC-033): otherwise each funding would land and be reported as an unknown outcome, holding its inputs for 600s. List more than one key to cover a rotation. Default empty, which accepts any valid signature as before and is warned about at startup. Invalid hex or length is refused at startup.
-* `total_timeout_seconds` — ceiling on a whole submit: every attempt and every back-off between them. Default `45`; must be at least `timeout_seconds`. This is the worst case a `POST /fund` caller — and the actix worker serving it — can be held by an unresponsive mapi-lite, so it is the number to set first and then fit the other two inside.
+* `auth_token` — optional. The token alone, as mapi-lite's own `auth_token` is: every request carries `Authorization: Bearer <token>`. **Before CS-624 this held the whole header**; a value starting `Bearer `, or holding any space, is now refused at startup, so drop the prefix. Takes an `env:VAR_NAME` reference, or can be set with `FS__MAPI_LITE__AUTH_TOKEN`. A plaintext value is reported at startup like any other plaintext secret. Never logged.
+* `miner_id_public_keys` — mapi-lite's miner-ID public keys, as hex (33-byte compressed or 65-byte uncompressed): the `minerId` in every response it signs (CS-523, SR-SEC-019). **Set this.** A signed response is otherwise checked only against the key *it carries*, which shows it was not altered, not who sent it. Anyone able to answer in mapi-lite's place — over plain HTTP, anyone on the path — could then forge an "accepted" or a fee quote. A response signed by any other key is refused: a fee quote is ignored, and a submit is reported as `broadcast_outcome_unknown`, because what the real mapi-lite did is hidden. Once any signed answer has shown mapi-lite signing with an unlisted key, `GET /ready` reports mapi-lite not ready and `POST /fund` sends nothing, answering 503 `broadcaster_untrusted`, until a signed answer verifies again (CS-618, SR-SEC-033): otherwise each funding would land and be reported as an unknown outcome, holding its inputs for 600s. List more than one key to cover a rotation. **Required on mainnet and testnet**: left empty there, the service refuses to start (CS-624). On regtest and STN it may be empty, which accepts any valid signature and is warned about at startup. Invalid hex or length is refused at startup.
+* `total_timeout_seconds` — ceiling on a whole submit: every attempt and every back-off between them. Default `45`. The one timing setting for mapi-lite (CS-624): the rest is derived from it and from what mapi-lite publishes, below. It is the worst case a `POST /fund` caller — and the actix worker serving it — can be held by an unresponsive mapi-lite.
 
   On expiry the caller gets `broadcast_outcome_unknown` (HTTP 504) if an attempt was still in flight, because cancelling a request says nothing about what the server did with it and the transaction may be on the network; the service reserves that transaction's inputs in response — see [When the outcome is unknown](SupportedEndpoints.md#when-the-outcome-is-unknown). If instead the deadline was consumed by back-off between attempts that were all refused outright, nothing was ever delivered and the caller gets `broadcast_failed` (HTTP 502) with no reservation.
 
-**The three interact.** The worst case is `timeout_seconds × (max_retries + 1)` plus back-off, and `total_timeout_seconds` cuts it off there. Set the deadline to the longest a `/fund` call may take, then choose the other two to fit inside it; the startup warning tells you when they do not.
+**`timeout_seconds`, `max_retries` and `health_timeout_seconds` are gone (CS-624)**, and refused if present. They had to be kept in step with each other and with mapi-lite by hand. Now:
 
-**`timeout_seconds` has to outlast mapi-lite's own ceiling (CS-510).** mapi-lite answers a submission it cannot finish within its `submit_timeout_sec` (default 10s) with HTTP 504, outcome unknown. An attempt that gives up first reports a hung node as *this* service's timeout instead: the same unknown outcome, from the wrong layer, with mapi-lite still working on a request nobody is waiting for. The budget, outermost first:
+* **Each attempt** outlasts mapi-lite's submit ceiling by 3s. mapi-lite answers a submission it cannot finish within its `submit_timeout_sec` (default 10s) with HTTP 504, outcome unknown, and publishes that ceiling in `GET /ready` as `submitTimeoutSecs`. An attempt that gave up first would report a hung node as *this* service's timeout: the same unknown outcome, from the wrong layer, with mapi-lite still working on a request nobody is waiting for (CS-510). The service reads the ceiling whenever it probes mapi-lite, at startup included, and assumes the 10s default until then. Against the default it is 13s, as before.
+* **The retries** are as many as fit inside `total_timeout_seconds` when every attempt runs to its bound, with linear back-off of 1s, 2s, … capped at 5s. At the defaults that is two, so three attempts in 42s, as before. Resubmitting is safe: mapi-lite answers an already-known transaction with success — which is also how a retry can *settle* an attempt that timed out, turning `broadcast_outcome_unknown` back into a plain success.
+* **The probe** behind `GET /ready` is bounded at 2s, as Event's is, under the 3s a readiness probe allows (Docker's health check defaults to `--timeout=3s`). Its verdict is cached for as long, so `/ready` — unauthenticated and exempt from rate limiting — cannot be used to flood mapi-lite.
+
+A `total_timeout_seconds` shorter than one attempt against the ceiling cuts every attempt short, so a hung node is reported as this service's deadline. That still works, so the service **warns**, naming the value that would not (SR-CFG-010), and carries on. The budget, outermost first:
 
 | Layer | Gives up after (defaults) |
 |---|---|
-| Event → `POST /fund` | 90s, above this service's 45s submit deadline plus a chain read |
-| this service → mapi-lite, per attempt | `timeout_seconds` = 13s |
+| Event → `POST /fund` | 90s; this service publishes its own worst case in `GET /status` as `fund_worst_case_seconds` for Event to check (135s at these defaults) |
+| this service → mapi-lite, whole submit | `total_timeout_seconds` = 45s |
+| this service → mapi-lite, per attempt | mapi-lite's ceiling + 3s = 13s |
 | mapi-lite → node, whole submit | `submit_timeout_sec` = 10s, answered 504 |
-
-mapi-lite publishes its ceiling in `GET /ready` as `submitTimeoutSecs`. The service reads it whenever it probes mapi-lite, at startup included, and **warns** when `timeout_seconds` does not exceed it by at least a second, naming both values (SR-CFG-010). It still starts and funds: the combination works, it just reports a hung node less well. Fix it by raising `timeout_seconds` (and `total_timeout_seconds` with it), or by lowering mapi-lite's ceiling.
 
 When the section is present the service:
 
 * Logs at startup: `mapi-lite integration configured (base_url=...): funding transactions will be broadcast via mapi-lite`. Without the section the line reads `mapi-lite not configured: funding transactions will be broadcast via the 'woc' blockchain interface` (naming whichever `interface_type` is configured).
 * Probes mapi-lite at startup (its `GET /ready`) and **warns** if it is unreachable or not ready, without refusing to start. Funding will fail until mapi-lite is reachable, but the read paths — `/status`, balances, UTXO refreshes — do not depend on it and keep serving, and the service recovers on its own when mapi-lite returns. Refusing to start would instead put the container in a restart loop driven by its own health check, taking the read paths down with it.
-* Asks mapi-lite's own `GET /ready` for this service's `GET /ready`, and returns HTTP 503 when mapi-lite is unreachable or not ready, reusing a verdict for up to `health_timeout_seconds`. mapi-lite's readiness fails when it cannot do its work: its nodes are unreachable, its block ingest has fallen behind, or it cannot sign or reach its database; the fee quote this used to probe is served from mapi-lite's configuration and answered with every node down (CS-505). `GET /health` is unaffected. See [Readiness check](SupportedEndpoints.md#readiness-check).
+* Asks mapi-lite's own `GET /ready` for this service's `GET /ready`, and returns HTTP 503 when mapi-lite is unreachable or not ready, reusing a verdict for up to 2s. mapi-lite's readiness fails when it cannot do its work: its nodes are unreachable, its block ingest has fallen behind, or it cannot sign or reach its database; the fee quote this used to probe is served from mapi-lite's configuration and answered with every node down (CS-505). `GET /health` is unaffected. See [Readiness check](SupportedEndpoints.md#readiness-check).
 * Reports `"broadcaster": "mapi-lite"` in `GET /status`.
 * Funds a request from cached chain state that has merely aged, rather than waiting for it to be refreshed through `[blockchain_interface]`, and refreshes it behind the request — see [How often the service reads the chain](#how-often-the-service-reads-the-chain).
 * Submits each funding transaction as a one-element batch to `POST /mapi/txs`, with the merkle proof declined (no callbacks are wanted). A rejection by mapi-lite or the node surfaces to the caller as `broadcast_rejected` (HTTP 409) when the upstream calls it final or names a conflicting transaction, since retrying cannot help, and otherwise as `broadcast_failed` (HTTP 502), as does a mapi-lite `503` (no node can have received it); either way the reason is in the service log. Anything that may have reached the network surfaces as `broadcast_outcome_unknown` (HTTP 504) instead, and the inputs are reserved: an answer that never arrives or cannot be read, a mapi-lite `500`/`502`/`504` (from mapi-lite v0.4.0 a `504` means a node may have received it), and mapi-lite's "accepted by the node but could not be recorded", which is resubmitted first since the resubmission records it (CS-501).
@@ -532,14 +524,13 @@ filename = "./data/dynamic.toml"
 * **Only `env:VAR` references by default.** `POST /client` refuses a raw `wif` with HTTP 400 and stores nothing; send `wif_env`, naming an environment variable that holds the key, and the file records `env:VAR` instead. `allow_plaintext_wif = true` lifts this for development; on mainnet and testnet it is refused at startup (CS-514). A file written before this, holding raw WIFs, still loads, with the usual plaintext warning.
 * **Written atomically, owner-only.** Every change is written to a `0600` sibling file, synced, and renamed over the original, so a crash cannot truncate it and other users cannot read it. A file found readable by other users at startup is made `0600`, with a warning. A client is added or removed in memory only once the file has been written.
 * **A file that does not parse stops startup.** It is left exactly as it is, to be fixed by hand, rather than replaced with an empty list on the next `POST /client`. A missing or empty file means no dynamic clients.
-* `wif_env_prefix` — the only environment variables a client added through `POST /client` may take its key from with `wif_env`. Default `FS_RUNTIME_WIF_`. It is rejected at startup if it overlaps `FS_CLIENT_`, which every client's own override variable (`FS_CLIENT_<ID>_WIF`) starts with (CS-521).
+* `wif_env_prefix` — the only environment variables a client added through `POST /client` may take its key from with `wif_env`. Default `FS_RUNTIME_WIF_`. It is rejected at startup if it overlaps `FS__`, which every configuration override starts with: those can carry any secret (CS-624).
 
-**Runtime clients cannot take another client's wallet (CS-521, SR-SEC-018).** Before this, `wif_env` could name any variable in the service's environment, another client's `FS_CLIENT_<ID>_WIF` included. Whoever could call `POST /client` (anyone, with no `admin_api_key`) could then fund from that client's wallet under an API key of their own. Now:
+**Runtime clients cannot take another client's wallet (CS-521, SR-SEC-018).** Before this, `wif_env` could name any variable in the service's environment, another client's key variable included. Whoever could call `POST /client` (anyone, with no `admin_api_key`) could then fund from that client's wallet under an API key of their own. Now:
 
 * `wif_env` must start with `wif_env_prefix`. **This is a breaking change:** a deployment that names other variables has to rename them, or set the prefix to match.
 * A `wif` beginning `env:` is refused; name a variable with `wif_env` instead.
 * A client whose key is the funding key of an existing client is refused, however the key was supplied. Two clients funding from one wallet would spend the same coins.
-* A `client_id` that folds onto an existing client's override variables (case and punctuation fold, so `ID.1` and `id_1` share `FS_CLIENT_ID_1_*`) is refused.
 
 Clients that already share a wallet when the service starts are reported as an error in the log, naming them. The service still starts. Remove the one that should not be there from the dynamic config.
 
@@ -582,20 +573,21 @@ If a referenced variable is not set, startup fails with a clear error.
 
 ### Environment overrides
 
-These variables take precedence over config file values:
+`FS__<TABLE>__<KEY>` sets any setting, over whatever the file holds, as `TE__` and `MAPI__` do for Event and mapi-lite (CS-624). The value is taken as written; the setting parses it, so a port or a number of seconds can be overridden too.
 
-| Variable | Overrides |
-|----------|-----------|
-| `FS_ADMIN_API_KEY` | `web_interface.admin_api_key` |
-| `FS_CLIENT_{CLIENT_ID}_WIF` | `wif_key` for that client (`CLIENT_ID` is uppercased; non-alphanumeric characters become `_`) |
-| `FS_CLIENT_{CLIENT_ID}_API_KEY` | `api_key` for that client |
-| `FS_RPC_USER` / `FS_RPC_PASSWORD` | `blockchain_interface.rpc_user` / `rpc_password` |
-| `FS_MAPI_LITE_AUTH_TOKEN` | `mapi_lite.auth_token` (include the scheme, e.g. `Bearer <secret>`) |
+| Variable | Sets |
+|----------|------|
+| `FS__WEB_INTERFACE__ADMIN_API_KEY` | `web_interface.admin_api_key` |
+| `FS__BLOCKCHAIN_INTERFACE__RPC_USER` / `FS__BLOCKCHAIN_INTERFACE__RPC_PASSWORD` | `blockchain_interface.rpc_user` / `rpc_password` |
+| `FS__MAPI_LITE__AUTH_TOKEN` | `mapi_lite.auth_token` (the token alone, without `Bearer `) |
+| `FS__LISTEN_ADDR` | `listen_addr` |
 
-Example: for `client_id = "id1"`, set `FS_CLIENT_ID1_WIF`.
+A `[[client]]` entry sits in an array, which an override cannot address: give its `wif_key` and `api_key` as `env:` references.
+
+**Breaking change (CS-624).** The named overrides `FS_ADMIN_API_KEY`, `FS_RPC_USER`, `FS_RPC_PASSWORD`, `FS_MAPI_LITE_AUTH_TOKEN`, `FS_CLIENT_<ID>_WIF` and `FS_CLIENT_<ID>_API_KEY` are no longer read. Rename the first four to their `FS__` form; for a client, write `wif_key = "env:FS_CLIENT_ID1_WIF"` (any variable name works) in the file.
 
 ### Plaintext warnings
 
-When WIF keys, client `api_key`, `admin_api_key`, `rpc_password`, or `mapi_lite.auth_token` are stored as literal values in config files, the service logs a warning at startup. Literal values still work for local development.
+When WIF keys, client `api_key`, `admin_api_key`, `rpc_password`, or `mapi_lite.auth_token` are stored as literal values in the config file, the service logs a warning at startup. A value set by an `FS__` override is not warned about: it is already in the environment. Literal values still work for local development.
 
 Dynamic clients added via `POST /client` use `wif_env` and can use `api_key_env` instead of `wif` and `api_key`; the service stores `env:VAR` references in the dynamic config file rather than the secret values. A raw `wif` is refused unless `dynamic_config.allow_plaintext_wif` is set — see [\[dynamic_config\]](#dynamic_config).

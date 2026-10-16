@@ -37,9 +37,19 @@ mod tests {
     #[test]
     fn sr_nfr_007_main_returns_error_instead_of_panicking_on_config_failure() {
         let source = include_str!("main.rs");
-        assert!(
-            source.contains("load_config(\"FS_CONFIG\", \"data/financing-service.toml\").map_err(")
-        );
+        assert!(source.contains("load_config(&config_path).map_err("));
+    }
+
+    /// A warning logged before the subscriber is installed goes nowhere, so
+    /// the plaintext-secret warning waits for it.
+    #[test]
+    fn sr_cfg_006_configuration_warnings_follow_logging_setup() {
+        let source = include_str!("main.rs");
+        let init = source.find("telemetry::init(").expect("telemetry::init");
+        let warn = source
+            .find("warn_plaintext_secrets(&file)")
+            .expect("the warning");
+        assert!(init < warn);
     }
 
     /// The line an operator reads to learn where funding transactions go.
@@ -94,6 +104,13 @@ mod tests {
     }
 
     #[test]
+    fn sr_cfg_003_the_image_listens_on_every_interface() {
+        let dockerfile = std::fs::read_to_string("Dockerfile").unwrap();
+        assert!(dockerfile.contains("ENV FS__LISTEN_ADDR=0.0.0.0:8080"));
+        assert!(!dockerfile.contains("APP_ENV"));
+    }
+
+    #[test]
     fn sr_nfr_009_docker_build_mounts_ssh_for_the_dependency_fetch() {
         let dockerfile = std::fs::read_to_string("Dockerfile").unwrap();
         assert!(dockerfile.contains("--mount=type=ssh"));
@@ -105,7 +122,7 @@ mod tests {
     fn sr_bchn_009_configuration_and_readme_document_mapi_lite() {
         let configuration = std::fs::read_to_string("docs/Configuration.md").unwrap();
         assert!(configuration.contains("## [mapi_lite]"));
-        assert!(configuration.contains("FS_MAPI_LITE_AUTH_TOKEN"));
+        assert!(configuration.contains("FS__MAPI_LITE__AUTH_TOKEN"));
         let readme = std::fs::read_to_string("README.md").unwrap();
         assert!(readme.contains("Configuration.md#mapi_lite"));
         let endpoints = std::fs::read_to_string("docs/SupportedEndpoints.md").unwrap();

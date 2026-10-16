@@ -1,6 +1,5 @@
 use std::env;
 
-use log::Level;
 use opentelemetry::{global, trace::TracerProvider as _, KeyValue};
 use opentelemetry_otlp::{MetricExporter, SpanExporter, WithExportConfig};
 use opentelemetry_sdk::{
@@ -45,8 +44,8 @@ impl Drop for TelemetryGuard {
 /// Initialise tracing, with optional OpenTelemetry trace export and optional
 /// OTLP metrics export (CS-608). Each has its own switch; returns a guard when
 /// either is on.
-pub fn init(config: &TelemetryConfig, log_level: Level) -> Result<Option<TelemetryGuard>, String> {
-    let filter = EnvFilter::new(log_level_filter(log_level));
+pub fn init(config: &TelemetryConfig) -> Result<Option<TelemetryGuard>, String> {
+    let filter = log_filter(env::var("RUST_LOG").ok().as_deref())?;
 
     let tracer_provider = if config.is_enabled() {
         global::set_text_map_propagator(TraceContextPropagator::new());
@@ -185,13 +184,19 @@ fn bridge_log_crate() -> Result<(), String> {
     Ok(())
 }
 
-fn log_level_filter(level: Level) -> &'static str {
-    match level {
-        Level::Error => "error",
-        Level::Warn => "warn",
-        Level::Info => "info",
-        Level::Debug => "debug",
-        Level::Trace => "trace",
+/// What is logged when `RUST_LOG` is unset or empty.
+pub const DEFAULT_LOG_FILTER: &str = "info";
+
+/// The log filter: `RUST_LOG` (e.g. `debug`, or
+/// `info,financing_service=debug`), else [`DEFAULT_LOG_FILTER`], as Event and
+/// mapi-lite read it (CS-624). One that does not parse stops startup, where
+/// they fall back to `info`: a level an operator asked for and did not get
+/// is not found until the line they needed is missing.
+pub fn log_filter(rust_log: Option<&str>) -> Result<EnvFilter, String> {
+    match rust_log.map(str::trim).filter(|value| !value.is_empty()) {
+        None => Ok(EnvFilter::new(DEFAULT_LOG_FILTER)),
+        Some(value) => EnvFilter::try_new(value)
+            .map_err(|e| format!("RUST_LOG {value:?} is not a log filter: {e}")),
     }
 }
 
@@ -270,6 +275,16 @@ mod tests {
     use super::*;
 
     use crate::test_support::env_lock;
+
+    #[test]
+    fn sr_cfg_006_the_log_filter_is_rust_log_else_info() {
+        assert_eq!(log_filter(None).unwrap().to_string(), "info");
+        assert_eq!(log_filter(Some(" ")).unwrap().to_string(), "info");
+        assert_eq!(log_filter(Some("debug")).unwrap().to_string(), "debug");
+        assert!(log_filter(Some("info,financing_service=trace")).is_ok());
+        let err = log_filter(Some("financing_service=loud")).unwrap_err();
+        assert!(err.contains("RUST_LOG"), "{err}");
+    }
 
     #[test]
     fn telemetry_defaults_to_disabled_without_otel_exporter_env() {
