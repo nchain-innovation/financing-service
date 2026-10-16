@@ -6,16 +6,16 @@ Most of this crate's dependencies come from crates.io and need nothing said abou
 
 | Crate | What it is | Source | Pin |
 |---|---|---|---|
-| `uls-client` | mapi-lite's typed HTTP client: `MapiClient::submit_transactions`, `fee_quote`, … | `ssh://git@github.com/nchain-innovation/mapi-lite.git` (**private**) | commit `e360a2a71b5b5b902e955dd6aa714e20adfdd79c` |
+| `uls-client` | mapi-lite's typed HTTP client: `MapiClient::submit_transactions`, `fee_quote`, … | `ssh://git@github.com/nchain-innovation/mapi-lite.git` (**private**) | commit `3b382890be61a9f3155ee10c9514752792d9d993` |
 | `uls-core` | The wire types and signed-envelope code both the server and client share | same repo, **same commit** | same |
 
 They exist for the optional mapi-lite transaction broadcaster (`src/broadcaster/mapi.rs`, configured by `[mapi_lite]`). They are compiled in whether or not that section is configured; a build without them is not offered, because a second build variant is more maintenance than the SSH requirement costs.
 
 ### Why a commit, not a tag or a version
 
-mapi-lite is not published to crates.io. The pin names the commit tagged `v0.5.0` (CS-627), on chain-gang 0.13 as before. It was taken for `uls-client`'s CS-600 work, which replaced this service's own copies: `MapiClient::broadcast` (one transaction's verdict, with the retries, the submit deadline and the resubmission of an acceptance mapi-lite could not record), the fee helpers on `FeeQuotePayload` and `FeeAmount`, `ready` with `ReadyReport`, and `submit_budget_warning`. `uls-core`'s `AppSettings` and `NodeConfig` gained fields, which this service does not build. The move before, to `v0.4.0`, was taken for `ClientError::may_have_been_delivered` (CS-501) and `MapiClient::with_trusted_miner_ids` (CS-523). It names the commit rather than the tag because a tag can be moved and a commit cannot; `Cargo.lock` would record the commit either way, but a `rev` pin also keeps `Cargo.toml` honest about it, and `sr_bchn_009_uls_client_and_uls_core_are_pinned_to_one_mapi_lite_revision` relies on that form.
+mapi-lite is not published to crates.io. The pin names the commit tagged `v0.6.0` (CS-624), on chain-gang 0.13 as before. It was taken for `ReadyReport::chain`, the network mapi-lite's nodes are on, which this service checks its own `blockchain_interface.network` against; `uls-client`'s API is otherwise unchanged. The move before, to `v0.5.0` (CS-627), was taken for `uls-client`'s CS-600 work, which replaced this service's own copies: `MapiClient::broadcast` (one transaction's verdict, with the retries, the submit deadline and the resubmission of an acceptance mapi-lite could not record), the fee helpers on `FeeQuotePayload` and `FeeAmount`, `ready` with `ReadyReport`, and `submit_budget_warning`. `uls-core`'s `AppSettings` and `NodeConfig` gained fields, which this service does not build. The move before, to `v0.4.0`, was taken for `ClientError::may_have_been_delivered` (CS-501) and `MapiClient::with_trusted_miner_ids` (CS-523). It names the commit rather than the tag because a tag can be moved and a commit cannot; `Cargo.lock` would record the commit either way, but a `rev` pin also keeps `Cargo.toml` honest about it, and `sr_bchn_009_uls_client_and_uls_core_are_pinned_to_one_mapi_lite_revision` relies on that form.
 
-`teranode-event-rs`, the other consumer, takes the same release, by tag `v0.5.0`, on the same chain-gang. The parent `uls-rs` repo's `scripts/preflight.sh` warns when a pin falls behind the mapi-lite checkout it is about to run.
+`teranode-event-rs`, the other consumer, takes mapi-lite by tag, on the same chain-gang; it moves to `v0.6.0` for the same check (CS-625). The parent `uls-rs` repo's `scripts/preflight.sh` warns when a pin falls behind the mapi-lite checkout it is about to run.
 
 ### Why the `ssh://` URL form
 
