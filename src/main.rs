@@ -76,7 +76,7 @@ async fn main() -> std::io::Result<()> {
         log::warn!(
             "web_interface.allow_unauthenticated is set on {}: authentication is left to whatever \
              is in front of this service",
-            config.blockchain_interface.network_type
+            config.blockchain_interface.network
         );
     }
     // Which way funding transactions leave the service. Reads always go

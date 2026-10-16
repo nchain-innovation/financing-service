@@ -81,7 +81,7 @@ pub fn test_config_with_keys(
     Config {
         blockchain_interface: BlockchainInterfaceConfig {
             interface_type: "test".to_string(),
-            network_type: "testnet".to_string(),
+            network: "testnet".to_string(),
             ..Default::default()
         },
         web_interface: crate::config::WebInterfaceConfig {
@@ -741,6 +741,8 @@ pub struct StubMapiBroadcaster {
     quotes: AtomicU32,
     /// What `knows_tx` answers for every txid (CS-619).
     knows: Option<bool>,
+    /// The network `published_network` reports (CS-624).
+    network: Option<String>,
 }
 
 impl StubMapiBroadcaster {
@@ -752,6 +754,21 @@ impl StubMapiBroadcaster {
             quoted_fee: None,
             quotes: AtomicU32::new(0),
             knows: None,
+            network: None,
+        })
+    }
+
+    /// A healthy stub whose `/ready` says its nodes are on `network`
+    /// (CS-624).
+    pub fn on_network(network: &str) -> Arc<Self> {
+        Arc::new(Self {
+            healthy: true,
+            broadcasts: AtomicU32::new(0),
+            probes: AtomicU32::new(0),
+            quoted_fee: None,
+            quotes: AtomicU32::new(0),
+            knows: None,
+            network: Some(network.to_string()),
         })
     }
 
@@ -765,6 +782,7 @@ impl StubMapiBroadcaster {
             quoted_fee: None,
             quotes: AtomicU32::new(0),
             knows,
+            network: None,
         })
     }
 
@@ -778,6 +796,7 @@ impl StubMapiBroadcaster {
             quoted_fee,
             quotes: AtomicU32::new(0),
             knows: None,
+            network: None,
         })
     }
 
@@ -820,6 +839,10 @@ impl TxBroadcaster for StubMapiBroadcaster {
     async fn fee_satoshis_per_kb(&self) -> Option<u64> {
         self.quotes.fetch_add(1, Ordering::SeqCst);
         self.quoted_fee
+    }
+
+    fn published_network(&self) -> Option<String> {
+        self.network.clone()
     }
 
     async fn knows_tx(&self, _txid: &str) -> Option<bool> {

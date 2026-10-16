@@ -66,6 +66,10 @@ pub struct MapiBroadcaster {
     /// plus one, so 0 means "not seen" (CS-510). Kept so the budget is
     /// rebuilt, and logged, once per value rather than on every probe.
     seen_ceiling: AtomicU64,
+    /// The network mapi-lite's last `/ready` said its nodes are on, from
+    /// `ReadyReport::chain` (CS-624). Kept from the last answer that named
+    /// one: an answer before any node has replied names none.
+    chain: Mutex<Option<String>>,
     /// Whether `[mapi_lite] miner_id_public_keys` is set. With none, any key's
     /// signature verifies, so no answer can come from an untrusted one.
     pins_miner_ids: bool,
@@ -109,6 +113,7 @@ impl MapiBroadcaster {
             submit: RwLock::new((submit, budget)),
             probe,
             seen_ceiling: AtomicU64::new(0),
+            chain: Mutex::new(None),
             pins_miner_ids: !config.miner_id_public_keys.is_empty(),
             untrusted_signer: Mutex::new(None),
         })
@@ -135,8 +140,12 @@ impl MapiBroadcaster {
             .await
             .map_err(|e| BroadcastError::Upstream(format!("mapi-lite /ready: {e}")))?;
         // Read whatever the answer, ready or not: it is also where mapi-lite
-        // publishes its submit ceiling (CS-510).
+        // publishes its submit ceiling (CS-510) and its nodes' network
+        // (CS-624).
         self.note_ceiling(report.submit_timeout());
+        if let Some(chain) = &report.chain {
+            *self.chain.lock().unwrap_or_else(|e| e.into_inner()) = Some(chain.clone());
+        }
         if report.ready {
             return Ok(());
         }
@@ -469,6 +478,10 @@ impl TxBroadcaster for MapiBroadcaster {
 
     /// `GET /query/tx/{txid}`, which asks mapi-lite's nodes (CS-619). `None`
     /// on any failure: an unanswered question is not evidence of anything.
+    fn published_network(&self) -> Option<String> {
+        self.chain.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
     async fn knows_tx(&self, txid: &str) -> Option<bool> {
         match self.probe.tx_status(txid).await {
             Ok(status) => Some(status.known),
@@ -1404,6 +1417,33 @@ mod tests {
                 assert_eq!(config.deadline_warning(Some(ceiling)), None, "{seconds}s");
             }
         }
+    }
+
+    /// CS-624: the network mapi-lite's `/ready` names is recorded, ready or
+    /// not, and an answer naming none keeps the last one heard.
+    #[tokio::test]
+    async fn cs_624_the_network_mapi_lite_publishes_is_recorded() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ready"))
+            .respond_with(
+                ResponseTemplate::new(503)
+                    .set_body_json(json!({"ready": false, "chain": "regtest", "checks": {}})),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/ready"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ready": true})))
+            .mount(&server)
+            .await;
+        let broadcaster = broadcaster(&server);
+        assert_eq!(broadcaster.published_network(), None);
+        let _ = broadcaster.health_check().await;
+        assert_eq!(broadcaster.published_network().as_deref(), Some("regtest"));
+        broadcaster.health_check().await.expect("ready");
+        assert_eq!(broadcaster.published_network().as_deref(), Some("regtest"));
     }
 
     /// CS-627: mapi-lite's answer is read as uls-client's `ReadyReport`; a body
