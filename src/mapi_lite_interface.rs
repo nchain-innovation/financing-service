@@ -47,8 +47,8 @@ impl MapiLiteInterface {
         let mut client = MapiClient::new(config.base_url().to_string())
             .with_http(http)
             .with_trusted_miner_ids(&config.miner_id_public_keys);
-        if let Some(token) = &config.auth_token {
-            client = client.with_token(token.clone());
+        if let Some(authorization) = config.authorization() {
+            client = client.with_token(authorization);
         }
         Ok(MapiLiteInterface {
             client,
@@ -201,7 +201,7 @@ mod tests {
 
     fn interface(server: &MockServer) -> MapiLiteInterface {
         let mut config = MapiLiteConfig::for_base_url(server.uri());
-        config.auth_token = Some("Bearer t".to_string());
+        config.auth_token = Some("t".to_string());
         MapiLiteInterface::new(&config, Some(Duration::from_secs(5))).unwrap()
     }
 

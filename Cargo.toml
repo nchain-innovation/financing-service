@@ -9,6 +9,11 @@ edition = "2021"
 actix-web = { version = "4.15.0", default-features = false, features = ["macros", "compress-brotli", "compress-gzip", "compress-zstd", "cookies", "unicode", "compat", "ws"] }
 serde = { version = "1.0.229", features =["derive"] }
 toml = "1.1.6"
+# The configuration loader: the TOML file, then FS__ environment overrides
+# (CS-624), as teranode-event-rs (TE__) and mapi-lite (MAPI__) load theirs.
+# serde_ignored names every key no setting reads, which is refused.
+config = "0.15"
+serde_ignored = "0.1"
 serde_json = "1.0.151"
 tokio = { version = "1.53.1", features = ["full"] }
 chrono = "0.4.45"

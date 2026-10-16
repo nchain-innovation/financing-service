@@ -50,11 +50,11 @@ pub fn warn_plaintext_secrets(config: &crate::config::Config) {
     for field in plaintext_secret_fields(config) {
         if field == "web_interface.admin_api_key" {
             log::warn!(
-                "web_interface.admin_api_key is stored as plaintext in config; use env:VAR_NAME or FS_ADMIN_API_KEY instead"
+                "web_interface.admin_api_key is stored as plaintext in config; use env:VAR_NAME or FS__WEB_INTERFACE__ADMIN_API_KEY instead"
             );
         } else if field == "mapi_lite.auth_token" {
             log::warn!(
-                "mapi_lite.auth_token is stored as plaintext in config; use env:VAR_NAME or FS_MAPI_LITE_AUTH_TOKEN instead"
+                "mapi_lite.auth_token is stored as plaintext in config; use env:VAR_NAME or FS__MAPI_LITE__AUTH_TOKEN instead"
             );
         } else if let Some(client_id) = field.strip_prefix("client.").and_then(|rest| {
             rest.strip_suffix(".wif_key")

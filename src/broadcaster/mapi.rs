@@ -27,14 +27,18 @@
 //! `BroadcastError::Indeterminate` and `Client::commit_uncertain_funding_spend`).
 //! This module ran that loop itself until uls-client v0.4.0 could say which.
 //!
-//! Each attempt is bounded by `mapi_lite.timeout_seconds`, the attempts after
-//! the first number `mapi_lite.max_retries`, and the whole broadcast,
-//! resubmission included, is bounded by `mapi_lite.total_timeout_seconds`. A
-//! funding call is interactive: a wedged mapi-lite must not hold the caller,
-//! and the actix worker serving it, for `timeout * (max_retries + 1)`.
+//! The whole broadcast, resubmission included, is bounded by
+//! `mapi_lite.total_timeout_seconds`, the one timing setting (CS-624). Each
+//! attempt outlasts the submit ceiling mapi-lite publishes in `/ready` by a
+//! margin, so a hung node is reported by mapi-lite's `504` rather than this
+//! side's timeout, and as many retries run as fit inside the deadline (see
+//! `SubmitBudget`). Until mapi-lite has published a ceiling its default is
+//! assumed; one it publishes that changes the budget rebuilds the submit
+//! client. A funding call is interactive: a wedged mapi-lite must not hold
+//! the caller, and the actix worker serving it, for longer than that.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -44,27 +48,23 @@ use uls_client::{Broadcast, BroadcastOptions, ClientError, MapiClient};
 use uls_core::wire::FeeAmount;
 
 use super::{BroadcastError, TxBroadcaster, MAPI_LITE};
-use crate::config::MapiLiteConfig;
-
-/// Wait between submit retries: linear back-off, `attempt * BASE` capped at
-/// `CAP`, uls-client's own default since v0.5.0, set here so it does not
-/// change under this service with a later release. A funding call is
-/// interactive.
-const RETRY_BACKOFF_BASE: Duration = Duration::from_secs(1);
-const RETRY_BACKOFF_CAP: Duration = Duration::from_secs(5);
+use crate::config::{
+    MapiLiteConfig, SubmitBudget, MAPI_LITE_PROBE_TIMEOUT, RETRY_BACKOFF_BASE, RETRY_BACKOFF_CAP,
+};
 
 /// Hands transactions to a mapi-lite server.
 pub struct MapiBroadcaster {
-    /// Each request bounded by `timeout_seconds`, retried `max_retries`
-    /// times, and the whole broadcast by `total_timeout_seconds`.
-    submit: MapiClient,
-    /// For the fee quote: a short timeout and no retries.
+    /// The section, to rebuild the submit client from when mapi-lite
+    /// publishes a ceiling that changes the budget.
+    config: MapiLiteConfig,
+    /// The submit client and the budget it was built with (CS-624).
+    submit: RwLock<(MapiClient, SubmitBudget)>,
+    /// For `/ready` and the fee quote: [`MAPI_LITE_PROBE_TIMEOUT`] and no
+    /// retries.
     probe: MapiClient,
-    /// Ceiling on one attempt.
-    attempt_timeout: Duration,
     /// mapi-lite's own submit ceiling as last published in its `/ready`,
-    /// plus one, so 0 means "not seen" (CS-510). Kept so a misaligned budget
-    /// is warned about once per value rather than on every probe.
+    /// plus one, so 0 means "not seen" (CS-510). Kept so the budget is
+    /// rebuilt, and logged, once per value rather than on every probe.
     seen_ceiling: AtomicU64,
     /// Whether `[mapi_lite] miner_id_public_keys` is set. With none, any key's
     /// signature verifies, so no answer can come from an untrusted one.
@@ -87,25 +87,27 @@ fn untrusted_signer_detail(key: &str) -> String {
 
 impl MapiBroadcaster {
     /// Build a broadcaster for the server named by `config`.
+    /// The submit budget assumes mapi-lite's default ceiling until its
+    /// `/ready` publishes the one it runs with.
     pub fn new(config: &MapiLiteConfig) -> Result<Self, String> {
-        if let Some(warning) = config.retry_budget_warning() {
+        if let Some(warning) = config.deadline_warning(None) {
             log::warn!("{warning}");
         }
         if let Some(warning) = config.unpinned_warning() {
             log::warn!("{warning}");
         }
-        // This service's budget, not uls-client's defaults: an attempt is
-        // never allowed to outlive the deadline it sits inside, and no retry
-        // starts that could not finish inside it.
-        let submit = Self::client(config, config.timeout())?
-            .retry(config.max_retries, RETRY_BACKOFF_BASE, RETRY_BACKOFF_CAP)
-            .with_submit_deadline(Some(config.total_timeout()));
+        Self::with_budget(config, config.submit_budget(None))
+    }
+
+    /// A broadcaster that submits on `budget`.
+    fn with_budget(config: &MapiLiteConfig, budget: SubmitBudget) -> Result<Self, String> {
+        let submit = Self::submit_client(config, budget)?;
         // ready and fee_quote do not retry, so the probe needs no retry settings.
-        let probe = Self::client(config, config.health_timeout())?;
+        let probe = Self::client(config, MAPI_LITE_PROBE_TIMEOUT)?;
         Ok(Self {
-            submit,
+            config: config.clone(),
+            submit: RwLock::new((submit, budget)),
             probe,
-            attempt_timeout: config.timeout(),
             seen_ceiling: AtomicU64::new(0),
             pins_miner_ids: !config.miner_id_public_keys.is_empty(),
             untrusted_signer: Mutex::new(None),
@@ -209,33 +211,56 @@ impl MapiBroadcaster {
         }
     }
 
-    /// Records the ceiling a `/ready` answer published, and warns when this
-    /// side's attempt timeout does not clear it (SR-CFG-010), by uls-client's
-    /// own rule: `submit_budget_warning` on the client this service submits
-    /// with. Once per distinct value: the probe runs every few seconds, and the
-    /// configuration it is checking changes only on a restart of one side or
-    /// the other.
+    /// The submit budget in force.
+    pub fn submit_budget(&self) -> SubmitBudget {
+        self.submit.read().unwrap_or_else(|e| e.into_inner()).1
+    }
+
+    /// The client to submit with: one built on the budget in force.
+    fn submitter(&self) -> MapiClient {
+        self.submit
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .0
+            .clone()
+    }
+
+    /// Records the ceiling a `/ready` answer published, and takes the budget
+    /// it gives (CS-624): each attempt outlasts it, so a hung node is
+    /// reported by mapi-lite's `504`, and the retries are what still fit in
+    /// `total_timeout_seconds`. Warns when the deadline is too short to let an
+    /// attempt wait for that answer (SR-CFG-010). Once per distinct value: the
+    /// probe runs every few seconds, and the ceiling changes only on a
+    /// restart of mapi-lite.
     fn note_ceiling(&self, ceiling: Option<Duration>) {
-        let Some(ceiling) = ceiling.map(|c| c.as_secs()) else {
+        let Some(ceiling) = ceiling else {
             return;
         };
-        if self.seen_ceiling.swap(ceiling + 1, Ordering::Relaxed) == ceiling + 1 {
+        let seconds = ceiling.as_secs();
+        if self.seen_ceiling.swap(seconds + 1, Ordering::Relaxed) == seconds + 1 {
             return;
         }
-        match self
-            .submit
-            .submit_budget_warning(Duration::from_secs(ceiling))
-        {
-            // Named as the operator sets it, with both values (SR-CFG-010).
-            Some(warning) => log::warn!(
-                "[mapi_lite] timeout_seconds is {}s, mapi-lite's submit ceiling {ceiling}s: \
-                 {warning}",
-                self.attempt_timeout.as_secs()
-            ),
+        let budget = self.config.submit_budget(Some(ceiling));
+        match self.config.deadline_warning(Some(ceiling)) {
+            Some(warning) => log::warn!("{warning}"),
             None => log::info!(
-                "mapi-lite answers a slow submit at {ceiling}s, inside this service's {}s attempt",
-                self.attempt_timeout.as_secs()
+                "mapi-lite answers a slow submit at {seconds}s: each attempt waits {}s, with {} \
+                 retries inside mapi_lite.total_timeout_seconds ({}s)",
+                budget.attempt.as_secs(),
+                budget.retries,
+                budget.deadline.as_secs()
             ),
+        }
+        if budget == self.submit_budget() {
+            return;
+        }
+        match Self::submit_client(&self.config, budget) {
+            Ok(client) => {
+                *self.submit.write().unwrap_or_else(|e| e.into_inner()) = (client, budget)
+            }
+            // Building a client only fails on the HTTP stack itself; the
+            // budget in force keeps working.
+            Err(e) => log::warn!("keeping the previous mapi-lite submit budget: {e}"),
         }
     }
 
@@ -255,6 +280,15 @@ impl MapiBroadcaster {
         }
     }
 
+    /// The submit client for `budget`: this service's budget, not
+    /// uls-client's defaults, so an attempt never outlives the deadline it
+    /// sits inside and no retry starts that could not finish inside it.
+    fn submit_client(config: &MapiLiteConfig, budget: SubmitBudget) -> Result<MapiClient, String> {
+        Ok(Self::client(config, budget.attempt)?
+            .retry(budget.retries, RETRY_BACKOFF_BASE, RETRY_BACKOFF_CAP)
+            .with_submit_deadline(Some(budget.deadline)))
+    }
+
     /// A `MapiClient` for `config` whose every request times out after
     /// `timeout` (uls-client's own bound since v0.5.0).
     fn client(config: &MapiLiteConfig, timeout: Duration) -> Result<MapiClient, String> {
@@ -263,10 +297,8 @@ impl MapiBroadcaster {
         let mut client = MapiClient::new(config.base_url().to_string())
             .with_timeout(timeout)
             .with_trusted_miner_ids(&config.miner_id_public_keys);
-        if let Some(token) = &config.auth_token {
-            // Sent verbatim as the Authorization header; the scheme is the
-            // operator's to include (see MapiLiteConfig::auth_token).
-            client = client.with_token(token.clone());
+        if let Some(authorization) = config.authorization() {
+            client = client.with_token(authorization);
         }
         Ok(client)
     }
@@ -329,7 +361,7 @@ impl TxBroadcaster for MapiBroadcaster {
             }
         }
 
-        let verdict = self.submit.broadcast(&raw, &options).await;
+        let verdict = self.submitter().broadcast(&raw, &options).await;
         self.note_signature(verdict.as_ref().err());
         match verdict.map_err(|e| self.in_this_services_terms(e))? {
             Broadcast::Accepted {
@@ -385,8 +417,8 @@ impl TxBroadcaster for MapiBroadcaster {
     /// for the log line; the `/ready` body this service returns stays generic.
     async fn health_check(&self) -> Result<(), BroadcastError> {
         // Both at once, not one after the other: each is bounded by
-        // health_timeout, and the whole probe has to fit inside one, since
-        // readiness probes allow under 3s (CS-618).
+        // MAPI_LITE_PROBE_TIMEOUT, and the whole probe has to fit inside one,
+        // since readiness probes allow under 3s (CS-618).
         let (ready, signer) = tokio::join!(self.mapi_lite_ready(), self.check_signer());
         ready.and(signer)
     }
@@ -537,6 +569,23 @@ mod tests {
         MapiBroadcaster::new(&config(server)).expect("broadcaster builds")
     }
 
+    /// A broadcaster on a budget of `attempt`s per attempt, `retries`
+    /// retries and a `deadline`, in seconds, rather than the one derived from
+    /// mapi-lite's ceiling: a test's mock answers in seconds, not tens.
+    fn on_budget(
+        config: &MapiLiteConfig,
+        attempt: u64,
+        retries: u32,
+        deadline: u64,
+    ) -> MapiBroadcaster {
+        let budget = SubmitBudget {
+            attempt: Duration::from_secs(attempt),
+            retries,
+            deadline: Duration::from_secs(deadline),
+        };
+        MapiBroadcaster::with_budget(config, budget).expect("broadcaster builds")
+    }
+
     /// The detail of an upstream error, or a panic naming what came instead.
     fn upstream_detail(error: BroadcastError) -> String {
         match error {
@@ -599,7 +648,7 @@ mod tests {
             .await;
 
         let mut config = config(&server);
-        config.auth_token = Some("Bearer secret".to_string());
+        config.auth_token = Some("secret".to_string());
         let broadcaster = MapiBroadcaster::new(&config).expect("broadcaster builds");
 
         broadcaster.broadcast_tx(&tx).await.expect("accepted");
@@ -618,8 +667,7 @@ mod tests {
     fn pinned_to(server: &MockServer, key: &str) -> MapiBroadcaster {
         let mut config = config(server);
         config.miner_id_public_keys = vec![key.to_string()];
-        config.max_retries = 0;
-        MapiBroadcaster::new(&config).expect("broadcaster builds")
+        on_budget(&config, 13, 0, 45)
     }
 
     /// A response signed by mapi-lite's own key is believed.
@@ -745,7 +793,7 @@ mod tests {
     }
 
     /// CS-618: the signer check runs alongside mapi-lite's `/ready`, so with
-    /// miner IDs pinned the probe still fits inside one `health_timeout`:
+    /// miner IDs pinned the probe still fits inside one probe timeout:
     /// with both answers taking 1.5s of a 2s timeout it takes about 1.5s.
     #[tokio::test]
     async fn cs_618_the_signer_check_keeps_the_probe_within_one_timeout() {
@@ -1099,12 +1147,8 @@ mod tests {
 
         // Six attempts of up to 2s each, plus back-off, is fifteen seconds and
         // more; the deadline ends it at three.
-        let mut config = config(&server);
-        config.timeout_seconds = 2;
-        config.max_retries = 5;
-        config.total_timeout_seconds = 3;
-        assert!(config.validate().is_ok(), "the test config is a legal one");
-        let broadcaster = MapiBroadcaster::new(&config).expect("broadcaster builds");
+        let config = config(&server);
+        let broadcaster = on_budget(&config, 2, 5, 3);
 
         let started = std::time::Instant::now();
         let error = broadcaster
@@ -1129,14 +1173,13 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/mapi/txs"))
             .respond_with(ResponseTemplate::new(500))
-            // one attempt plus max_retries
+            // one attempt and the budget's one retry
             .expect(2)
             .mount(&server)
             .await;
 
-        let mut config = config(&server);
-        config.max_retries = 1;
-        let broadcaster = MapiBroadcaster::new(&config).expect("broadcaster builds");
+        let config = config(&server);
+        let broadcaster = on_budget(&config, 13, 1, 45);
 
         let error = broadcaster
             .broadcast_tx(&sample_tx())
@@ -1158,9 +1201,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let mut config = config(&server);
-        config.max_retries = 1;
-        let broadcaster = MapiBroadcaster::new(&config).expect("broadcaster builds");
+        let config = config(&server);
+        let broadcaster = on_budget(&config, 13, 1, 45);
 
         let error = broadcaster
             .broadcast_tx(&sample_tx())
@@ -1216,10 +1258,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let mut config = config(&server);
-        config.max_retries = 1;
-        let error = MapiBroadcaster::new(&config)
-            .expect("broadcaster builds")
+        let error = on_budget(&config(&server), 13, 1, 45)
             .broadcast_tx(&tx)
             .await
             .expect_err("never settled");
@@ -1234,11 +1273,8 @@ mod tests {
     async fn sr_fund_011_an_unreachable_mapi_lite_is_a_failure_not_an_unknown_outcome() {
         // A port nothing is listening on: the connection is refused rather
         // than accepted and left hanging.
-        let mut config = MapiLiteConfig::for_base_url("http://127.0.0.1:1");
-        config.timeout_seconds = 2;
-        config.max_retries = 0;
-        config.total_timeout_seconds = 5;
-        let broadcaster = MapiBroadcaster::new(&config).expect("broadcaster builds");
+        let config = MapiLiteConfig::for_base_url("http://127.0.0.1:1");
+        let broadcaster = on_budget(&config, 2, 0, 5);
 
         let error = broadcaster
             .broadcast_tx(&sample_tx())
@@ -1319,40 +1355,55 @@ mod tests {
         }
     }
 
-    /// An attempt has to outlast mapi-lite's ceiling, with a second to spare
-    /// for the 504 to arrive, or a hung node is reported as this side's own
-    /// timeout (CS-510).
-    /// The warning for an attempt of `attempt` seconds against mapi-lite's
-    /// ceiling, as the broadcaster checks it: on the client it submits with
-    /// (CS-627).
-    fn budget_warning(attempt: u64, ceiling: u64) -> Option<String> {
-        let mut config = MapiLiteConfig::for_base_url("http://mapi-lite".to_string());
-        config.timeout_seconds = attempt;
-        MapiBroadcaster::new(&config)
-            .expect("broadcaster builds")
-            .submit
-            .submit_budget_warning(Duration::from_secs(ceiling))
+    /// A ceiling mapi-lite publishes sets the budget (CS-624): a 20s ceiling
+    /// gives 23s attempts, and inside the default 45s no retry fits.
+    #[tokio::test]
+    async fn sr_cfg_010_the_published_ceiling_sets_the_submit_budget() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ready"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ready": true,
+                "submitTimeoutSecs": 20,
+                "checks": {}
+            })))
+            .mount(&server)
+            .await;
+        let broadcaster = broadcaster(&server);
+        let assumed = broadcaster.submit_budget();
+        assert_eq!((assumed.attempt.as_secs(), assumed.retries), (13, 2));
+
+        broadcaster.health_check().await.expect("ready");
+        let budget = broadcaster.submit_budget();
+        assert_eq!((budget.attempt.as_secs(), budget.retries), (23, 0));
+        assert_eq!(budget.deadline, Duration::from_secs(45));
+        // And the client it submits with is the one built on it.
+        assert_eq!(broadcaster.submitter().timeout(), Some(budget.attempt));
     }
 
+    /// Every derived attempt clears mapi-lite's ceiling by uls-client's own
+    /// rule, unless the deadline cannot allow it, which is warned about
+    /// instead (SR-CFG-010).
     #[test]
-    fn sr_cfg_010_an_attempt_shorter_than_mapi_lite_s_ceiling_is_warned_about() {
-        for (attempt, ceiling) in [(10, 10), (5, 10), (10, 20)] {
-            let warning = budget_warning(attempt, ceiling)
-                .unwrap_or_else(|| panic!("{attempt}s against {ceiling}s was not warned about"));
-            assert!(warning.contains(&format!("{attempt}s")), "{warning}");
-            assert!(warning.contains(&format!("{ceiling}s")), "{warning}");
-        }
-        for (attempt, ceiling) in [(11, 10), (13, 10), (30, 10)] {
-            assert_eq!(budget_warning(attempt, ceiling), None);
-        }
-    }
-
-    /// The shipped defaults are aligned: FS's 13s attempt against mapi-lite's
-    /// 10s ceiling (CS-510).
-    #[test]
-    fn sr_cfg_010_the_default_attempt_clears_mapi_lite_s_default_ceiling() {
+    fn sr_cfg_010_a_derived_attempt_always_clears_mapi_lite_s_ceiling() {
         let config = MapiLiteConfig::for_base_url("http://mapi-lite".to_string());
-        assert_eq!(budget_warning(config.timeout_seconds, 10), None);
+        for seconds in 0..60 {
+            let ceiling = Duration::from_secs(seconds);
+            let budget = config.submit_budget(Some(ceiling));
+            let warning = MapiBroadcaster::with_budget(&config, budget)
+                .expect("broadcaster builds")
+                .submitter()
+                .submit_budget_warning(ceiling);
+            if budget.cuts_attempts_short(ceiling) {
+                assert!(
+                    config.deadline_warning(Some(ceiling)).is_some(),
+                    "{seconds}s"
+                );
+            } else {
+                assert_eq!(warning, None, "{seconds}s");
+                assert_eq!(config.deadline_warning(Some(ceiling)), None, "{seconds}s");
+            }
+        }
     }
 
     /// CS-627: mapi-lite's answer is read as uls-client's `ReadyReport`; a body
@@ -1417,9 +1468,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let mut config = config(&server);
-        config.health_timeout_seconds = 1;
-        let broadcaster = MapiBroadcaster::new(&config).expect("broadcaster builds");
+        let broadcaster = broadcaster(&server);
 
         let started = std::time::Instant::now();
         let error = broadcaster
@@ -1443,7 +1492,7 @@ mod tests {
 
     // ---- The retry budget actually running (issue #68) ----
 
-    /// `max_retries` has to mean attempts that happen. Before this, the total
+    /// The retries a budget buys have to be attempts that happen. Before this, the total
     /// deadline cut the default sequence off after one attempt and part of a
     /// second, so the number in the config was not the number that ran.
     ///
@@ -1454,19 +1503,16 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/mapi/txs"))
             .respond_with(ResponseTemplate::new(500))
-            .expect(3) // one attempt plus max_retries = 2
+            .expect(3) // one attempt plus the default budget's two retries
             .mount(&server)
             .await;
 
-        let config = config(&server);
-        assert_eq!(config.max_retries, 2, "the default this test is about");
+        let broadcaster = broadcaster(&server);
         assert_eq!(
-            config.attempts_within_deadline(),
-            3,
-            "the defaults must allow all three"
+            broadcaster.submit_budget().retries,
+            2,
+            "the default budget this test is about"
         );
-
-        let broadcaster = MapiBroadcaster::new(&config).expect("broadcaster builds");
         broadcaster
             .broadcast_tx(&sample_tx())
             .await
@@ -1484,11 +1530,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let mut config = config(&server);
-        config.timeout_seconds = 2;
-        config.max_retries = 10;
-        config.total_timeout_seconds = 3;
-        let broadcaster = MapiBroadcaster::new(&config).expect("broadcaster builds");
+        let config = config(&server);
+        let broadcaster = on_budget(&config, 2, 10, 3);
 
         let started = std::time::Instant::now();
         let error = broadcaster
@@ -1531,11 +1574,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let mut config = config(&server);
-        config.timeout_seconds = 1;
-        config.max_retries = 2;
-        config.total_timeout_seconds = 10;
-        let broadcaster = MapiBroadcaster::new(&config).expect("broadcaster builds");
+        let config = config(&server);
+        let broadcaster = on_budget(&config, 1, 2, 10);
 
         let txid = broadcaster
             .broadcast_tx(&tx)
@@ -1566,11 +1606,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let mut config = config(&server);
-        config.timeout_seconds = 1;
-        config.max_retries = 1;
-        config.total_timeout_seconds = 5;
-        let broadcaster = MapiBroadcaster::new(&config).expect("broadcaster builds");
+        let config = config(&server);
+        let broadcaster = on_budget(&config, 1, 1, 5);
 
         let error = broadcaster
             .broadcast_tx(&sample_tx())
@@ -1593,11 +1630,8 @@ mod tests {
     async fn sr_fund_013_backoff_exhausting_the_deadline_is_a_failure_not_unknown() {
         // Nothing is listening, so every attempt is refused immediately and
         // only the back-off takes any time.
-        let mut config = MapiLiteConfig::for_base_url("http://127.0.0.1:1");
-        config.timeout_seconds = 5;
-        config.max_retries = 5;
-        config.total_timeout_seconds = 5;
-        let broadcaster = MapiBroadcaster::new(&config).expect("broadcaster builds");
+        let config = MapiLiteConfig::for_base_url("http://127.0.0.1:1");
+        let broadcaster = on_budget(&config, 5, 5, 5);
 
         let error = broadcaster
             .broadcast_tx(&sample_tx())

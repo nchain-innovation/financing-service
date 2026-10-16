@@ -138,6 +138,8 @@ pub struct Service {
     /// How long a probe verdict is reused for. Zero without `[mapi_lite]`,
     /// where nothing is ever probed.
     mapi_health_ttl: Duration,
+    /// `Config::fund_worst_case`, for `GET /status` (CS-624).
+    fund_worst_case: Option<Duration>,
     /// Consecutive failures reaching the blockchain interface, so a run of
     /// them reads as a run and recovery from one is announced.
     chain_health: Mutex<ChainHealth>,
@@ -158,8 +160,6 @@ pub struct Service {
     /// starts at the rate in force rather than the one in the config file,
     /// which a fee quote may have superseded.
     fee_satoshis_per_kb: Mutex<u64>,
-    /// Whether to take the rate from mapi-lite's fee quote when there is one.
-    use_mapi_fee_quote: bool,
     /// `fees.max_satoshis_per_kb`: no quote may set a rate above it (CS-523).
     max_satoshis_per_kb: u64,
     /// Where each client's in-flight funding state is kept across a restart
@@ -399,18 +399,18 @@ impl Service {
             ready_max_chain_read_age: config.service.ready_max_chain_read_age(),
             chain_refresh_locks: std::sync::Mutex::new(HashMap::new()),
             fee_satoshis_per_kb: Mutex::new(config.fees.satoshis_per_kb),
-            use_mapi_fee_quote: config.fees.use_mapi_fee_quote,
             max_satoshis_per_kb: config.fees.max_satoshis_per_kb,
             inflight_state_path,
             inflight_save: Mutex::new(0),
             inflight_commits: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             inflight_writes: std::sync::atomic::AtomicU64::new(0),
-            mapi_health_ttl: config
-                .mapi_lite
-                .as_ref()
-                .map(|mapi_lite| mapi_lite.health_timeout())
-                .unwrap_or_default(),
+            fund_worst_case: config.fund_worst_case(),
+            mapi_health_ttl: if config.mapi_lite.is_some() {
+                crate::config::MAPI_LITE_PROBE_TIMEOUT
+            } else {
+                Duration::ZERO
+            },
         })
     }
 
@@ -753,26 +753,13 @@ impl Service {
     ///   meaningful -- each tracks its own UTXOs, so they would spend the same
     ///   coins -- and it is exactly what taking over another client's wallet
     ///   looks like, however the key was supplied: a `wif_env` naming that
-    ///   client's variable, the literal key, or an id that folds onto that
-    ///   client's override variable. Comparing addresses catches all three.
-    /// * **An id that folds onto another's.** `id.1` and `ID_1` share every
-    ///   `FS_CLIENT_ID_1_*` override, so whichever is set would apply to both.
+    ///   client's variable or the literal key. Comparing addresses catches
+    ///   both.
     async fn conflict_with_existing(
         clients: &HashMap<String, Arc<RwLock<Client>>>,
-        client_id: &str,
         address: &str,
     ) -> Option<CodedError> {
-        let suffix = crate::config::env_key_suffix(client_id);
-        for (existing_id, existing) in clients {
-            if crate::config::env_key_suffix(existing_id) == suffix {
-                return Some(CodedError::new(
-                    ErrorCode::InvalidRequest,
-                    format!(
-                        "client_id {client_id:?} shares the environment variables of existing \
-                         client {existing_id:?} (FS_CLIENT_{suffix}_*); choose a distinct id"
-                    ),
-                ));
-            }
+        for existing in clients.values() {
             if existing.read().await.get_address() == address {
                 return Some(CodedError::new(
                     ErrorCode::InvalidRequest,
@@ -834,9 +821,7 @@ impl Service {
                 ));
             }
             // Checked under the write lock, so two requests cannot both pass.
-            if let Some(error) =
-                Self::conflict_with_existing(&clients, &client_config.client_id, &address).await
-            {
+            if let Some(error) = Self::conflict_with_existing(&clients, &address).await {
                 return Err(error);
             }
             clients.insert(client_config.client_id.clone(), Arc::clone(&new_client));
@@ -873,6 +858,7 @@ impl Service {
             blockchain_status: *self.blockchain_status.read().await,
             blockchain_update_time: update_time,
             broadcaster: self.broadcaster.name().to_string(),
+            fund_worst_case_seconds: self.fund_worst_case.map(|bound| bound.as_secs()),
         }
     }
 
@@ -934,9 +920,6 @@ impl Service {
     /// Any failure leaves the current rate alone, so a mapi-lite that is down
     /// stops the rate changing rather than stopping funding.
     pub async fn refresh_fee_rate(&self) {
-        if !self.use_mapi_fee_quote {
-            return;
-        }
         let Some(rate) = self.broadcaster.fee_satoshis_per_kb().await else {
             return;
         };
@@ -1297,7 +1280,7 @@ impl Service {
     /// `None` when mapi-lite is not configured: there is then nothing to
     /// probe, and `/ready` reports chain reads alone.
     ///
-    /// The verdict is cached for `mapi_lite.health_timeout_seconds`, because
+    /// The verdict is cached for [`crate::config::MAPI_LITE_PROBE_TIMEOUT`], because
     /// `/ready` is unauthenticated *and* exempt from the rate limiter
     /// (SR-SEC-013), so without a cache anyone who can reach the port can turn
     /// readiness traffic into an unbounded stream of requests to mapi-lite and
@@ -1311,7 +1294,7 @@ impl Service {
 
         // Held across the probe on purpose: concurrent callers wait for the
         // one in flight rather than each starting their own, which is the
-        // point of the cache. The probe is bounded by health_timeout.
+        // point of the cache. The probe is bounded by MAPI_LITE_PROBE_TIMEOUT.
         let mut cached = self.mapi_health.lock().await;
         if let Some(entry) = cached.as_ref() {
             if entry.taken_at.elapsed() < self.mapi_health_ttl {
@@ -1320,7 +1303,7 @@ impl Service {
         }
 
         // At the same time, not one after the other: each is bounded by
-        // health_timeout, which the whole probe has to fit inside.
+        // MAPI_LITE_PROBE_TIMEOUT, which the whole probe has to fit inside.
         let (health, same_chain) = tokio::join!(
             self.broadcaster.health_check(),
             self.same_chain_as_mapi_lite()
@@ -1337,7 +1320,7 @@ impl Service {
     }
 
     /// The keys the authentication policy requires (CS-514), checked with
-    /// environment overrides applied and the clients loaded: on a production
+    /// `FS__` overrides applied and the clients loaded: on a production
     /// network without the opt-out, `admin_api_key` must be set, or
     /// `POST /client` and `DELETE /client` are open, and every client needs an
     /// `api_key`, or its `/fund`, balance and address are. See
@@ -1349,7 +1332,7 @@ impl Service {
         if self.admin_api_key.is_none() {
             return Err(format!(
                 "web_interface.admin_api_key is not set, so POST /client and DELETE /client would \
-                 be open on {}. Set it (or FS_ADMIN_API_KEY), or set \
+                 be open on {}. Set it (or FS__WEB_INTERFACE__ADMIN_API_KEY), or set \
                  web_interface.allow_unauthenticated = true if a gateway in front of this service \
                  authenticates callers",
                 self.network_type
@@ -1362,7 +1345,7 @@ impl Service {
         without.sort();
         Err(format!(
             "clients without an api_key: {}. Their /fund, balance and address routes would be \
-             open to anyone; give each an api_key (or FS_CLIENT_<ID>_API_KEY), or set \
+             open to anyone; give each an api_key (an env: reference keeps it out of the file), or set \
              web_interface.allow_unauthenticated = true if a gateway authenticates callers",
             without.join(", ")
         ))
@@ -3237,29 +3220,6 @@ mod tests {
         );
     }
 
-    /// Turning the quote off means the configured rate is authoritative, and
-    /// mapi-lite is not asked at all.
-    #[tokio::test]
-    async fn cs_451_the_quote_can_be_turned_off() {
-        use crate::test_support::StubMapiBroadcaster;
-
-        let mut config = test_config(&unique_dynamic_config_path());
-        config.fees.use_mapi_fee_quote = false;
-        config.fees.satoshis_per_kb = 175;
-
-        let blockchain = test_blockchain_interface(&config).await;
-        let broadcaster = StubMapiBroadcaster::quoting(Some(250));
-        let handed: Arc<dyn TxBroadcaster> = broadcaster.clone();
-        let service = service_with(&config, blockchain, handed).await;
-
-        service.refresh_fee_rate().await;
-
-        assert_eq!(broadcaster.quote_count(), 0, "not even asked");
-        assert_eq!(service.fee_satoshis_per_kb().await, 175);
-        let client = service.client_handle(TEST_CLIENT_ID).await.expect("client");
-        assert_eq!(client.read().await.fee_satoshis_per_kb(), 175);
-    }
-
     /// A client added after a quote has moved the rate must cost its
     /// transactions the same as one that was here all along.
     #[tokio::test]
@@ -3335,7 +3295,7 @@ mod tests {
     }
 
     /// CS-619: the chain check runs alongside mapi-lite's `/ready`, not after
-    /// it, so the probe still fits inside one `health_timeout`: with both
+    /// it, so the probe still fits inside one probe timeout: with both
     /// answers taking 1.5s of a 2s timeout it takes about 1.5s, not 3.
     #[tokio::test]
     async fn cs_619_the_chain_check_keeps_the_probe_within_one_timeout() {
@@ -3369,7 +3329,10 @@ mod tests {
 
         let config = test_config(&unique_dynamic_config_path());
         let mapi = MapiLiteConfig::for_base_url(server.uri());
-        assert_eq!(mapi.health_timeout(), Duration::from_secs(2));
+        assert_eq!(
+            crate::config::MAPI_LITE_PROBE_TIMEOUT,
+            Duration::from_secs(2)
+        );
         let broadcaster: Arc<dyn TxBroadcaster> = Arc::new(MapiBroadcaster::new(&mapi).unwrap());
         let blockchain = test_blockchain_interface(&config).await;
         let service = service_with(&config, blockchain, broadcaster).await;
@@ -3410,13 +3373,13 @@ mod tests {
     /// not reach mapi-lite once per request. Within the TTL the verdict is
     /// reused; past it a fresh probe is taken.
     #[tokio::test]
-    async fn sr_bchn_011_mapi_lite_health_is_cached_for_the_health_timeout() {
+    async fn sr_bchn_011_mapi_lite_health_is_cached_for_the_probe_timeout() {
         use crate::test_support::StubMapiBroadcaster;
 
         let mut config = test_config(&unique_dynamic_config_path());
-        let mut mapi_lite = crate::config::MapiLiteConfig::for_base_url("http://127.0.0.1:8080");
-        mapi_lite.health_timeout_seconds = 1;
-        config.mapi_lite = Some(mapi_lite);
+        config.mapi_lite = Some(crate::config::MapiLiteConfig::for_base_url(
+            "http://127.0.0.1:8080",
+        ));
 
         let blockchain = test_blockchain_interface(&config).await;
         let broadcaster = StubMapiBroadcaster::new(true);
@@ -3427,7 +3390,8 @@ mod tests {
         }
         assert_eq!(broadcaster.probe_count(), 1, "the verdict should be reused");
 
-        tokio::time::sleep(Duration::from_millis(1100)).await;
+        tokio::time::sleep(crate::config::MAPI_LITE_PROBE_TIMEOUT + Duration::from_millis(100))
+            .await;
         assert_eq!(service.mapi_lite_health().await, Some(Ok(())));
         assert_eq!(
             broadcaster.probe_count(),
@@ -4234,32 +4198,6 @@ mod tests {
             error.description
         );
         assert!(service.client_handle("thief").await.is_none());
-    }
-
-    /// `ID1` and `id.1`-style ids fold onto an existing client's override
-    /// variables, so whatever key those hold would fund both.
-    #[tokio::test]
-    async fn sr_sec_018_an_id_that_folds_onto_another_s_is_refused() {
-        let config = test_config(&unique_dynamic_config_path());
-        let blockchain = test_blockchain_interface(&config).await;
-        let service = Service::new_for_test(&config, blockchain).await;
-
-        let folded = TEST_CLIENT_ID.to_uppercase();
-        assert_ne!(folded, TEST_CLIENT_ID);
-        let error = service
-            .add_client(&ClientConfig {
-                client_id: folded,
-                wif_key: crate::test_support::OTHER_TEST_WIF.to_string(),
-                api_key: None,
-            })
-            .await
-            .expect_err("folds onto id1");
-        assert_eq!(error.code, ErrorCode::InvalidRequest);
-        assert!(
-            error.description.contains("FS_CLIENT_ID1_"),
-            "{}",
-            error.description
-        );
     }
 
     /// A pair added before the check existed is still found, at startup.

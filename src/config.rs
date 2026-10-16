@@ -1,10 +1,10 @@
-use std::{env, net::Ipv4Addr};
+use std::{env, net::SocketAddr, time::Duration};
 
 use chain_gang::network::Network;
 use log::debug;
 use serde::{Deserialize, Serialize};
 
-use crate::secrets::{resolve_secret, warn_plaintext_secrets};
+use crate::secrets::resolve_secret;
 
 /// Blockchain Interface Configuration
 #[derive(Debug, Deserialize, Clone)]
@@ -19,7 +19,7 @@ pub struct BlockchainInterfaceConfig {
     #[serde(default)]
     pub rpc_user: Option<String>,
     /// JSON-RPC password, for `interface_type = "rpc"`. Takes an
-    /// `env:VAR_NAME` reference, and is overridden by `FS_RPC_PASSWORD`.
+    /// `env:VAR_NAME` reference, or `FS__BLOCKCHAIN_INTERFACE__RPC_PASSWORD`.
     #[serde(default)]
     pub rpc_password: Option<String>,
     /// Whether to ask the node to watch each client's funding address at
@@ -150,11 +150,6 @@ pub struct ClientConfig {
     pub api_key: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize, Clone)]
-pub struct LoggingConfig {
-    pub level: String,
-}
-
 /// OpenTelemetry trace export configuration.
 #[derive(Debug, Default, Deserialize, Clone)]
 pub struct TelemetryConfig {
@@ -250,15 +245,6 @@ pub struct FeesConfig {
     /// never underpays and risks a rejection.
     #[serde(default = "default_satoshis_per_kb")]
     pub satoshis_per_kb: u64,
-    /// When `[mapi_lite]` is configured, take the rate from its `feeQuote`
-    /// instead of `satoshis_per_kb`, so one server sets the rate for every
-    /// service that broadcasts through it.
-    ///
-    /// `satoshis_per_kb` stays the fallback: it is used before the first quote
-    /// arrives, and whenever a refresh fails. Without `[mapi_lite]` this has
-    /// no effect, because there is nothing to ask.
-    #[serde(default = "default_use_mapi_fee_quote")]
-    pub use_mapi_fee_quote: bool,
     /// The highest rate a mapi-lite fee quote may set, in satoshis per KB
     /// (CS-523, SR-SEC-020). A quote above it is ignored and the current rate
     /// kept, so a forged or mistaken quote cannot make every funding
@@ -273,7 +259,6 @@ impl Default for FeesConfig {
     fn default() -> Self {
         FeesConfig {
             satoshis_per_kb: default_satoshis_per_kb(),
-            use_mapi_fee_quote: default_use_mapi_fee_quote(),
             max_satoshis_per_kb: default_max_satoshis_per_kb(),
         }
     }
@@ -317,10 +302,6 @@ fn default_satoshis_per_kb() -> u64 {
     DEFAULT_SATOSHIS_PER_KB
 }
 
-fn default_use_mapi_fee_quote() -> bool {
-    true
-}
-
 impl Default for IdempotencyConfig {
     fn default() -> Self {
         IdempotencyConfig {
@@ -360,8 +341,9 @@ impl IdempotencyConfig {
 /// the named mapi-lite server instead of through the `[blockchain_interface]`;
 /// chain reads (balances, UTXOs) are unaffected. The two settings that select
 /// and authenticate the server mirror the ones teranode-event-rs uses for the
-/// same integration (`mapi_base_url`, `auth_token`); the rest bound how long a
-/// funding call may wait on mapi-lite.
+/// same integration (`mapi_base_url`, `auth_token`). One setting bounds how
+/// long a funding call may wait on mapi-lite, `total_timeout_seconds`; the
+/// rest of the timing is derived (CS-624).
 #[derive(Debug, Deserialize, Clone, PartialEq)]
 pub struct MapiLiteConfig {
     /// Base URL of the mapi-lite server, e.g. `http://127.0.0.1:8080`.
@@ -369,31 +351,20 @@ pub struct MapiLiteConfig {
     /// through [`MapiLiteConfig::base_url`] rather than touching the field,
     /// so what was validated is what gets requested.
     pub base_url: String,
-    /// Sent verbatim as the `Authorization` header on every request, so it
-    /// must include the scheme: `"Bearer <secret>"`. Takes an `env:VAR_NAME`
-    /// reference, and is overridden by `FS_MAPI_LITE_AUTH_TOKEN`.
+    /// The token alone, as mapi-lite's own `auth_token` is (CS-624): every
+    /// request carries `Authorization: Bearer <token>`, see
+    /// [`MapiLiteConfig::authorization`]. A value starting `Bearer ` is
+    /// refused at startup. Takes an `env:VAR_NAME` reference, or
+    /// `FS__MAPI_LITE__AUTH_TOKEN`.
     #[serde(default)]
     pub auth_token: Option<String>,
-    /// Per-request timeout for transaction submits, in seconds.
-    #[serde(default = "default_mapi_lite_timeout_seconds")]
-    pub timeout_seconds: u64,
-    /// Timeout for the mapi-lite probe behind `GET /ready`, in seconds. Must
-    /// be under three seconds, and is rejected at startup otherwise: a probe
-    /// slower than the few seconds a readiness probe allows
-    /// would mark the container unhealthy even while mapi-lite is fine.
-    #[serde(default = "default_mapi_lite_health_timeout_seconds")]
-    pub health_timeout_seconds: u64,
-    /// How many times a submit is retried after a transient failure (an HTTP
-    /// 5xx or a transport error) before `/fund` reports `broadcast_failed`.
-    /// Resubmitting is safe: mapi-lite answers a known transaction with
-    /// success.
-    #[serde(default = "default_mapi_lite_max_retries")]
-    pub max_retries: u32,
     /// Upper bound on a whole submit -- every attempt and every back-off
-    /// between them -- in seconds. Without it the worst case is
-    /// `timeout_seconds * (max_retries + 1)` plus back-off, which against a
-    /// wedged mapi-lite holds a `/fund` request, and the worker serving it,
-    /// open for minutes. Must be at least `timeout_seconds`.
+    /// between them -- in seconds: the one timing setting for this hop
+    /// (CS-624). Each attempt outlasts the submit ceiling mapi-lite publishes
+    /// by [`SUBMIT_CEILING_MARGIN`], and as many retries run as fit inside
+    /// it: see [`SubmitBudget`]. It is what a `/fund` caller, and the worker
+    /// serving it, can be held by a wedged mapi-lite, and part of the worst
+    /// case `GET /status` publishes.
     #[serde(default = "default_mapi_lite_total_timeout_seconds")]
     pub total_timeout_seconds: u64,
     /// mapi-lite's miner-ID public keys, as hex: the `minerId` in every
@@ -405,41 +376,82 @@ pub struct MapiLiteConfig {
     pub miner_id_public_keys: Vec<String>,
 }
 
-/// One attempt's ceiling.
-///
-/// Chosen with `max_retries` and `total_timeout_seconds` so all three attempts
-/// actually fit: 3 x 13s of attempts plus 3s of back-off is 42s, inside the
-/// 45s deadline. It was 30s, which made the deadline cut the sequence off
-/// after one attempt and part of a second, so the stated retry count was not
-/// what ran. The worst case a `/fund` caller waits is unchanged at 45s; what
-/// changed is that the retries inside it are real.
-fn default_mapi_lite_timeout_seconds() -> u64 {
-    13
-}
-
-fn default_mapi_lite_health_timeout_seconds() -> u64 {
-    2
-}
-
-fn default_mapi_lite_max_retries() -> u32 {
-    2
-}
-
 fn default_mapi_lite_total_timeout_seconds() -> u64 {
     45
 }
 
-/// Back-off between submit attempts, mirrored from `broadcaster::mapi` so the
-/// budget arithmetic below describes what the broadcaster actually does.
-const RETRY_BACKOFF_BASE_SECONDS: u64 = 1;
-const RETRY_BACKOFF_CAP_SECONDS: u64 = 5;
+/// mapi-lite's own default submit ceiling (its `submit_timeout_sec`),
+/// assumed until its `/ready` publishes the one it runs with (CS-624).
+pub const ASSUMED_SUBMIT_CEILING: Duration = Duration::from_secs(10);
 
-/// `/ready` answers orchestrator readiness probes, which allow a probe a few
-/// seconds at most (Docker's health check defaults to `--timeout=3s`). A
-/// mapi-lite probe slower than that is killed by the caller rather than
-/// answered, marking the instance unready on every check even while mapi-lite
-/// is fine -- so the bound is rejected at startup rather than only documented.
-const MAPI_LITE_HEALTH_TIMEOUT_LIMIT_SECONDS: u64 = 3;
+/// How far an attempt outlasts mapi-lite's submit ceiling, so that its `504`
+/// for a hung node arrives before this side gives up: the answer still has to
+/// cross the network. uls-client warns below one second; three keeps the 13s
+/// attempt the defaults have always had against mapi-lite's default 10s.
+pub const SUBMIT_CEILING_MARGIN: Duration = Duration::from_secs(3);
+
+/// The bound on the mapi-lite probe behind `GET /ready`, and how long its
+/// verdict is cached (CS-624, as Event's). Under the three seconds a readiness
+/// probe allows (Docker's `--timeout=3s` default): a slower probe is killed
+/// by the caller rather than answered, marking the instance unready on every
+/// check even while mapi-lite is fine.
+pub const MAPI_LITE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The wait before submit retry `n` is `n` times this, capped at
+/// [`RETRY_BACKOFF_CAP`]: uls-client's own default since v0.5.0, set here so
+/// it does not change under this service with a later release.
+pub const RETRY_BACKOFF_BASE: Duration = Duration::from_secs(1);
+pub const RETRY_BACKOFF_CAP: Duration = Duration::from_secs(5);
+
+/// The wait before submit retry `n` (from 1).
+pub fn retry_backoff(n: u32) -> Duration {
+    (RETRY_BACKOFF_BASE * n).min(RETRY_BACKOFF_CAP)
+}
+
+/// How a submit spends `mapi_lite.total_timeout_seconds` (CS-624).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubmitBudget {
+    /// The bound on each attempt.
+    pub attempt: Duration,
+    /// Attempts after the first.
+    pub retries: u32,
+    /// The bound on the whole submit, back-off included.
+    pub deadline: Duration,
+}
+
+impl SubmitBudget {
+    /// The budget against mapi-lite's submit `ceiling`: each attempt outlasts
+    /// it by [`SUBMIT_CEILING_MARGIN`], cut to the deadline if it must be, and
+    /// as many retries as fit inside the deadline when every attempt runs to
+    /// its bound and every back-off is waited out. Each retry it buys is a
+    /// real one; none starts that the deadline would cut off.
+    pub fn new(ceiling: Duration, deadline: Duration) -> Self {
+        let attempt = (ceiling + SUBMIT_CEILING_MARGIN).min(deadline);
+        let mut elapsed = attempt;
+        let mut retries = 0;
+        loop {
+            let next = elapsed + retry_backoff(retries + 1) + attempt;
+            if next > deadline {
+                break;
+            }
+            elapsed = next;
+            retries += 1;
+        }
+        SubmitBudget {
+            attempt,
+            retries,
+            deadline,
+        }
+    }
+
+    /// Whether the deadline leaves an attempt less time than mapi-lite needs
+    /// to answer a hung node itself, at `ceiling`: the node is then reported
+    /// as this side's deadline rather than mapi-lite's `504`. The outcome is
+    /// unknown either way; it is only reported by the wrong layer.
+    pub fn cuts_attempts_short(&self, ceiling: Duration) -> bool {
+        self.attempt < ceiling + SUBMIT_CEILING_MARGIN
+    }
+}
 
 impl MapiLiteConfig {
     /// A section naming only `base_url`, with every other field at its default.
@@ -448,12 +460,17 @@ impl MapiLiteConfig {
         MapiLiteConfig {
             base_url: base_url.into(),
             auth_token: None,
-            timeout_seconds: default_mapi_lite_timeout_seconds(),
-            health_timeout_seconds: default_mapi_lite_health_timeout_seconds(),
-            max_retries: default_mapi_lite_max_retries(),
             total_timeout_seconds: default_mapi_lite_total_timeout_seconds(),
             miner_id_public_keys: Vec::new(),
         }
+    }
+
+    /// The `Authorization` header every request to mapi-lite carries, when
+    /// a token is configured.
+    pub fn authorization(&self) -> Option<String> {
+        self.auth_token
+            .as_deref()
+            .map(|token| format!("Bearer {token}"))
     }
 
     /// The configured base URL, normalised: surrounding whitespace removed and
@@ -465,64 +482,35 @@ impl MapiLiteConfig {
         self.base_url.trim().trim_end_matches('/')
     }
 
-    pub fn timeout(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(self.timeout_seconds)
-    }
-
-    pub fn health_timeout(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(self.health_timeout_seconds)
-    }
-
     pub fn total_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.total_timeout_seconds)
     }
 
-    /// How many submit attempts can actually start before the deadline cuts
-    /// the sequence off.
-    ///
-    /// The three fields interact and nothing makes that obvious: an operator
-    /// who raises `max_retries` for resilience may get no extra attempts at
-    /// all. This walks the sequence the broadcaster runs -- attempt, back-off,
-    /// attempt -- against `total_timeout_seconds` and reports what will
-    /// really happen, assuming the worst case where every attempt runs to its
-    /// full timeout.
-    pub fn attempts_within_deadline(&self) -> u32 {
-        let mut elapsed = 0u64;
-        let mut started = 0u32;
-        for attempt in 1..=(self.max_retries + 1) {
-            if elapsed >= self.total_timeout_seconds {
-                break;
-            }
-            started = attempt;
-            elapsed += self
-                .timeout_seconds
-                .min(self.total_timeout_seconds - elapsed);
-            let backoff =
-                (RETRY_BACKOFF_BASE_SECONDS * attempt as u64).min(RETRY_BACKOFF_CAP_SECONDS);
-            elapsed += backoff;
-        }
-        started
+    /// The submit budget against mapi-lite's published submit `ceiling`, or
+    /// [`ASSUMED_SUBMIT_CEILING`] until it has published one.
+    pub fn submit_budget(&self, ceiling: Option<Duration>) -> SubmitBudget {
+        SubmitBudget::new(
+            ceiling.unwrap_or(ASSUMED_SUBMIT_CEILING),
+            self.total_timeout(),
+        )
     }
 
-    /// A warning for a section whose retry budget cannot fit its deadline, or
-    /// `None` when the three fields agree.
-    ///
-    /// Warn rather than reject: the combination still works, it just does
-    /// fewer attempts than it says, and refusing to start would break
-    /// deployments that have been running on it.
-    pub fn retry_budget_warning(&self) -> Option<String> {
-        let configured = self.max_retries + 1;
-        let actual = self.attempts_within_deadline();
-        if actual >= configured {
-            return None;
-        }
-        Some(format!(
-            "mapi_lite: max_retries = {} asks for {configured} submit attempts, but only {actual} \
-             can start within total_timeout_seconds = {}s at timeout_seconds = {}s (plus \
-             back-off). Raise total_timeout_seconds or lower timeout_seconds/max_retries so the \
-             three agree.",
-            self.max_retries, self.total_timeout_seconds, self.timeout_seconds
-        ))
+    /// Why the deadline cuts every attempt short against mapi-lite's
+    /// `ceiling`, or `None` when an attempt can wait for its answer.
+    pub fn deadline_warning(&self, ceiling: Option<Duration>) -> Option<String> {
+        let ceiling = ceiling.unwrap_or(ASSUMED_SUBMIT_CEILING);
+        let budget = self.submit_budget(Some(ceiling));
+        budget.cuts_attempts_short(ceiling).then(|| {
+            format!(
+                "mapi_lite.total_timeout_seconds is {}s, but mapi-lite answers a submit it cannot \
+                 finish at {}s: every attempt is cut to {}s, so a hung node is reported as this \
+                 service's deadline instead of mapi-lite's answer. Raise it to at least {}s",
+                self.total_timeout_seconds,
+                ceiling.as_secs(),
+                budget.attempt.as_secs(),
+                (ceiling + SUBMIT_CEILING_MARGIN).as_secs()
+            )
+        })
     }
 
     /// Reject a section the broadcaster cannot work with, at startup rather
@@ -537,29 +525,8 @@ impl MapiLiteConfig {
                 "mapi_lite.base_url must start with http:// or https://, got '{base_url}'"
             ));
         }
-        if self.timeout_seconds == 0 {
-            return Err("mapi_lite.timeout_seconds must be greater than zero".to_string());
-        }
-        if self.health_timeout_seconds == 0 {
-            return Err("mapi_lite.health_timeout_seconds must be greater than zero".to_string());
-        }
-        if self.health_timeout_seconds >= MAPI_LITE_HEALTH_TIMEOUT_LIMIT_SECONDS {
-            return Err(format!(
-                "mapi_lite.health_timeout_seconds must be less than \
-                 {MAPI_LITE_HEALTH_TIMEOUT_LIMIT_SECONDS}, so GET /ready answers inside a \
-                 readiness probe's own timeout, got {}",
-                self.health_timeout_seconds
-            ));
-        }
         if self.total_timeout_seconds == 0 {
             return Err("mapi_lite.total_timeout_seconds must be greater than zero".to_string());
-        }
-        if self.total_timeout_seconds < self.timeout_seconds {
-            return Err(format!(
-                "mapi_lite.total_timeout_seconds ({}) must be at least timeout_seconds ({}), \
-                 otherwise not even the first attempt can finish",
-                self.total_timeout_seconds, self.timeout_seconds
-            ));
         }
         for key in &self.miner_id_public_keys {
             if !is_public_key_hex(key) {
@@ -573,14 +540,17 @@ impl MapiLiteConfig {
     }
 
     /// The startup warning for a section that names no miner ID (CS-523).
+    /// On mainnet and testnet it is an error instead: see
+    /// [`Config::check_miner_id_pin`].
     pub fn unpinned_warning(&self) -> Option<&'static str> {
-        self.miner_id_public_keys.is_empty().then_some(
-            "mapi_lite.miner_id_public_keys is empty: responses from mapi-lite are signed, but \
-             by a key nothing checks, so anyone able to answer in its place can forge an \
-             'accepted' or a fee quote. Set it to mapi-lite's minerId.",
-        )
+        self.miner_id_public_keys.is_empty().then_some(UNPINNED)
     }
 }
+
+/// Why an empty `miner_id_public_keys` is warned about, or refused.
+const UNPINNED: &str = "mapi_lite.miner_id_public_keys is empty: responses from mapi-lite are \
+     signed, but by a key nothing checks, so anyone able to answer in its place can forge an \
+     'accepted' or a fee quote. Set it to mapi-lite's minerId.";
 
 /// A secp256k1 public key in hex: compressed (33 bytes, `02`/`03`) or
 /// uncompressed (65 bytes, `04`). The shape only; whether it is on the curve is
@@ -609,10 +579,11 @@ pub struct DynamicConfigConfig {
     /// (CS-521, SR-SEC-018). Default [`DEFAULT_WIF_ENV_PREFIX`].
     ///
     /// Without it, `wif_env` could name any variable in the process
-    /// environment -- another client's `FS_CLIENT_<ID>_WIF` among them -- and
+    /// environment -- another client's key variable among them -- and
     /// whoever could add a client could fund from that wallet under a key of
     /// their own. With it, only variables the operator has set aside for
-    /// runtime clients can be named. It may not overlap `FS_CLIENT_`.
+    /// runtime clients can be named. It may not overlap `FS__`, the
+    /// configuration overrides, which carry secrets (CS-624).
     #[serde(default = "default_wif_env_prefix")]
     pub wif_env_prefix: String,
 }
@@ -625,16 +596,18 @@ fn default_wif_env_prefix() -> String {
 }
 
 impl DynamicConfigConfig {
-    /// The prefix must be a usable variable-name start that no per-client
-    /// override (`FS_CLIENT_<ID>_WIF`) can begin with.
+    /// The prefix must be a usable variable-name start that no configuration
+    /// override (`FS__...`) can begin with.
     pub fn validate(&self) -> Result<(), String> {
         let prefix = &self.wif_env_prefix;
         crate::secrets::validate_env_var_name(prefix)
             .map_err(|e| format!("dynamic_config.wif_env_prefix: {e}"))?;
-        if prefix.starts_with(CLIENT_ENV_PREFIX) || CLIENT_ENV_PREFIX.starts_with(prefix.as_str()) {
+        if prefix.starts_with(ENV_OVERRIDE_PREFIX)
+            || ENV_OVERRIDE_PREFIX.starts_with(prefix.as_str())
+        {
             return Err(format!(
-                "dynamic_config.wif_env_prefix {prefix:?} overlaps {CLIENT_ENV_PREFIX:?}, the \
-                 prefix of every client's own key variable"
+                "dynamic_config.wif_env_prefix {prefix:?} overlaps {ENV_OVERRIDE_PREFIX:?}, the \
+                 prefix of the configuration overrides, which carry secrets"
             ));
         }
         Ok(())
@@ -693,11 +666,10 @@ impl RateLimitConfig {
     }
 }
 
-/// Web Interface Configuration
-#[derive(Debug, Deserialize, Clone)]
+/// Web Interface Configuration. Every key has a default, so the section may
+/// be left out.
+#[derive(Debug, Default, Deserialize, Clone)]
 pub struct WebInterfaceConfig {
-    pub address: Ipv4Addr,
-    pub port: u16,
     /// When set, required for `POST /client`.
     #[serde(default)]
     pub admin_api_key: Option<String>,
@@ -712,24 +684,19 @@ pub struct WebInterfaceConfig {
     pub allow_unauthenticated: bool,
 }
 
-impl Default for WebInterfaceConfig {
-    fn default() -> Self {
-        WebInterfaceConfig {
-            address: Ipv4Addr::new(0, 0, 0, 0),
-            port: 0,
-            admin_api_key: None,
-            rate_limit: RateLimitConfig::default(),
-            allow_unauthenticated: false,
-        }
-    }
-}
-
 /// Service Configuration
 #[derive(Debug, Default, Deserialize, Clone)]
 pub struct Config {
+    /// Where the REST API listens, `host:port` (CS-624), as `listen_addr` is
+    /// in Event and mapi-lite. Default [`DEFAULT_LISTEN_ADDR`], loopback: the
+    /// funding routes are not exposed until an operator chooses to. The
+    /// Docker image sets `FS__LISTEN_ADDR=0.0.0.0:8080`, since a container's
+    /// own loopback cannot be reached from outside it.
+    #[serde(default = "default_listen_addr")]
+    pub listen_addr: String,
     pub blockchain_interface: BlockchainInterfaceConfig,
+    #[serde(default)]
     pub web_interface: WebInterfaceConfig,
-    pub logging: LoggingConfig,
     #[serde(default)]
     pub telemetry: TelemetryConfig,
     pub service: ServiceConfig,
@@ -799,6 +766,45 @@ impl Config {
         Ok(())
     }
 
+    /// The longest a single-transaction `POST /fund` can take, published in
+    /// `GET /status` so a caller can give up later than this service does
+    /// (CS-624): a chain read already running for the client, which it
+    /// queues behind, then its own; the broadcast; and the chain read after a
+    /// commit is refused. Chain reads are bounded by
+    /// `blockchain_interface.timeout_seconds`, the broadcast by
+    /// `mapi_lite.total_timeout_seconds`, or the same per-call bound without
+    /// `[mapi_lite]`. `None` when chain reads have no deadline, so nothing
+    /// bounds it.
+    ///
+    /// Requests queued behind a failing chain read each wait their turn, so
+    /// during an outage a request can take longer; and `multiple_tx` repeats
+    /// the broadcast and its reads per transaction.
+    pub fn fund_worst_case(&self) -> Option<Duration> {
+        let read = self.blockchain_interface.call_timeout()?;
+        let broadcast = match &self.mapi_lite {
+            Some(mapi_lite) => mapi_lite.total_timeout(),
+            None => read,
+        };
+        Some(read * 3 + broadcast)
+    }
+
+    /// On mainnet and testnet, `[mapi_lite]` must name the keys its answers
+    /// are signed with (CS-624). Unpinned, a forged "accepted" spends real or
+    /// shared coins on a transaction that never left; elsewhere it is still
+    /// allowed, with a warning.
+    pub fn check_miner_id_pin(&self) -> Result<(), String> {
+        match &self.mapi_lite {
+            Some(mapi_lite) if self.is_production_network() => match mapi_lite.unpinned_warning() {
+                Some(why) => Err(format!(
+                    "{why} It is required on {}.",
+                    self.blockchain_interface.network_type
+                )),
+                None => Ok(()),
+            },
+            _ => Ok(()),
+        }
+    }
+
     /// Return the configured network as Network type
     /// Refuse a chain-read backend this configuration cannot serve (CS-601).
     ///
@@ -836,62 +842,38 @@ impl Config {
         }
     }
 
-    // Return the log level (as a log::Level type) from the config
-    pub fn get_log_level(&self) -> Result<log::Level, String> {
-        match self.logging.level.as_str() {
-            "error" => Ok(log::Level::Error),
-            "warn" | "warning" => Ok(log::Level::Warn),
-            "info" | "information" => Ok(log::Level::Info),
-            "debug" => Ok(log::Level::Debug),
-            "trace" => Ok(log::Level::Trace),
-            other => Err(format!("Unknown log level '{other}'")),
-        }
-    }
-
-    /// Resolve secret references and apply environment overrides.
+    /// Resolve `env:VAR_NAME` references in the secret fields.
+    ///
+    /// The named overrides that used to take precedence here --
+    /// `FS_ADMIN_API_KEY`, `FS_RPC_USER`, `FS_RPC_PASSWORD`,
+    /// `FS_MAPI_LITE_AUTH_TOKEN` and each client's `FS_CLIENT_<ID>_WIF` and
+    /// `_API_KEY` -- are gone (CS-624). Any setting can be overridden with
+    /// `FS__<TABLE>__<KEY>`, applied when the file is read; a client's keys,
+    /// which live in an array, are `env:` references in the file.
     pub fn resolve_secrets(mut self) -> Result<Self, String> {
-        if let Ok(admin_api_key) = env::var("FS_ADMIN_API_KEY") {
-            if !admin_api_key.is_empty() {
-                self.web_interface.admin_api_key = Some(admin_api_key);
-            }
-        } else if let Some(admin_api_key) = self.web_interface.admin_api_key.take() {
-            self.web_interface.admin_api_key = Some(resolve_secret(&admin_api_key)?);
-        }
-
-        // The node's RPC credentials are secrets like any other.
-        if let Ok(rpc_user) = env::var("FS_RPC_USER") {
-            if !rpc_user.is_empty() {
-                self.blockchain_interface.rpc_user = Some(rpc_user);
-            }
-        } else if let Some(rpc_user) = self.blockchain_interface.rpc_user.take() {
-            self.blockchain_interface.rpc_user = Some(resolve_secret(&rpc_user)?);
-        }
-
-        if let Ok(rpc_password) = env::var("FS_RPC_PASSWORD") {
-            if !rpc_password.is_empty() {
-                self.blockchain_interface.rpc_password = Some(rpc_password);
-            }
-        } else if let Some(rpc_password) = self.blockchain_interface.rpc_password.take() {
-            self.blockchain_interface.rpc_password = Some(resolve_secret(&rpc_password)?);
-        }
-
-        // The mapi-lite token is a bearer credential like the API keys.
+        let resolve = |value: Option<String>| -> Result<Option<String>, String> {
+            value.map(|v| resolve_secret(&v)).transpose()
+        };
+        self.web_interface.admin_api_key = resolve(self.web_interface.admin_api_key.take())?;
+        self.blockchain_interface.rpc_user = resolve(self.blockchain_interface.rpc_user.take())?;
+        self.blockchain_interface.rpc_password =
+            resolve(self.blockchain_interface.rpc_password.take())?;
         if let Some(mapi_lite) = self.mapi_lite.as_mut() {
-            if let Ok(auth_token) = env::var("FS_MAPI_LITE_AUTH_TOKEN") {
-                if !auth_token.is_empty() {
-                    mapi_lite.auth_token = Some(auth_token);
-                } else if let Some(auth_token) = mapi_lite.auth_token.take() {
-                    mapi_lite.auth_token = Some(resolve_secret(&auth_token)?);
-                }
-            } else if let Some(auth_token) = mapi_lite.auth_token.take() {
-                mapi_lite.auth_token = Some(resolve_secret(&auth_token)?);
-            }
+            mapi_lite.auth_token = resolve(mapi_lite.auth_token.take())?;
             // An empty token and no token mean the same thing: send none.
             if mapi_lite.auth_token.as_deref() == Some("") {
                 mapi_lite.auth_token = None;
             }
+            // Checked once resolved, where the value an env: reference or
+            // override supplied can be seen. The message never repeats it.
+            if mapi_lite
+                .auth_token
+                .as_deref()
+                .is_some_and(|token| token.contains(char::is_whitespace))
+            {
+                return Err(MAPI_LITE_TOKEN_SHAPE.to_string());
+            }
         }
-
         if let Some(clients) = self.client.as_mut() {
             let resolved = std::mem::take(clients)
                 .into_iter()
@@ -899,88 +881,65 @@ impl Config {
                 .collect::<Result<Vec<_>, _>>()?;
             *clients = resolved;
         }
-
         Ok(self)
     }
 }
 
 fn resolve_client_config(mut client: ClientConfig) -> Result<ClientConfig, String> {
-    if let Ok(wif_key) = env::var(client_wif_env_var(&client.client_id)) {
-        if !wif_key.is_empty() {
-            client.wif_key = wif_key;
-        } else {
-            client.wif_key = resolve_secret(&client.wif_key)?;
-        }
-    } else {
-        client.wif_key = resolve_secret(&client.wif_key)?;
-    }
-
-    if let Ok(api_key) = env::var(client_api_key_env_var(&client.client_id)) {
-        if !api_key.is_empty() {
-            client.api_key = Some(api_key);
-        } else if let Some(key) = client.api_key.take() {
-            client.api_key = Some(resolve_secret(&key)?);
-        }
-    } else if let Some(api_key) = client.api_key.take() {
-        client.api_key = Some(resolve_secret(&api_key)?);
-    }
-
+    client.wif_key = resolve_secret(&client.wif_key)?;
+    client.api_key = client.api_key.map(|key| resolve_secret(&key)).transpose()?;
     Ok(client)
 }
 
-/// What every per-client environment override starts with.
-const CLIENT_ENV_PREFIX: &str = "FS_CLIENT_";
+/// Why a `mapi_lite.auth_token` holding a scheme, or any space, is refused.
+const MAPI_LITE_TOKEN_SHAPE: &str = "mapi_lite.auth_token holds the token alone, which is sent as \
+     `Authorization: Bearer <token>`: drop the \"Bearer \" prefix and any spaces (CS-624)";
 
-fn client_wif_env_var(client_id: &str) -> String {
-    format!("{CLIENT_ENV_PREFIX}{}_WIF", env_key_suffix(client_id))
+/// What every configuration override's name starts with (CS-624):
+/// `FS__WEB_INTERFACE__ADMIN_API_KEY` sets `web_interface.admin_api_key`.
+pub const ENV_OVERRIDE_PREFIX: &str = "FS__";
+
+/// The variable naming the configuration file, as `TE_CONFIG` and
+/// `MAPI_CONFIG` do for the other two services (CS-624).
+pub const CONFIG_FILE_ENV: &str = "FS_CONFIG";
+
+/// The configuration file when [`CONFIG_FILE_ENV`] is unset.
+pub const DEFAULT_CONFIG_FILE: &str = "data/financing-service.toml";
+
+/// The configuration file to read: [`CONFIG_FILE_ENV`], else
+/// [`DEFAULT_CONFIG_FILE`].
+pub fn config_file() -> String {
+    env::var(CONFIG_FILE_ENV)
+        .ok()
+        .filter(|path| !path.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_CONFIG_FILE.to_string())
 }
 
-fn client_api_key_env_var(client_id: &str) -> String {
-    format!("{CLIENT_ENV_PREFIX}{}_API_KEY", env_key_suffix(client_id))
+/// Where the REST API listens when `listen_addr` is not set.
+pub const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:8080";
+
+fn default_listen_addr() -> String {
+    DEFAULT_LISTEN_ADDR.to_string()
 }
 
-/// The part of a client's override variables that comes from its id.
-///
-/// Not one-to-one: case and punctuation fold, so `id.1` and `ID_1` share
-/// `FS_CLIENT_ID_1_WIF`. Two clients that fold together would both take
-/// whatever key that variable holds, so `POST /client` refuses an id that
-/// folds onto an existing client's (CS-521).
-pub(crate) fn env_key_suffix(client_id: &str) -> String {
-    client_id
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() {
-                ch.to_ascii_uppercase()
-            } else {
-                '_'
-            }
+impl Config {
+    /// `listen_addr` as a socket address, or why it is not one.
+    pub fn listen_socket_addr(&self) -> Result<SocketAddr, String> {
+        self.listen_addr.parse().map_err(|e| {
+            format!(
+                "listen_addr {:?} is not host:port, e.g. \"127.0.0.1:8080\": {e}",
+                self.listen_addr
+            )
         })
-        .collect()
-}
-
-/// Return the HTTP bind address and port, honouring `APP_ENV=docker`.
-///
-/// In a container a loopback address is replaced with `0.0.0.0`: loopback
-/// there is the container's own, which nothing published from the host can
-/// reach, so a config file written for a bare-metal run would otherwise give a
-/// container that answers nobody. Which host interfaces see the port is then
-/// decided where it is published (`run.sh` publishes it on the host's
-/// loopback). Any other configured address is honoured (CS-527): it used to be
-/// overridden to `0.0.0.0` too, so a container given a specific interface, or
-/// run with `--network host`, listened on every interface instead.
-pub fn web_bind_address(config: &Config) -> (Ipv4Addr, u16) {
-    let port = config.web_interface.port;
-    let address = config.web_interface.address;
-    match env::var_os("APP_ENV") {
-        Some(content) if content == "docker" && address.is_loopback() => {
-            (Ipv4Addr::UNSPECIFIED, port)
-        }
-        Some(_) | None => (address, port),
     }
 }
 
-pub fn load_config(env_var: &str, filename: &str) -> Result<Config, String> {
-    let config = get_config(env_var, filename)?;
+/// Read, validate and resolve the configuration in `path` (CS-624): the TOML
+/// file, then `FS__` environment overrides, then `env:` references. A key no
+/// setting reads -- in the file or an override -- is refused, naming it.
+pub fn load_config(path: &str) -> Result<Config, String> {
+    let config = get_config(path)?;
+    config.listen_socket_addr()?;
     config.web_interface.rate_limit.validate()?;
     config.telemetry.validate()?;
     config.idempotency.validate()?;
@@ -993,33 +952,57 @@ pub fn load_config(env_var: &str, filename: &str) -> Result<Config, String> {
     if let Some(mapi_lite) = &config.mapi_lite {
         mapi_lite.validate()?;
     }
-    warn_plaintext_secrets(&config);
+    config.check_miner_id_pin()?;
     config.resolve_secrets()
 }
 
-/// Read the config from the provided file
-fn read_config(filename: &str) -> Result<Config, String> {
-    debug!("read_config = {}", filename);
-    // Given filename read the config
-    let content = std::fs::read_to_string(filename).map_err(|e| e.to_string())?;
-    let config = toml::from_str(&content).map_err(|e| e.to_string())?;
-    Ok(config)
+/// The configuration in `path` alone, without `FS__` overrides: what the
+/// plaintext-secret warning reads, since a secret an override supplies is in
+/// the environment already, which is what the warning asks for. `main` warns
+/// once logging is up; a warning issued while loading would go nowhere.
+pub fn file_only(path: &str) -> Result<Config, String> {
+    read_layers(path, false)
 }
 
-/// Read the config from environment variable, if not read from filename
-pub fn get_config(env_var: &str, filename: &str) -> Result<Config, String> {
-    match env::var_os(env_var) {
-        Some(content) => {
-            let val = content
-                .into_string()
-                .map_err(|_| format!("Environment variable {env_var} is not valid UTF-8"))?;
-            serde_json::from_str(&val)
-                .map_err(|e| format!("Error parsing JSON environment variable {env_var}: {e}"))
-        }
-        None => {
-            read_config(filename).map_err(|e| format!("Error reading config file {filename}: {e}"))
-        }
+/// The configuration in `path` with `FS__` overrides applied, before
+/// validation and secret resolution.
+pub fn get_config(path: &str) -> Result<Config, String> {
+    read_layers(path, true)
+}
+
+/// The file, and the `FS__` environment when `with_env`, as one [`Config`].
+fn read_layers(path: &str, with_env: bool) -> Result<Config, String> {
+    debug!("read_config = {}", path);
+    let mut builder = config::Config::builder()
+        .add_source(config::File::new(path, config::FileFormat::Toml).required(true));
+    if with_env {
+        builder = builder.add_source(
+            // Values stay text until a setting reads them, which then
+            // parses "8080" or "true" as its own type. `try_parsing` would
+            // parse first, so a key of "007" would arrive as "7".
+            config::Environment::with_prefix("FS")
+                .prefix_separator("__")
+                .separator("__"),
+        );
     }
+    let built = builder
+        .build()
+        .map_err(|e| format!("Error reading config file {path}: {e}"))?;
+    let mut unused = Vec::new();
+    let config: Config = serde_ignored::deserialize(built, |key| {
+        // serde_ignored writes an Option's inside as a `?` segment.
+        unused.push(key.to_string().replace(".?", ""))
+    })
+    .map_err(|e| format!("Error in config file {path}: {e}"))?;
+    if !unused.is_empty() {
+        unused.sort();
+        return Err(format!(
+            "configuration keys no setting reads: {}. Check the spelling: a key belongs in the \
+             [table] it is written under, and an override is {ENV_OVERRIDE_PREFIX}<TABLE>__<KEY>",
+            unused.join(", ")
+        ));
+    }
+    Ok(config)
 }
 
 #[cfg(test)]
@@ -1035,12 +1018,9 @@ mod tests {
         unsafe { env::set_var("FS_TEST_CONFIG_WIF", "test-wif-value") };
         unsafe { env::set_var("FS_TEST_CONFIG_API_KEY", "test-api-key") };
         unsafe { env::set_var("FS_TEST_CONFIG_ADMIN", "admin-from-env") };
-        unsafe { env::remove_var("FS_CLIENT_ID1_WIF") };
 
         let config = Config {
             web_interface: WebInterfaceConfig {
-                address: Ipv4Addr::new(127, 0, 0, 1),
-                port: 8080,
                 admin_api_key: Some("env:FS_TEST_CONFIG_ADMIN".to_string()),
                 rate_limit: RateLimitConfig::default(),
                 allow_unauthenticated: false,
@@ -1061,47 +1041,6 @@ mod tests {
         let client = resolved.client.as_ref().unwrap().first().unwrap();
         assert_eq!(client.wif_key, "test-wif-value");
         assert_eq!(client.api_key.as_deref(), Some("test-api-key"));
-    }
-
-    #[test]
-    fn resolve_secrets_applies_client_env_overrides() {
-        let _env = env_lock();
-        unsafe { env::set_var("FS_CLIENT_ID1_WIF", "override-wif") };
-        let config = Config {
-            client: Some(vec![ClientConfig {
-                client_id: "id1".to_string(),
-                wif_key: "env:SHOULD_NOT_BE_USED".to_string(),
-                api_key: None,
-            }]),
-            ..Default::default()
-        };
-        let resolved = config.resolve_secrets().unwrap();
-        assert_eq!(resolved.client.as_ref().unwrap()[0].wif_key, "override-wif");
-        unsafe { env::remove_var("FS_CLIENT_ID1_WIF") };
-    }
-
-    #[test]
-    fn sr_sec_008_resolve_secrets_applies_client_api_key_env_override() {
-        let _env = env_lock();
-        unsafe { env::set_var("FS_CLIENT_ID1_API_KEY", "override-api-key") };
-        let config = Config {
-            client: Some(vec![ClientConfig {
-                client_id: "id1".to_string(),
-                wif_key: "env:FS_TEST_CONFIG_WIF".to_string(),
-                api_key: Some("env:SHOULD_NOT_BE_USED".to_string()),
-            }]),
-            ..Default::default()
-        };
-        unsafe { env::set_var("FS_TEST_CONFIG_WIF", "test-wif-value") };
-        let resolved = config.resolve_secrets().unwrap();
-        assert_eq!(
-            resolved.client.as_ref().unwrap()[0].api_key.as_deref(),
-            Some("override-api-key")
-        );
-        unsafe {
-            env::remove_var("FS_CLIENT_ID1_API_KEY");
-            env::remove_var("FS_TEST_CONFIG_WIF");
-        }
     }
 
     #[test]
@@ -1131,17 +1070,14 @@ mod tests {
         std::fs::write(
             &path,
             r#"
+listen_addr = "127.0.0.1:9091"
+
 [blockchain_interface]
 interface_type = "test"
 network_type = "testnet"
 
 [web_interface]
-address = "127.0.0.1"
 allow_unauthenticated = true  # testnet without keys (CS-514)
-port = 9091
-
-[logging]
-level = "info"
 
 [service]
 utxo_refresh_period = 45
@@ -1152,81 +1088,184 @@ filename = "./data/dynamic.toml"
         )
         .unwrap();
 
-        unsafe { env::remove_var("FS_CONFIG") };
-        let config = load_config("FS_CONFIG", path.to_str().unwrap()).unwrap();
-        assert_eq!(config.web_interface.port, 9091);
+        let config = load_config(path.to_str().unwrap()).unwrap();
+        assert_eq!(config.listen_addr, "127.0.0.1:9091");
         assert_eq!(config.service.utxo_refresh_period, 45);
     }
 
+    /// `FS_CONFIG` names the file, as `TE_CONFIG` and `MAPI_CONFIG` do; it
+    /// no longer holds the configuration itself (CS-624).
     #[test]
-    fn sr_cfg_002_get_config_reads_fs_config_json() {
+    fn sr_cfg_002_fs_config_names_the_file() {
         let _env = env_lock();
-        unsafe {
-            env::set_var(
-                "FS_CONFIG",
-                r#"{"blockchain_interface":{"interface_type":"test","network_type":"testnet"},"web_interface":{"address":"127.0.0.1","port":9092,"allow_unauthenticated":true},"logging":{"level":"info"},"service":{"utxo_refresh_period":30},"dynamic_config":{"filename":"./data/dynamic.toml"}}"#,
+        unsafe { env::remove_var(CONFIG_FILE_ENV) };
+        assert_eq!(config_file(), DEFAULT_CONFIG_FILE);
+        let path = write_temp_config("named", MINIMAL_TOML);
+        unsafe { env::set_var(CONFIG_FILE_ENV, &path) };
+        assert_eq!(config_file(), path.to_str().unwrap());
+        let config = load_config(&config_file()).unwrap();
+        assert_eq!(config.listen_addr, DEFAULT_LISTEN_ADDR);
+        unsafe { env::remove_var(CONFIG_FILE_ENV) };
+    }
+
+    /// Runs `body` with `vars` set, removing them after, under the env lock.
+    fn with_env<T>(vars: &[(&str, &str)], body: impl FnOnce() -> T) -> T {
+        let _env = env_lock();
+        for (name, value) in vars {
+            unsafe { env::set_var(name, value) };
+        }
+        let result = body();
+        for (name, _) in vars {
+            unsafe { env::remove_var(name) };
+        }
+        result
+    }
+
+    /// `FS__<TABLE>__<KEY>` overrides any setting the file holds, or adds
+    /// one it does not, with its value taken as the setting's type (CS-624).
+    #[test]
+    fn sr_cfg_002_fs_overrides_any_setting() {
+        let path = write_temp_config("override", MINIMAL_TOML);
+        let config = with_env(
+            &[
+                ("FS__LISTEN_ADDR", "0.0.0.0:9093"),
+                ("FS__WEB_INTERFACE__ADMIN_API_KEY", "admin-from-env"),
+                ("FS__SERVICE__UTXO_REFRESH_PERIOD", "15"),
+            ],
+            || load_config(path.to_str().unwrap()).unwrap(),
+        );
+        assert_eq!(config.listen_addr, "0.0.0.0:9093");
+        assert_eq!(
+            config.web_interface.admin_api_key.as_deref(),
+            Some("admin-from-env")
+        );
+        assert_eq!(config.service.utxo_refresh_period, 15);
+    }
+
+    /// A secret set by override is taken as written: a key of digits keeps
+    /// its leading zeros and one that reads as a number stays text.
+    #[test]
+    fn sr_sec_008_an_override_secret_is_taken_verbatim() {
+        let path = write_temp_config("verbatim", MINIMAL_TOML);
+        for secret in ["007", "1e5", "true", "0x10"] {
+            let config = with_env(&[("FS__WEB_INTERFACE__ADMIN_API_KEY", secret)], || {
+                load_config(path.to_str().unwrap()).unwrap()
+            });
+            assert_eq!(
+                config.web_interface.admin_api_key.as_deref(),
+                Some(secret),
+                "{secret:?}"
             );
         }
-        let config = get_config("FS_CONFIG", "missing-file.toml").unwrap();
-        assert_eq!(config.web_interface.port, 9092);
-        unsafe { env::remove_var("FS_CONFIG") };
     }
 
+    /// A key no setting reads -- misspelt, or under the wrong table -- is
+    /// refused at startup with its name, whether the file or an override
+    /// holds it, rather than silently leaving the setting at its default.
     #[test]
-    fn sr_cfg_003_web_bind_address_uses_all_interfaces_in_docker() {
-        let _env = env_lock();
-        unsafe { env::set_var("APP_ENV", "docker") };
-        let config = Config {
-            web_interface: WebInterfaceConfig {
-                address: Ipv4Addr::new(127, 0, 0, 1),
-                port: 8080,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        assert_eq!(web_bind_address(&config), (Ipv4Addr::new(0, 0, 0, 0), 8080));
-        unsafe { env::remove_var("APP_ENV") };
-    }
-
-    /// CS-527: only a loopback address is replaced in a container. One the
-    /// operator chose -- a specific interface, say, under `--network host` --
-    /// is what the service binds.
-    #[test]
-    fn sr_cfg_003_web_bind_address_honours_a_non_loopback_address_in_docker() {
-        let _env = env_lock();
-        unsafe { env::set_var("APP_ENV", "docker") };
-        let config = Config {
-            web_interface: WebInterfaceConfig {
-                address: Ipv4Addr::new(10, 1, 2, 3),
-                port: 8080,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        assert_eq!(
-            web_bind_address(&config),
-            (Ipv4Addr::new(10, 1, 2, 3), 8080)
+    fn sr_cfg_002_a_key_no_setting_reads_is_refused() {
+        let path = write_temp_config(
+            "unknown",
+            &MINIMAL_TOML.replace("[web_interface]", "[web_interface]\nprot = 8081"),
         );
-        unsafe { env::remove_var("APP_ENV") };
+        let err = with_env(&[], || load_config(path.to_str().unwrap()).unwrap_err());
+        assert!(err.contains("web_interface.prot"), "{err}");
+
+        let path = write_temp_config("unknown-env", MINIMAL_TOML);
+        let err = with_env(&[("FS__FEES__SATOSHIS_PER_KBYTE", "100")], || {
+            load_config(path.to_str().unwrap()).unwrap_err()
+        });
+        assert!(err.contains("fees.satoshis_per_kbyte"), "{err}");
+        assert!(err.contains("FS__<TABLE>__<KEY>"), "{err}");
     }
 
+    /// The overrides that preceded `FS__` are gone, so a deployment still
+    /// setting one learns nothing changed only by reading the docs: they no
+    /// longer take effect (CS-624).
     #[test]
-    fn sr_cfg_006_get_log_level_accepts_configured_levels() {
-        for (level, expected) in [
-            ("error", log::Level::Error),
-            ("warn", log::Level::Warn),
-            ("info", log::Level::Info),
-            ("debug", log::Level::Debug),
-            ("trace", log::Level::Trace),
-        ] {
-            let config = Config {
-                logging: LoggingConfig {
-                    level: level.to_string(),
-                },
-                ..Default::default()
-            };
-            assert_eq!(config.get_log_level().unwrap(), expected);
-        }
+    fn sr_sec_008_the_retired_named_overrides_are_not_read() {
+        let path = write_temp_config(
+            "retired",
+            &format!(
+                "{MINIMAL_TOML}\n[[client]]\nclient_id = \"id1\"\nwif_key = \"in-file-wif\"\n"
+            ),
+        );
+        let config = with_env(
+            &[
+                ("FS_ADMIN_API_KEY", "retired"),
+                ("FS_CLIENT_ID1_WIF", "retired"),
+                ("FS_CLIENT_ID1_API_KEY", "retired"),
+            ],
+            || {
+                get_config(path.to_str().unwrap())
+                    .unwrap()
+                    .resolve_secrets()
+                    .unwrap()
+            },
+        );
+        assert_eq!(config.web_interface.admin_api_key, None);
+        let client = &config.client.unwrap()[0];
+        assert_eq!(client.wif_key, "in-file-wif");
+        assert_eq!(client.api_key, None);
+    }
+
+    /// The plaintext-secret warning reads the file alone: a secret an
+    /// override supplies is already where the warning asks for it.
+    #[test]
+    fn sr_sec_008_the_file_layer_excludes_overrides() {
+        let path = write_temp_config("file-layer", MINIMAL_TOML);
+        let (file_only, merged) = with_env(&[("FS__WEB_INTERFACE__ADMIN_API_KEY", "k")], || {
+            (
+                read_layers(path.to_str().unwrap(), false).unwrap(),
+                read_layers(path.to_str().unwrap(), true).unwrap(),
+            )
+        });
+        assert_eq!(file_only.web_interface.admin_api_key, None);
+        assert_eq!(merged.web_interface.admin_api_key.as_deref(), Some("k"));
+    }
+
+    /// The REST API listens on loopback unless told otherwise; the address
+    /// is checked at startup, naming the setting (CS-624).
+    #[test]
+    fn sr_cfg_003_listen_addr_defaults_to_loopback_and_is_checked() {
+        let path = write_temp_config("listen", MINIMAL_TOML);
+        let config = with_env(&[], || load_config(path.to_str().unwrap()).unwrap());
+        let addr = config.listen_socket_addr().unwrap();
+        assert!(addr.ip().is_loopback(), "{addr}");
+        assert_eq!(addr.port(), 8080);
+
+        let err = with_env(&[("FS__LISTEN_ADDR", "0.0.0.0")], || {
+            load_config(path.to_str().unwrap()).unwrap_err()
+        });
+        assert!(err.contains("listen_addr"), "{err}");
+    }
+
+    /// The settings `listen_addr` replaced are refused, not ignored, so a
+    /// file written for an earlier version cannot quietly listen elsewhere.
+    #[test]
+    fn sr_cfg_003_the_retired_address_and_port_are_refused() {
+        let path = write_temp_config(
+            "retired-address",
+            &MINIMAL_TOML.replace(
+                "[web_interface]",
+                "[web_interface]\naddress = \"127.0.0.1\"\nport = 8080",
+            ),
+        );
+        let err = with_env(&[], || load_config(path.to_str().unwrap()).unwrap_err());
+        assert!(err.contains("web_interface.address"), "{err}");
+        assert!(err.contains("web_interface.port"), "{err}");
+    }
+
+    /// The level is `RUST_LOG`'s, as in Event and mapi-lite; a `[logging]`
+    /// section is refused rather than silently ignored (CS-624).
+    #[test]
+    fn sr_cfg_006_a_logging_section_is_refused() {
+        let path = write_temp_config(
+            "logging",
+            &format!("{MINIMAL_TOML}\n[logging]\nlevel = \"debug\"\n"),
+        );
+        let err = with_env(&[], || load_config(path.to_str().unwrap()).unwrap_err());
+        assert!(err.contains("no setting reads: logging"), "{err}");
     }
 
     #[test]
@@ -1364,8 +1403,6 @@ filename = "./data/dynamic.toml"
     fn sr_sec_014_rpc_password_resolves_from_an_env_reference() {
         let _guard = crate::test_support::env_lock();
         unsafe { std::env::set_var("FS_TEST_RPC_PASSWORD", "from-env") };
-        unsafe { std::env::remove_var("FS_RPC_PASSWORD") };
-        unsafe { std::env::remove_var("FS_RPC_USER") };
         let config = Config {
             blockchain_interface: rpc_interface_config(
                 Some("127.0.0.1:18443"),
@@ -1380,26 +1417,6 @@ filename = "./data/dynamic.toml"
             Some("from-env")
         );
         unsafe { std::env::remove_var("FS_TEST_RPC_PASSWORD") };
-    }
-
-    #[test]
-    fn sr_sec_014_fs_rpc_password_env_overrides_the_config() {
-        let _guard = crate::test_support::env_lock();
-        unsafe { std::env::set_var("FS_RPC_PASSWORD", "override") };
-        let config = Config {
-            blockchain_interface: rpc_interface_config(
-                Some("127.0.0.1:18443"),
-                Some("rpcuser"),
-                Some("in-file"),
-            ),
-            ..Default::default()
-        };
-        let resolved = config.resolve_secrets().unwrap();
-        assert_eq!(
-            resolved.blockchain_interface.rpc_password.as_deref(),
-            Some("override")
-        );
-        unsafe { std::env::remove_var("FS_RPC_PASSWORD") };
     }
 
     #[test]
@@ -1439,8 +1456,7 @@ filename = "./data/dynamic.toml"
     #[test]
     fn sr_nfr_007_load_config_returns_error_for_invalid_file() {
         let _env = env_lock();
-        unsafe { env::remove_var("FS_CONFIG") };
-        let err = load_config("FS_CONFIG", "definitely-missing-config.toml").unwrap_err();
+        let err = load_config("definitely-missing-config.toml").unwrap_err();
         assert!(err.contains("Error reading config file"));
     }
 
@@ -1449,6 +1465,15 @@ filename = "./data/dynamic.toml"
         let content = std::fs::read_to_string("data/financing-service.toml").unwrap();
         let config: Config = toml::from_str(&content).unwrap();
         assert_eq!(config.service.utxo_refresh_period, 60);
+    }
+
+    /// The shipped sample is read by the real loader, so a key it holds that
+    /// no setting reads -- one a later change retires, say -- fails here
+    /// rather than at an operator's first start.
+    #[test]
+    fn sr_cfg_002_the_sample_config_holds_only_keys_settings_read() {
+        let config = with_env(&[], || get_config(DEFAULT_CONFIG_FILE).unwrap());
+        assert_eq!(config.listen_addr, DEFAULT_LISTEN_ADDR);
     }
 
     #[test]
@@ -1472,12 +1497,7 @@ interface_type = "test"
 network_type = "testnet"
 
 [web_interface]
-address = "127.0.0.1"
 allow_unauthenticated = true  # testnet without keys (CS-514)
-port = 8080
-
-[logging]
-level = "info"
 
 [telemetry]
 enabled = true
@@ -1492,8 +1512,7 @@ filename = "./data/dynamic.toml"
         )
         .unwrap();
 
-        unsafe { env::remove_var("FS_CONFIG") };
-        let err = load_config("FS_CONFIG", path.to_str().unwrap()).unwrap_err();
+        let err = load_config(path.to_str().unwrap()).unwrap_err();
         assert!(err.contains("telemetry.otlp_endpoint"));
     }
 
@@ -1505,12 +1524,7 @@ interface_type = "test"
 network_type = "testnet"
 
 [web_interface]
-address = "127.0.0.1"
 allow_unauthenticated = true  # testnet without keys (CS-514)
-port = 8080
-
-[logging]
-level = "info"
 
 [service]
 utxo_refresh_period = 60
@@ -1526,10 +1540,6 @@ filename = "./data/dynamic.toml"
         let config: Config = toml::from_str(MINIMAL_TOML).unwrap();
         assert_eq!(config.fees.satoshis_per_kb, DEFAULT_SATOSHIS_PER_KB);
         assert_eq!(config.fees.satoshis_per_kb, 100);
-        assert!(
-            config.fees.use_mapi_fee_quote,
-            "the quote is used by default when there is a mapi-lite to ask"
-        );
         assert!(config.fees.validate().is_ok());
     }
 
@@ -1539,17 +1549,32 @@ filename = "./data/dynamic.toml"
         let only_rate: Config =
             toml::from_str(&format!("{MINIMAL_TOML}\n[fees]\nsatoshis_per_kb = 250\n")).unwrap();
         assert_eq!(only_rate.fees.satoshis_per_kb, 250);
-        assert!(only_rate.fees.use_mapi_fee_quote);
+        assert_eq!(
+            only_rate.fees.max_satoshis_per_kb,
+            DEFAULT_MAX_SATOSHIS_PER_KB
+        );
 
-        let only_flag: Config = toml::from_str(&format!(
-            "{MINIMAL_TOML}\n[fees]\nuse_mapi_fee_quote = false\n"
+        let only_ceiling: Config = toml::from_str(&format!(
+            "{MINIMAL_TOML}\n[fees]\nmax_satoshis_per_kb = 500\n"
         ))
         .unwrap();
-        assert_eq!(only_flag.fees.satoshis_per_kb, DEFAULT_SATOSHIS_PER_KB);
-        assert!(!only_flag.fees.use_mapi_fee_quote);
+        assert_eq!(only_ceiling.fees.satoshis_per_kb, DEFAULT_SATOSHIS_PER_KB);
+        assert_eq!(only_ceiling.fees.max_satoshis_per_kb, 500);
 
         // Those are the only two. The dust threshold is derived from the rate
         // rather than configured, so there is no third key (CS-452).
+    }
+
+    /// With `[mapi_lite]` its fee quote always sets the rate; the switch that
+    /// could turn it off is refused rather than ignored (CS-624).
+    #[test]
+    fn sr_fund_024_use_mapi_fee_quote_is_refused() {
+        let path = write_temp_config(
+            "fee-switch",
+            &format!("{MINIMAL_TOML}\n[fees]\nuse_mapi_fee_quote = false\n"),
+        );
+        let err = with_env(&[], || load_config(path.to_str().unwrap()).unwrap_err());
+        assert!(err.contains("fees.use_mapi_fee_quote"), "{err}");
     }
 
     /// A zero rate builds transactions nothing relays, and the service would
@@ -1562,8 +1587,7 @@ filename = "./data/dynamic.toml"
             "fees-zero",
             &format!("{MINIMAL_TOML}\n[fees]\nsatoshis_per_kb = 0\n"),
         );
-        unsafe { env::remove_var("FS_CONFIG") };
-        let err = load_config("FS_CONFIG", path.to_str().unwrap()).unwrap_err();
+        let err = load_config(path.to_str().unwrap()).unwrap_err();
         assert!(err.contains("fees.satoshis_per_kb"), "{err}");
     }
 
@@ -1601,9 +1625,16 @@ filename = "./data/dynamic.toml"
         path
     }
 
-    /// The minimal config plus a `[mapi_lite]` section holding `fields`.
+    /// The minimal config plus a `[mapi_lite]` section holding `fields`,
+    /// pinned to a miner ID unless `fields` names its own: the minimal config
+    /// is testnet, where an unpinned section is refused (CS-624).
     fn with_mapi_lite_section(fields: &str) -> String {
-        format!("{MINIMAL_TOML}\n[mapi_lite]\n{fields}")
+        let pin = if fields.contains("miner_id_public_keys") {
+            String::new()
+        } else {
+            format!("miner_id_public_keys = [\"{PINNED_KEY}\"]\n")
+        };
+        format!("{MINIMAL_TOML}\n[mapi_lite]\n{fields}{pin}")
     }
 
     fn config_with_mapi_lite(auth_token: Option<&str>) -> Config {
@@ -1634,59 +1665,126 @@ filename = "./data/dynamic.toml"
         let mapi_lite = config.mapi_lite.expect("section present");
         assert_eq!(mapi_lite.base_url, "http://127.0.0.1:8080");
         assert_eq!(mapi_lite.auth_token, None);
-        assert_eq!(mapi_lite.timeout_seconds, 13);
-        assert_eq!(mapi_lite.health_timeout_seconds, 2);
-        assert_eq!(mapi_lite.max_retries, 2);
         assert_eq!(mapi_lite.total_timeout_seconds, 45);
         assert!(mapi_lite.validate().is_ok());
     }
 
-    /// The defaults have to be a set that can all happen at once, or
-    /// `max_retries` is describing attempts that never run.
+    /// Against mapi-lite's default 10s ceiling and the default 45s deadline,
+    /// the budget the three settings it replaces used to give: 13s attempts,
+    /// two retries (CS-624).
     #[test]
-    fn sr_cfg_009_the_default_retry_budget_fits_the_default_deadline() {
+    fn sr_cfg_009_the_default_budget_is_13s_attempts_and_two_retries() {
         let config = MapiLiteConfig::for_base_url("http://127.0.0.1:8080");
-        assert_eq!(
-            config.attempts_within_deadline(),
-            config.max_retries + 1,
-            "all {} attempts should fit in {}s",
-            config.max_retries + 1,
-            config.total_timeout_seconds
-        );
-        assert_eq!(config.retry_budget_warning(), None);
+        let budget = config.submit_budget(None);
+        assert_eq!(budget, config.submit_budget(Some(ASSUMED_SUBMIT_CEILING)));
+        assert_eq!(budget.attempt, Duration::from_secs(13));
+        assert_eq!(budget.retries, 2);
+        assert_eq!(budget.deadline, Duration::from_secs(45));
+        assert_eq!(config.deadline_warning(None), None);
     }
 
-    /// The combination the issue describes: three attempts asked for, one and
-    /// a bit delivered. It is legal, so it still starts -- but it says so.
+    /// The attempt follows the ceiling mapi-lite publishes, and the retries
+    /// are what then fit: every one of them can run to its bound, with its
+    /// back-off, inside the deadline (CS-624).
     #[test]
-    fn sr_cfg_009_a_budget_that_cannot_fit_is_warned_about() {
-        let mut config = MapiLiteConfig::for_base_url("http://127.0.0.1:8080");
-        config.timeout_seconds = 30;
-        config.max_retries = 2;
-        config.total_timeout_seconds = 45;
-
-        assert_eq!(config.attempts_within_deadline(), 2);
-        let warning = config
-            .retry_budget_warning()
-            .expect("an unfittable budget is warned about");
-        assert!(warning.contains("3 submit attempts"), "{warning}");
-        assert!(warning.contains("only 2"), "{warning}");
-        // still a legal section: warn, do not refuse to start
-        assert!(config.validate().is_ok());
+    fn sr_cfg_009_the_budget_follows_mapi_lite_s_ceiling() {
+        let secs = Duration::from_secs;
+        for (ceiling, deadline, attempt, retries) in [
+            (10, 45, 13, 2),
+            (20, 45, 23, 0),
+            (2, 45, 5, 5),
+            (10, 13, 13, 0),
+            (10, 120, 13, 6),
+        ] {
+            let budget = SubmitBudget::new(secs(ceiling), secs(deadline));
+            assert_eq!(
+                (budget.attempt, budget.retries),
+                (secs(attempt), retries),
+                "{ceiling}s ceiling, {deadline}s deadline"
+            );
+        }
+        for ceiling in 0..40 {
+            for deadline in 1..120 {
+                let budget = SubmitBudget::new(secs(ceiling), secs(deadline));
+                let worst = budget.attempt * (budget.retries + 1)
+                    + (1..=budget.retries).map(retry_backoff).sum::<Duration>();
+                assert!(
+                    worst <= budget.deadline,
+                    "{ceiling}s/{deadline}s: {budget:?} takes {worst:?}"
+                );
+                let one_more = worst + retry_backoff(budget.retries + 1) + budget.attempt;
+                assert!(
+                    one_more > budget.deadline,
+                    "{ceiling}s/{deadline}s: {budget:?}"
+                );
+            }
+        }
     }
 
-    /// Raising `max_retries` alone is the trap the issue names: without more
-    /// deadline it buys nothing, and the operator is told so.
+    /// A deadline shorter than one attempt against the ceiling cuts every
+    /// attempt short, so a hung node is reported as this side's deadline. It
+    /// still works, so it is warned about, naming the value that would not.
     #[test]
-    fn sr_cfg_009_raising_max_retries_alone_is_warned_about() {
+    fn sr_cfg_010_a_deadline_shorter_than_an_attempt_is_warned_about() {
         let mut config = MapiLiteConfig::for_base_url("http://127.0.0.1:8080");
-        config.max_retries = 10;
-        let attempts = config.attempts_within_deadline();
+        config.total_timeout_seconds = 12;
+        let warning = config.deadline_warning(None).expect("12s < 10s + 3s");
         assert!(
-            attempts < 11,
-            "11 attempts cannot fit 45s at 13s each, got {attempts}"
+            warning.contains("total_timeout_seconds is 12s"),
+            "{warning}"
         );
-        assert!(config.retry_budget_warning().is_some());
+        assert!(warning.contains("at least 13s"), "{warning}");
+        let budget = config.submit_budget(None);
+        assert_eq!(
+            (budget.attempt, budget.retries),
+            (Duration::from_secs(12), 0)
+        );
+        assert!(config.validate().is_ok());
+
+        let warning = MapiLiteConfig::for_base_url("http://127.0.0.1:8080")
+            .deadline_warning(Some(Duration::from_secs(60)))
+            .expect("45s < 60s + 3s");
+        assert!(warning.contains("at 60s"), "{warning}");
+        assert!(warning.contains("at least 63s"), "{warning}");
+    }
+
+    /// What `GET /status` publishes: three chain reads and the broadcast, or
+    /// nothing when chain reads have no deadline (CS-624).
+    #[test]
+    fn sr_cfg_011_the_fund_worst_case_is_three_reads_and_the_broadcast() {
+        let mut config: Config = toml::from_str(MINIMAL_TOML).unwrap();
+        // Without [mapi_lite] the broadcast is one more interface call.
+        assert_eq!(config.fund_worst_case(), Some(Duration::from_secs(4 * 30)));
+        config.mapi_lite = Some(MapiLiteConfig::for_base_url("http://mapi"));
+        assert_eq!(
+            config.fund_worst_case(),
+            Some(Duration::from_secs(3 * 30 + 45))
+        );
+        config.blockchain_interface.timeout_seconds = Some(5);
+        assert_eq!(
+            config.fund_worst_case(),
+            Some(Duration::from_secs(3 * 5 + 45))
+        );
+        config.blockchain_interface.timeout_seconds = Some(0);
+        assert_eq!(config.fund_worst_case(), None);
+    }
+
+    /// The settings the budget replaces are refused, not ignored (CS-624).
+    #[test]
+    fn sr_cfg_009_the_retired_timings_are_refused() {
+        for key in [
+            "timeout_seconds = 5",
+            "max_retries = 1",
+            "health_timeout_seconds = 1",
+        ] {
+            let path = write_temp_config(
+                "retired-timing",
+                &with_mapi_lite_section(&format!("base_url = \"http://mapi\"\n{key}\n")),
+            );
+            let err = with_env(&[], || load_config(path.to_str().unwrap()).unwrap_err());
+            let name = key.split(' ').next().unwrap();
+            assert!(err.contains(&format!("mapi_lite.{name}")), "{err}");
+        }
     }
 
     /// Whatever `validate` checked has to be what the client requests, so the
@@ -1719,18 +1817,14 @@ filename = "./data/dynamic.toml"
     #[test]
     fn sr_cfg_008_mapi_lite_section_accepts_every_field() {
         let content = with_mapi_lite_section(
-            "base_url = \"https://mapi.example:8443/\"\nauth_token = \"Bearer secret\"\ntimeout_seconds = 5\nhealth_timeout_seconds = 1\nmax_retries = 0\n",
+            "base_url = \"https://mapi.example:8443/\"\nauth_token = \"secret\"\ntotal_timeout_seconds = 30\n",
         );
         let config: Config = toml::from_str(&content).unwrap();
         let mapi_lite = config.mapi_lite.expect("section present");
         assert_eq!(mapi_lite.base_url, "https://mapi.example:8443/");
-        assert_eq!(mapi_lite.auth_token.as_deref(), Some("Bearer secret"));
-        assert_eq!(mapi_lite.timeout(), std::time::Duration::from_secs(5));
-        assert_eq!(
-            mapi_lite.health_timeout(),
-            std::time::Duration::from_secs(1)
-        );
-        assert_eq!(mapi_lite.max_retries, 0);
+        assert_eq!(mapi_lite.auth_token.as_deref(), Some("secret"));
+        assert_eq!(mapi_lite.authorization().as_deref(), Some("Bearer secret"));
+        assert_eq!(mapi_lite.total_timeout(), Duration::from_secs(30));
         assert!(mapi_lite.validate().is_ok());
     }
 
@@ -1750,21 +1844,7 @@ filename = "./data/dynamic.toml"
     }
 
     #[test]
-    fn sr_cfg_008_mapi_lite_validate_rejects_zero_timeouts() {
-        let mut config = MapiLiteConfig::for_base_url("http://127.0.0.1:8080");
-        config.timeout_seconds = 0;
-        assert!(config
-            .validate()
-            .unwrap_err()
-            .contains("mapi_lite.timeout_seconds"));
-
-        let mut config = MapiLiteConfig::for_base_url("http://127.0.0.1:8080");
-        config.health_timeout_seconds = 0;
-        assert!(config
-            .validate()
-            .unwrap_err()
-            .contains("mapi_lite.health_timeout_seconds"));
-
+    fn sr_cfg_008_mapi_lite_validate_rejects_a_zero_deadline() {
         let mut config = MapiLiteConfig::for_base_url("http://127.0.0.1:8080");
         config.total_timeout_seconds = 0;
         assert!(config
@@ -1773,52 +1853,11 @@ filename = "./data/dynamic.toml"
             .contains("mapi_lite.total_timeout_seconds"));
     }
 
-    /// A mapi-lite probe slower than the few seconds a readiness probe allows
-    /// is killed by the caller rather than answered, marking the instance
-    /// unready on every check even while mapi-lite is fine. So the documented
-    /// ceiling is enforced rather than just written down.
-    #[test]
-    fn sr_cfg_008_mapi_lite_validate_rejects_a_health_timeout_a_probe_cannot_wait_for() {
-        for seconds in [3, 4, 10] {
-            let mut config = MapiLiteConfig::for_base_url("http://127.0.0.1:8080");
-            config.health_timeout_seconds = seconds;
-            let error = config
-                .validate()
-                .expect_err("a health timeout at or above 3s is rejected");
-            assert!(
-                error.contains("must be less than 3"),
-                "for {seconds}s: {error}"
-            );
-        }
-
-        let mut config = MapiLiteConfig::for_base_url("http://127.0.0.1:8080");
-        config.health_timeout_seconds = 2;
-        assert!(config.validate().is_ok());
-    }
-
-    /// The retry budget multiplies `timeout_seconds`, so the total deadline
-    /// has to leave room for at least one attempt.
-    #[test]
-    fn sr_cfg_008_mapi_lite_validate_rejects_a_total_timeout_below_one_attempt() {
-        let mut config = MapiLiteConfig::for_base_url("http://127.0.0.1:8080");
-        config.timeout_seconds = 30;
-        config.total_timeout_seconds = 10;
-        let error = config.validate().expect_err("no attempt can finish");
-        assert!(
-            error.contains("must be at least timeout_seconds"),
-            "{error}"
-        );
-
-        config.total_timeout_seconds = 30;
-        assert!(config.validate().is_ok());
-    }
-
     #[test]
     fn sr_cfg_008_load_config_validates_the_mapi_lite_section() {
         let _env = env_lock();
         let path = write_temp_config("mapi-lite", &with_mapi_lite_section("base_url = \"\"\n"));
-        unsafe { env::remove_var("FS_CONFIG") };
-        let err = load_config("FS_CONFIG", path.to_str().unwrap()).unwrap_err();
+        let err = load_config(path.to_str().unwrap()).unwrap_err();
         assert!(err.contains("mapi_lite.base_url"), "{err}");
     }
 
@@ -1829,59 +1868,94 @@ filename = "./data/dynamic.toml"
             "mapi-lite-ok",
             &with_mapi_lite_section("base_url = \"http://127.0.0.1:8080\"\n"),
         );
-        unsafe { env::remove_var("FS_CONFIG") };
-        unsafe { env::remove_var("FS_MAPI_LITE_AUTH_TOKEN") };
-        let config = load_config("FS_CONFIG", path.to_str().unwrap()).unwrap();
+        let config = load_config(path.to_str().unwrap()).unwrap();
         assert_eq!(config.mapi_lite.unwrap().base_url, "http://127.0.0.1:8080");
     }
 
+    /// An override can supply the whole section, which then takes the
+    /// defaults for everything it leaves out.
     #[test]
-    fn sr_cfg_008_fs_config_json_accepts_a_mapi_lite_object() {
-        let _env = env_lock();
-        unsafe {
-            env::set_var(
-                "FS_CONFIG",
-                r#"{"blockchain_interface":{"interface_type":"test","network_type":"testnet"},"web_interface":{"address":"127.0.0.1","port":9092,"allow_unauthenticated":true},"logging":{"level":"info"},"service":{"utxo_refresh_period":30},"dynamic_config":{"filename":"./data/dynamic.toml"},"mapi_lite":{"base_url":"http://mapi:8080","max_retries":1}}"#,
-            );
-        }
-        let config = get_config("FS_CONFIG", "missing-file.toml").unwrap();
-        unsafe { env::remove_var("FS_CONFIG") };
-        let mapi_lite = config.mapi_lite.expect("object present");
+    fn sr_cfg_008_overrides_can_supply_the_mapi_lite_section() {
+        // Regtest: an override cannot give a list, and on testnet the section
+        // needs miner_id_public_keys.
+        let path = write_temp_config(
+            "mapi-lite-env",
+            &MINIMAL_TOML.replace("\"testnet\"", "\"regtest\""),
+        );
+        let config = with_env(
+            &[
+                ("FS__MAPI_LITE__BASE_URL", "http://mapi:8080"),
+                ("FS__MAPI_LITE__TOTAL_TIMEOUT_SECONDS", "30"),
+            ],
+            || load_config(path.to_str().unwrap()).unwrap(),
+        );
+        let mapi_lite = config.mapi_lite.expect("section supplied");
         assert_eq!(mapi_lite.base_url, "http://mapi:8080");
-        assert_eq!(mapi_lite.max_retries, 1);
+        assert_eq!(mapi_lite.total_timeout_seconds, 30);
+        assert_eq!(mapi_lite.auth_token, None);
     }
 
     #[test]
     fn sr_sec_015_mapi_lite_auth_token_resolves_from_an_env_reference() {
         let _env = env_lock();
-        unsafe { env::set_var("FS_TEST_MAPI_TOKEN", "Bearer from-env") };
-        unsafe { env::remove_var("FS_MAPI_LITE_AUTH_TOKEN") };
+        unsafe { env::set_var("FS_TEST_MAPI_TOKEN", "from-env") };
         let config = config_with_mapi_lite(Some("env:FS_TEST_MAPI_TOKEN"));
         let resolved = config.resolve_secrets().unwrap();
         assert_eq!(
             resolved.mapi_lite.unwrap().auth_token.as_deref(),
-            Some("Bearer from-env")
+            Some("from-env")
         );
         unsafe { env::remove_var("FS_TEST_MAPI_TOKEN") };
     }
 
     #[test]
-    fn sr_sec_015_fs_mapi_lite_auth_token_env_overrides_the_config() {
-        let _env = env_lock();
-        unsafe { env::set_var("FS_MAPI_LITE_AUTH_TOKEN", "Bearer override") };
-        let config = config_with_mapi_lite(Some("env:SHOULD_NOT_BE_USED"));
-        let resolved = config.resolve_secrets().unwrap();
-        assert_eq!(
-            resolved.mapi_lite.unwrap().auth_token.as_deref(),
-            Some("Bearer override")
+    fn sr_sec_015_the_mapi_lite_auth_token_can_be_an_override() {
+        let path = write_temp_config(
+            "mapi-lite-token",
+            &with_mapi_lite_section("base_url = \"http://127.0.0.1:8080\"\n"),
         );
-        unsafe { env::remove_var("FS_MAPI_LITE_AUTH_TOKEN") };
+        let config = with_env(&[("FS__MAPI_LITE__AUTH_TOKEN", "override")], || {
+            load_config(path.to_str().unwrap()).unwrap()
+        });
+        assert_eq!(
+            config.mapi_lite.unwrap().auth_token.as_deref(),
+            Some("override")
+        );
+    }
+
+    /// The token is the token alone; the scheme is added when it is sent. A
+    /// value written for the old verbatim header would go out as
+    /// `Bearer Bearer ...` and fail only at the first request, so it stops
+    /// startup, without the message repeating it (CS-624).
+    #[test]
+    fn sr_sec_015_a_token_with_a_scheme_or_spaces_is_refused() {
+        let _env = env_lock();
+        unsafe { env::set_var("FS_TEST_MAPI_TOKEN", "Bearer hunter2") };
+        for token in [
+            "Bearer hunter2",
+            "env:FS_TEST_MAPI_TOKEN",
+            " hunter2",
+            "hun ter2",
+        ] {
+            let err = config_with_mapi_lite(Some(token))
+                .resolve_secrets()
+                .unwrap_err();
+            assert!(err.contains("token alone"), "{token:?}: {err}");
+            assert!(!err.contains("hunter2"), "{token:?}: {err}");
+        }
+        unsafe { env::remove_var("FS_TEST_MAPI_TOKEN") };
+        let config = config_with_mapi_lite(Some("hunter2"))
+            .resolve_secrets()
+            .unwrap();
+        assert_eq!(
+            config.mapi_lite.unwrap().authorization().as_deref(),
+            Some("Bearer hunter2")
+        );
     }
 
     #[test]
     fn sr_sec_015_missing_mapi_lite_auth_token_env_reference_fails_resolution() {
         let _env = env_lock();
-        unsafe { env::remove_var("FS_MAPI_LITE_AUTH_TOKEN") };
         unsafe { env::remove_var("FS_DEFINITELY_MISSING_MAPI_TOKEN") };
         let config = config_with_mapi_lite(Some("env:FS_DEFINITELY_MISSING_MAPI_TOKEN"));
         let err = config.resolve_secrets().unwrap_err();
@@ -1891,7 +1965,6 @@ filename = "./data/dynamic.toml"
     #[test]
     fn mapi_lite_auth_token_absent_stays_absent_after_resolution() {
         let _env = env_lock();
-        unsafe { env::remove_var("FS_MAPI_LITE_AUTH_TOKEN") };
         let resolved = config_with_mapi_lite(None).resolve_secrets().unwrap();
         assert_eq!(resolved.mapi_lite.unwrap().auth_token, None);
     }
@@ -2032,14 +2105,47 @@ filename = "./data/dynamic.toml"
         }
     }
 
-    /// Unpinned is allowed, and said so.
+    /// Unpinned is allowed off the public networks, and said so.
     #[test]
     fn sr_sec_019_an_unpinned_section_is_warned_about() {
         let mut config = MapiLiteConfig::for_base_url("http://mapi-lite");
         assert!(config.unpinned_warning().is_some());
-        config.miner_id_public_keys =
-            vec!["0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".to_string()];
+        config.miner_id_public_keys = vec![PINNED_KEY.to_string()];
         assert!(config.unpinned_warning().is_none());
+    }
+
+    const PINNED_KEY: &str = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+
+    /// On mainnet and testnet an unpinned section stops startup (CS-624).
+    #[test]
+    fn sr_sec_019_an_unpinned_section_is_refused_on_a_public_network() {
+        let config = |network: &str, keys: &[&str]| {
+            let mut mapi_lite = MapiLiteConfig::for_base_url("http://mapi-lite");
+            mapi_lite.miner_id_public_keys = keys.iter().map(|k| k.to_string()).collect();
+            Config {
+                blockchain_interface: BlockchainInterfaceConfig {
+                    interface_type: "woc".to_string(),
+                    network_type: network.to_string(),
+                    ..Default::default()
+                },
+                mapi_lite: Some(mapi_lite),
+                ..Default::default()
+            }
+        };
+        for network in ["mainnet", "testnet"] {
+            let err = config(network, &[]).check_miner_id_pin().unwrap_err();
+            assert!(err.contains("miner_id_public_keys"), "{err}");
+            assert!(err.contains(network), "{err}");
+            assert!(config(network, &[PINNED_KEY]).check_miner_id_pin().is_ok());
+        }
+        for network in ["regtest", "stn"] {
+            assert!(config(network, &[]).check_miner_id_pin().is_ok());
+        }
+        let without_mapi_lite = Config {
+            mapi_lite: None,
+            ..config("mainnet", &[])
+        };
+        assert!(without_mapi_lite.check_miner_id_pin().is_ok());
     }
 
     /// The fee ceiling may not sit below the rate it caps.
@@ -2048,17 +2154,16 @@ filename = "./data/dynamic.toml"
         let fees = |rate, max| FeesConfig {
             satoshis_per_kb: rate,
             max_satoshis_per_kb: max,
-            ..FeesConfig::default()
         };
         assert!(FeesConfig::default().validate().is_ok());
         assert!(fees(100, 100).validate().is_ok());
         assert!(fees(100, 99).validate().is_err());
     }
 
-    /// The runtime-client prefix may not be one a client's own override
-    /// variable (`FS_CLIENT_<ID>_WIF`) could start with (CS-521).
+    /// The runtime-client prefix may not be one a configuration override
+    /// (`FS__...`), which may carry any secret, could start with (CS-624).
     #[test]
-    fn sr_sec_018_wif_env_prefix_may_not_overlap_client_variables() {
+    fn sr_sec_018_wif_env_prefix_may_not_overlap_the_overrides() {
         let check = |prefix: &str| {
             DynamicConfigConfig {
                 filename: "x".to_string(),
@@ -2069,7 +2174,8 @@ filename = "./data/dynamic.toml"
         };
         assert!(check(DEFAULT_WIF_ENV_PREFIX).is_ok());
         assert!(check("MY_RUNTIME_KEYS_").is_ok());
-        for bad in ["FS_CLIENT_", "FS_CLIENT_ID1_", "FS_CLIENT", "FS_", "F", ""] {
+        assert!(check("FS_CLIENT_").is_ok());
+        for bad in ["FS__", "FS__WEB_INTERFACE__", "FS_", "FS", "F", ""] {
             assert!(check(bad).is_err(), "{bad:?} was accepted");
         }
     }
