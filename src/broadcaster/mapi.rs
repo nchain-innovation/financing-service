@@ -10,68 +10,58 @@
 //! configuration even with every node down.
 //!
 //! Two `uls-client` clients share one base URL and token: the submit client
-//! and the probe client, which fetches the fee quote. The probe client, and the
-//! plain HTTP client behind the health probe, have a short timeout and no
-//! retries, because `GET /ready` has to answer inside a readiness probe's few
-//! seconds however slow mapi-lite is being.
+//! and the probe client, which asks `GET /ready` (`MapiClient::ready`, read as
+//! the shared `ReadyReport`, CS-627) and fetches the fee quote. The probe
+//! client has a short timeout and no retries, because `GET /ready` has to
+//! answer inside a readiness probe's few seconds however slow mapi-lite is
+//! being.
 //!
-//! **Retries are this module's, not uls-client's.** uls-client will retry a
-//! submit for us, but it reports the whole sequence as one `RetriesExhausted`
-//! whose cause is a string, and a refused connection and an expired timeout
-//! render identically there. The service needs that distinction: a refused
-//! connection delivered nothing, while an attempt cancelled in flight may
-//! have delivered everything, and only the second calls for the funding
-//! inputs to be reserved (see `BroadcastError::Indeterminate` and
-//! `Client::commit_uncertain_funding_spend`). Running the loop here keeps
-//! every attempt's outcome structural.
+//! **The submit is uls-client's `MapiClient::broadcast` (CS-627).** It reads
+//! mapi-lite's verdict on one transaction: one result, for the transaction it
+//! hashed; an acceptance mapi-lite could not record resubmitted once; anything
+//! it cannot read an unknown outcome. Its retries keep what this service
+//! needs structural: [`ClientError::may_have_been_delivered`] tells an attempt
+//! that may have reached a node -- cancelled in flight, answered `504`, or
+//! unreadable -- from one that cannot have, a refused connection or a `503`,
+//! and only the first calls for the funding inputs to be reserved (see
+//! `BroadcastError::Indeterminate` and `Client::commit_uncertain_funding_spend`).
+//! This module ran that loop itself until uls-client v0.4.0 could say which.
 //!
-//! Each attempt is bounded by `mapi_lite.timeout_seconds` and the whole
-//! sequence by `mapi_lite.total_timeout_seconds`. A funding call is
-//! interactive: a wedged mapi-lite must not hold the caller, and the actix
-//! worker serving it, for `timeout * (max_retries + 1)`.
+//! Each attempt is bounded by `mapi_lite.timeout_seconds`, the attempts after
+//! the first number `mapi_lite.max_retries`, and the whole broadcast,
+//! resubmission included, is bounded by `mapi_lite.total_timeout_seconds`. A
+//! funding call is interactive: a wedged mapi-lite must not hold the caller,
+//! and the actix worker serving it, for `timeout * (max_retries + 1)`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use chain_gang::messages::Tx;
-use uls_client::{ClientError, MapiClient, SubmitTxRequest};
-use uls_core::status::RESULT_SUCCESS;
+use chain_gang::util::Serializable;
+use uls_client::{Broadcast, BroadcastOptions, ClientError, MapiClient};
 use uls_core::wire::FeeAmount;
 
-/// The fee quote entry that applies to ordinary transactions. mapi quotes a
-/// "standard" and a "data" rate; funding transactions are the former.
-const STANDARD_FEE_TYPE: &str = "standard";
-
 use super::{BroadcastError, TxBroadcaster, MAPI_LITE};
-use crate::{config::MapiLiteConfig, util::tx_as_hexstr};
+use crate::config::MapiLiteConfig;
 
 /// Wait between submit retries: linear back-off, `attempt * BASE` capped at
-/// `CAP`. uls-client's own default caps at 60s, which would hold a `/fund`
-/// request open for minutes; a funding call is interactive.
+/// `CAP`, uls-client's own default since v0.5.0, set here so it does not
+/// change under this service with a later release. A funding call is
+/// interactive.
 const RETRY_BACKOFF_BASE: Duration = Duration::from_secs(1);
 const RETRY_BACKOFF_CAP: Duration = Duration::from_secs(5);
 
 /// Hands transactions to a mapi-lite server.
 pub struct MapiBroadcaster {
-    /// Built with uls-client's own retries left off: the loop in
-    /// [`MapiBroadcaster::broadcast_tx`] owns them.
+    /// Each request bounded by `timeout_seconds`, retried `max_retries`
+    /// times, and the whole broadcast by `total_timeout_seconds`.
     submit: MapiClient,
     /// For the fee quote: a short timeout and no retries.
     probe: MapiClient,
-    /// `GET {base_url}/ready`, mapi-lite's own readiness, which is what the
-    /// health check asks (CS-505). Plain HTTP: the probe is unauthenticated and
-    /// unsigned on mapi-lite's side, so a typed client adds nothing.
-    ready_url: String,
-    ready_http: reqwest::Client,
     /// Ceiling on one attempt.
     attempt_timeout: Duration,
-    /// Attempts after the first.
-    max_retries: u32,
-    /// Ceiling on a whole submit, retries and back-off included, so a `/fund`
-    /// caller cannot be held for `timeout * (max_retries + 1)`.
-    submit_deadline: Duration,
     /// mapi-lite's own submit ceiling as last published in its `/ready`,
     /// plus one, so 0 means "not seen" (CS-510). Kept so a misaligned budget
     /// is warned about once per value rather than on every probe.
@@ -95,37 +85,6 @@ fn untrusted_signer_detail(key: &str) -> String {
     )
 }
 
-/// How far a submit attempt has to outlast mapi-lite's own ceiling for
-/// mapi-lite's `504` to arrive before this side gives up: the answer still has
-/// to cross the network after the ceiling fires.
-const CEILING_MARGIN: Duration = Duration::from_secs(1);
-
-/// The warning for an attempt timeout that does not clear mapi-lite's submit
-/// ceiling, or `None` when it does (CS-510, SR-CFG-010).
-///
-/// mapi-lite answers a submission it cannot finish in `ceiling` with `504`,
-/// outcome unknown. An attempt that gives up first turns a hung node into
-/// this service's own timeout instead: the same unknown outcome, reported by
-/// the wrong layer, and with mapi-lite still working on a request nobody is
-/// waiting for. Nothing is refused: the funding still works, just reported
-/// less well.
-pub(crate) fn submit_budget_warning(
-    attempt_timeout: Duration,
-    ceiling: Duration,
-) -> Option<String> {
-    (attempt_timeout < ceiling + CEILING_MARGIN).then(|| {
-        format!(
-            "[mapi_lite] timeout_seconds is {}s, but mapi-lite answers a submit it cannot \
-             finish at {}s (its submit_timeout_sec). An attempt has to outlast that by at \
-             least {}s, or a hung node is reported as this service's own timeout instead of \
-             mapi-lite's answer. Raise timeout_seconds, or lower mapi-lite's ceiling.",
-            attempt_timeout.as_secs(),
-            ceiling.as_secs(),
-            CEILING_MARGIN.as_secs(),
-        )
-    })
-}
-
 impl MapiBroadcaster {
     /// Build a broadcaster for the server named by `config`.
     pub fn new(config: &MapiLiteConfig) -> Result<Self, String> {
@@ -135,34 +94,18 @@ impl MapiBroadcaster {
         if let Some(warning) = config.unpinned_warning() {
             log::warn!("{warning}");
         }
-        // uls-client retries five times by default with a 60s back-off cap,
-        // so the retries have to be turned *off* explicitly -- left alone they
-        // would nest inside every attempt this module makes and blow through
-        // both bounds. Zero means one HTTP request per call, which is what the
-        // loop below is counting.
-        //
-        // The reqwest timeout is only a backstop against a connection the
-        // per-attempt bound somehow outlives; that bound is never larger than
-        // the deadline, so it always fires first.
-        let submit = Self::client(config, config.total_timeout() + Duration::from_secs(5))?.retry(
-            0,
-            RETRY_BACKOFF_BASE,
-            RETRY_BACKOFF_CAP,
-        );
-        // fee_quote does not retry, so the probe needs no retry settings.
+        // This service's budget, not uls-client's defaults: an attempt is
+        // never allowed to outlive the deadline it sits inside, and no retry
+        // starts that could not finish inside it.
+        let submit = Self::client(config, config.timeout())?
+            .retry(config.max_retries, RETRY_BACKOFF_BASE, RETRY_BACKOFF_CAP)
+            .with_submit_deadline(Some(config.total_timeout()));
+        // ready and fee_quote do not retry, so the probe needs no retry settings.
         let probe = Self::client(config, config.health_timeout())?;
-        let ready_http = reqwest::Client::builder()
-            .timeout(config.health_timeout())
-            .build()
-            .map_err(|e| format!("mapi-lite readiness client: {e}"))?;
         Ok(Self {
             submit,
             probe,
-            ready_url: format!("{}/ready", config.base_url()),
-            ready_http,
             attempt_timeout: config.timeout(),
-            max_retries: config.max_retries,
-            submit_deadline: config.total_timeout(),
             seen_ceiling: AtomicU64::new(0),
             pins_miner_ids: !config.miner_id_public_keys.is_empty(),
             untrusted_signer: Mutex::new(None),
@@ -180,50 +123,29 @@ impl MapiBroadcaster {
     }
 
     /// mapi-lite's own `GET /ready`: the half of [`TxBroadcaster::health_check`]
-    /// that asks whether a broadcast through it can work at all.
+    /// that asks whether a broadcast through it can work at all. Read through
+    /// uls-client as its `ReadyReport` (CS-627), which names the failing checks
+    /// and carries mapi-lite's submit ceiling.
     async fn mapi_lite_ready(&self) -> Result<(), BroadcastError> {
-        let response = self
-            .ready_http
-            .get(&self.ready_url)
-            .send()
+        let report = self
+            .probe
+            .ready()
             .await
             .map_err(|e| BroadcastError::Upstream(format!("mapi-lite /ready: {e}")))?;
-        let status = response.status();
         // Read whatever the answer, ready or not: it is also where mapi-lite
         // publishes its submit ceiling (CS-510).
-        let body = response
-            .bytes()
-            .await
-            .ok()
-            .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok());
-        if let Some(body) = &body {
-            self.note_ceiling(body);
-        }
-        if status.is_success() {
+        self.note_ceiling(report.submit_timeout());
+        if report.ready {
             return Ok(());
         }
-        let failing = body
-            .and_then(|body| {
-                body.get("checks")?.as_object().map(|checks| {
-                    checks
-                        .iter()
-                        .filter(|(_, check)| {
-                            check.get("ok") == Some(&serde_json::Value::Bool(false))
-                        })
-                        .map(
-                            |(name, check)| match check.get("detail").and_then(|d| d.as_str()) {
-                                Some(detail) => format!("{name}: {detail}"),
-                                None => name.clone(),
-                            },
-                        )
-                        .collect::<Vec<_>>()
-                        .join("; ")
-                })
-            })
-            .filter(|failing| !failing.is_empty());
-        Err(BroadcastError::Upstream(match failing {
-            Some(failing) => format!("mapi-lite /ready answered {status}: {failing}"),
-            None => format!("mapi-lite /ready answered {status}"),
+        let failing = report.failing();
+        Err(BroadcastError::Upstream(if failing.is_empty() {
+            "mapi-lite /ready answered 503 Service Unavailable".to_string()
+        } else {
+            format!(
+                "mapi-lite /ready answered 503 Service Unavailable: {}",
+                failing.join("; ")
+            )
         }))
     }
 
@@ -288,18 +210,28 @@ impl MapiBroadcaster {
     }
 
     /// Records the ceiling a `/ready` answer published, and warns when this
-    /// side's attempt timeout does not clear it. Once per distinct value: the
-    /// probe runs every few seconds, and the configuration it is checking
-    /// changes only on a restart of one side or the other.
-    fn note_ceiling(&self, body: &serde_json::Value) {
-        let Some(ceiling) = body.get("submitTimeoutSecs").and_then(|v| v.as_u64()) else {
+    /// side's attempt timeout does not clear it (SR-CFG-010), by uls-client's
+    /// own rule: `submit_budget_warning` on the client this service submits
+    /// with. Once per distinct value: the probe runs every few seconds, and the
+    /// configuration it is checking changes only on a restart of one side or
+    /// the other.
+    fn note_ceiling(&self, ceiling: Option<Duration>) {
+        let Some(ceiling) = ceiling.map(|c| c.as_secs()) else {
             return;
         };
         if self.seen_ceiling.swap(ceiling + 1, Ordering::Relaxed) == ceiling + 1 {
             return;
         }
-        match submit_budget_warning(self.attempt_timeout, Duration::from_secs(ceiling)) {
-            Some(warning) => log::warn!("{warning}"),
+        match self
+            .submit
+            .submit_budget_warning(Duration::from_secs(ceiling))
+        {
+            // Named as the operator sets it, with both values (SR-CFG-010).
+            Some(warning) => log::warn!(
+                "[mapi_lite] timeout_seconds is {}s, mapi-lite's submit ceiling {ceiling}s: \
+                 {warning}",
+                self.attempt_timeout.as_secs()
+            ),
             None => log::info!(
                 "mapi-lite answers a slow submit at {ceiling}s, inside this service's {}s attempt",
                 self.attempt_timeout.as_secs()
@@ -307,149 +239,29 @@ impl MapiBroadcaster {
         }
     }
 
-    /// Wait before attempt `attempt + 1`, matching uls-client's linear
-    /// back-off so moving the loop here does not change the pacing.
-    fn backoff(attempt: u32) -> Duration {
-        RETRY_BACKOFF_BASE
-            .saturating_mul(attempt)
-            .min(RETRY_BACKOFF_CAP)
-    }
-
-    /// Whether the one result is mapi-lite saying the node took the
-    /// transaction but it could not record that (CS-501).
-    fn accepted_but_unrecorded(payload: &uls_client::TxsPayload) -> bool {
-        matches!(payload.txs.as_slice(), [result] if result.accepted_but_unrecorded())
-    }
-
-    /// Turn a submit response into a txid or an error.
-    ///
-    /// Everything here is the server's answer about our transaction, so none
-    /// of it is retried: it is settled, however unwelcome. The one exception,
-    /// an acceptance mapi-lite could not record, is not a verdict and is
-    /// handled before this is reached.
-    fn read_result(
-        payload: uls_client::TxsPayload,
-        expected: &str,
-    ) -> Result<String, BroadcastError> {
-        // One in, one out. Anything else means the server and this client
-        // disagree about the batch contract, and guessing which result is ours
-        // would be worse than refusing.
-        let [result] = payload.txs.as_slice() else {
-            // The server answered, so it took the transaction, but the answer
-            // is not one this client can read. What it did with the
-            // transaction is therefore unknown rather than known to have
-            // failed.
-            return Err(BroadcastError::Indeterminate(format!(
-                "submitted 1 transaction but mapi-lite returned {} results",
-                payload.txs.len()
-            )));
-        };
-
-        if result.return_result != RESULT_SUCCESS {
-            let conflicts: Vec<&str> = result
-                .conflicted_with
-                .iter()
-                .map(|conflict| conflict.txid.as_str())
-                .collect();
-            let description = if conflicts.is_empty() {
-                result.result_description.clone()
-            } else {
-                format!(
-                    "{} (conflicted with {})",
-                    result.result_description,
-                    conflicts.join(", ")
-                )
-            };
-            // A conflict is final whatever the server says about retrying.
-            //
-            // `txn-mempool-conflict` means another transaction already holds
-            // an input of this one. Offering the identical transaction again
-            // cannot succeed -- the conflict is in the inputs, and they are
-            // gone. mapi-lite reports it as `failureRetryable: true`, which is
-            // how a caller ended up being told "retry may succeed" about a
-            // double spend that never would.
-            //
-            // Trusting the flag for everything else: this narrows one case the
-            // response itself contradicts, rather than second-guessing the
-            // upstream's judgement in general.
-            let retryable = result.failure_retryable && conflicts.is_empty();
-            return Err(BroadcastError::Rejected {
-                description,
-                retryable,
-            });
-        }
-
-        // "Already known" also comes back as success: a resubmitted funding
-        // transaction is the same transaction, so that is the right answer --
-        // and it is how a retry after an unknown outcome resolves into a
-        // known one.
-        //
-        // The txid must be the one we hashed. A different one means what
-        // reached the network is not the transaction this service built, and
-        // the caller would otherwise be handed outpoints -- derived from the
-        // local hash -- for a transaction that will never confirm, with its
-        // UTXOs already marked spent. Refused for the same reason the batch
-        // length is: a disagreement here is not ours to guess through.
-        //
-        // Unknown rather than failed, though: the server reported success, so
-        // something was accepted, and this service cannot tell whether the
-        // transaction it built was part of it.
-        if result.txid != expected {
-            return Err(BroadcastError::Indeterminate(format!(
-                "mapi-lite reported txid {} for a funding transaction hashing to {expected}",
-                result.txid
-            )));
-        }
-        Ok(result.txid.clone())
-    }
-
-    /// The error for a submit that ran out of deadline between attempts.
-    ///
-    /// Whether that is a failure or an unknown outcome turns on what the
-    /// attempts did, not on the clock: a mapi-lite that refuses connections
-    /// burns the deadline in back-off alone and delivered nothing, while one
-    /// that goes quiet burns it inside a request that may have been received.
-    fn out_of_time(&self, attempts: u32, may_have_landed: bool) -> BroadcastError {
-        let detail = format!(
-            "mapi-lite did not answer within {}s (mapi_lite.total_timeout_seconds) over {attempts} \
-             attempt(s)",
-            self.submit_deadline.as_secs()
-        );
-        if may_have_landed {
-            BroadcastError::Indeterminate(detail)
-        } else {
-            BroadcastError::Upstream(detail)
-        }
-    }
-
-    /// The error a finished submit reports, given what its attempts might have
-    /// delivered.
-    ///
-    /// A plain upstream failure on the last attempt does not make the call a
-    /// plain failure: if an earlier attempt was cancelled in flight, the
-    /// transaction may be on the network and the inputs must still be
-    /// reserved.
-    fn settle(&self, last: BroadcastError, may_have_landed: bool) -> BroadcastError {
-        match last {
-            BroadcastError::Upstream(detail) if may_have_landed => BroadcastError::Indeterminate(
-                format!("{detail}; an earlier attempt may have been delivered"),
-            ),
+    /// A broadcast error from uls-client, with the setting that bounded it
+    /// named when the submit deadline is what ended it: uls-client knows the
+    /// deadline only as a duration, and an operator looks for the setting.
+    fn in_this_services_terms(&self, error: ClientError) -> BroadcastError {
+        let deadline = error.to_string().contains("submit deadline");
+        match BroadcastError::from(error) {
+            BroadcastError::Indeterminate(detail) if deadline => {
+                BroadcastError::Indeterminate(format!("{detail} (mapi_lite.total_timeout_seconds)"))
+            }
+            BroadcastError::Upstream(detail) if deadline => {
+                BroadcastError::Upstream(format!("{detail} (mapi_lite.total_timeout_seconds)"))
+            }
             other => other,
         }
     }
 
     /// A `MapiClient` for `config` whose every request times out after
-    /// `timeout`. uls-client has no timeout setting of its own; the injected
-    /// reqwest client is the knob.
+    /// `timeout` (uls-client's own bound since v0.5.0).
     fn client(config: &MapiLiteConfig, timeout: Duration) -> Result<MapiClient, String> {
-        let http = reqwest::Client::builder()
-            .timeout(timeout)
-            .build()
-            .map_err(|e| format!("Unable to build the mapi-lite HTTP client: {e}"))?;
         // Only mapi-lite's own keys are believed (CS-523): otherwise any key
         // that signs a response verifies, which proves nothing about who sent it.
         let mut client = MapiClient::new(config.base_url().to_string())
-            .with_http(http)
+            .with_timeout(timeout)
             .with_trusted_miner_ids(&config.miner_id_public_keys);
         if let Some(token) = &config.auth_token {
             // Sent verbatim as the Authorization header; the scheme is the
@@ -493,17 +305,17 @@ impl TxBroadcaster for MapiBroadcaster {
     }
 
     async fn broadcast_tx(&self, tx: &Tx) -> Result<String, BroadcastError> {
-        let request = SubmitTxRequest {
-            raw_tx: tx_as_hexstr(tx).map_err(BroadcastError::Upstream)?,
-            callback_url: None,
-            callback_token: None,
-            // The server defaults this to true when omitted. A funding
-            // transaction's proof is of no use to this service, and asking for
-            // one only enlarges the response.
+        let mut raw = Vec::new();
+        tx.write(&mut raw).map_err(|e| {
+            BroadcastError::Upstream(format!("the funding transaction did not serialise: {e}"))
+        })?;
+        // The server defaults the proof to on when it is not asked. A funding
+        // transaction's proof is of no use to this service, and asking for one
+        // only makes mapi-lite keep it.
+        let options = BroadcastOptions {
             merkle_proof: Some(false),
-            merkle_format: None,
+            ..BroadcastOptions::default()
         };
-        let expected = tx.hash().encode();
 
         // Refused before anything is sent while mapi-lite signs with an
         // unlisted key (CS-618): its answer could not be believed, so the
@@ -517,80 +329,46 @@ impl TxBroadcaster for MapiBroadcaster {
             }
         }
 
-        let started = Instant::now();
-        let mut attempt: u32 = 0;
-        // Set the moment an attempt might have reached the server: a request
-        // cancelled in flight, or an answer this client could not read. It is
-        // never cleared, because a later refused connection cannot un-deliver
-        // an earlier request. Only a definite answer about the transaction --
-        // accepted, or rejected -- settles it.
-        let mut may_have_landed = false;
-
-        loop {
-            attempt += 1;
-            let remaining = self.submit_deadline.saturating_sub(started.elapsed());
-            if remaining.is_zero() {
-                return Err(self.out_of_time(attempt - 1, may_have_landed));
+        let verdict = self.submit.broadcast(&raw, &options).await;
+        self.note_signature(verdict.as_ref().err());
+        match verdict.map_err(|e| self.in_this_services_terms(e))? {
+            Broadcast::Accepted {
+                txid,
+                recorded: true,
+            } => Ok(txid),
+            // Accepted by the node, but mapi-lite could not record it even on
+            // the resubmission uls-client makes (CS-501). SR-FUND-035 keeps
+            // that an unknown outcome, which reserves the inputs, rather than a
+            // success.
+            Broadcast::Accepted {
+                recorded: false, ..
+            } => Err(BroadcastError::Indeterminate(format!(
+                "mapi-lite: {}",
+                uls_core::status::ACCEPTED_NOT_RECORDED_DESCRIPTION
+            ))),
+            Broadcast::Rejected {
+                description,
+                retryable,
+                conflicted_with,
+                ..
+            } => {
+                // uls-client reports a conflict as not retryable whatever
+                // mapi-lite says: `txn-mempool-conflict` means another
+                // transaction already holds an input of this one, and
+                // offering it again cannot succeed (CS-427).
+                let description = if conflicted_with.is_empty() {
+                    description
+                } else {
+                    format!(
+                        "{description} (conflicted with {})",
+                        conflicted_with.join(", ")
+                    )
+                };
+                Err(BroadcastError::Rejected {
+                    description,
+                    retryable,
+                })
             }
-            // Whichever runs out first. An attempt is never allowed to outlive
-            // the deadline it sits inside.
-            let bound = self.attempt_timeout.min(remaining);
-
-            let outcome = tokio::time::timeout(
-                bound,
-                self.submit
-                    .submit_transactions(std::slice::from_ref(&request)),
-            )
-            .await;
-            if let Ok(answer) = &outcome {
-                self.note_signature(answer.as_ref().err());
-            }
-            let error = match outcome {
-                // Accepted by the node but not recorded by mapi-lite (CS-501):
-                // the transaction is on the network, and resubmitting it is
-                // how mapi-lite records it -- the node answers "already
-                // known". So it is resubmitted like an unknown outcome, never
-                // read as the refusal its `failure` envelope looks like.
-                Ok(Ok(payload)) if Self::accepted_but_unrecorded(&payload) => {
-                    BroadcastError::Indeterminate(format!(
-                        "mapi-lite: {}",
-                        uls_core::status::ACCEPTED_NOT_RECORDED_DESCRIPTION
-                    ))
-                }
-                Ok(Ok(payload)) => return Self::read_result(payload, &expected),
-                Ok(Err(client_error)) => BroadcastError::from(client_error),
-                Err(_) => {
-                    // Cancelling the request says nothing about what the
-                    // server did with it: a mapi-lite that is slow rather than
-                    // broken may have relayed the transaction already and be
-                    // about to answer.
-                    BroadcastError::Indeterminate(format!(
-                        "mapi-lite did not answer attempt {attempt} within {}s \
-                         (mapi_lite.timeout_seconds)",
-                        bound.as_secs()
-                    ))
-                }
-            };
-
-            if matches!(error, BroadcastError::Indeterminate(_)) {
-                may_have_landed = true;
-            }
-
-            if attempt > self.max_retries {
-                return Err(self.settle(error, may_have_landed));
-            }
-
-            // Retrying is safe, and after an unknown outcome it is actively
-            // useful: mapi-lite answers a transaction it already holds with
-            // success, so a retry can turn "we do not know" into "it is on the
-            // network" -- which is the difference between reserving the
-            // client's inputs and committing them.
-            let backoff = Self::backoff(attempt);
-            let remaining = self.submit_deadline.saturating_sub(started.elapsed());
-            if backoff >= remaining {
-                return Err(self.out_of_time(attempt, may_have_landed));
-            }
-            tokio::time::sleep(backoff).await;
         }
     }
 
@@ -613,12 +391,15 @@ impl TxBroadcaster for MapiBroadcaster {
         ready.and(signer)
     }
 
-    /// The standard mining fee from mapi-lite's quote, converted to satoshis
-    /// per kilobyte (CS-451).
+    /// The standard mining fee from mapi-lite's quote, in satoshis per
+    /// kilobyte (CS-451), as uls-client reads it (CS-627): `standard_mining_fee`
+    /// and `satoshis_per_kb`, which rounds up so the service never charges
+    /// itself less than the miner asked for.
     ///
-    /// The quote states a rate as a pair -- so many satoshis per so many bytes
-    /// -- rather than per kilobyte, so it is scaled here, rounding up so the
-    /// service never charges itself less than the miner asked for.
+    /// Fetched afresh each time, not through `cached_fee_quote`: this is
+    /// called once per sweep, not per request, and a fresh quote is what lets
+    /// a fee change reach funding within one sweep rather than once the old
+    /// quote expires.
     ///
     /// `None` on any failure, which leaves the configured rate standing: a
     /// quote that cannot be fetched, is unsigned, names no standard fee, or
@@ -636,24 +417,22 @@ impl TxBroadcaster for MapiBroadcaster {
             }
         };
         let standard = quote
-            .fees
-            .iter()
-            .find(|fee| fee.fee_type.eq_ignore_ascii_case(STANDARD_FEE_TYPE))
+            .standard_mining_fee()
             // A quote that names only one fee is taken to mean it for
             // everything, rather than discarding a usable answer on a label.
-            .or_else(|| quote.fees.first())?;
+            .or_else(|| quote.fees.first().map(|fee| fee.mining_fee))?;
 
-        let FeeAmount { satoshis, bytes } = &standard.mining_fee;
-        if *bytes == 0 || *satoshis == 0 {
-            log::warn!(
-                "fee quote gave {} satoshis per {} bytes, which is not a usable rate; \
-                 keeping the current one",
-                satoshis,
-                bytes
-            );
-            return None;
+        match standard.satoshis_per_kb() {
+            Some(rate) if rate > 0 => Some(rate),
+            _ => {
+                let FeeAmount { satoshis, bytes } = standard;
+                log::warn!(
+                    "fee quote gave {satoshis} satoshis per {bytes} bytes, which is not a usable \
+                     rate; keeping the current one"
+                );
+                None
+            }
         }
-        Some(satoshis.saturating_mul(1000).div_ceil(*bytes))
     }
 
     /// `GET /query/tx/{txid}`, which asks mapi-lite's nodes (CS-619). `None`
@@ -678,7 +457,9 @@ mod tests {
 
     use super::*;
     use crate::test_support::{sample_tx, MAPI_TEST_SIGNER_WIF};
+    use crate::util::tx_as_hexstr;
     use serde_json::{json, Value};
+    use std::time::Instant;
     use uls_core::envelope::EnvelopeSigner;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1541,17 +1322,28 @@ mod tests {
     /// An attempt has to outlast mapi-lite's ceiling, with a second to spare
     /// for the 504 to arrive, or a hung node is reported as this side's own
     /// timeout (CS-510).
+    /// The warning for an attempt of `attempt` seconds against mapi-lite's
+    /// ceiling, as the broadcaster checks it: on the client it submits with
+    /// (CS-627).
+    fn budget_warning(attempt: u64, ceiling: u64) -> Option<String> {
+        let mut config = MapiLiteConfig::for_base_url("http://mapi-lite".to_string());
+        config.timeout_seconds = attempt;
+        MapiBroadcaster::new(&config)
+            .expect("broadcaster builds")
+            .submit
+            .submit_budget_warning(Duration::from_secs(ceiling))
+    }
+
     #[test]
     fn sr_cfg_010_an_attempt_shorter_than_mapi_lite_s_ceiling_is_warned_about() {
-        let secs = Duration::from_secs;
         for (attempt, ceiling) in [(10, 10), (5, 10), (10, 20)] {
-            let warning = submit_budget_warning(secs(attempt), secs(ceiling))
+            let warning = budget_warning(attempt, ceiling)
                 .unwrap_or_else(|| panic!("{attempt}s against {ceiling}s was not warned about"));
             assert!(warning.contains(&format!("{attempt}s")), "{warning}");
             assert!(warning.contains(&format!("{ceiling}s")), "{warning}");
         }
         for (attempt, ceiling) in [(11, 10), (13, 10), (30, 10)] {
-            assert_eq!(submit_budget_warning(secs(attempt), secs(ceiling)), None);
+            assert_eq!(budget_warning(attempt, ceiling), None);
         }
     }
 
@@ -1560,10 +1352,21 @@ mod tests {
     #[test]
     fn sr_cfg_010_the_default_attempt_clears_mapi_lite_s_default_ceiling() {
         let config = MapiLiteConfig::for_base_url("http://mapi-lite".to_string());
-        assert_eq!(
-            submit_budget_warning(config.timeout(), Duration::from_secs(10)),
-            None
-        );
+        assert_eq!(budget_warning(config.timeout_seconds, 10), None);
+    }
+
+    /// CS-627: mapi-lite's answer is read as uls-client's `ReadyReport`; a body
+    /// that is not one is not ready.
+    #[tokio::test]
+    async fn cs_627_an_unreadable_ready_answer_is_not_healthy() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ready"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .mount(&server)
+            .await;
+        let detail = upstream_detail(broadcaster(&server).health_check().await.unwrap_err());
+        assert!(detail.contains("mapi-lite /ready"), "{detail}");
     }
 
     /// A quote that answers does not make mapi-lite healthy when its own
@@ -1773,9 +1576,10 @@ mod tests {
             .broadcast_tx(&sample_tx())
             .await
             .expect_err("nothing succeeded");
+        // uls-client's words: an outcome unknown, over both attempts.
         let detail = indeterminate_detail(error);
         assert!(
-            detail.contains("earlier attempt may have been delivered"),
+            detail.contains("outcome unknown after 2 attempts"),
             "{detail}"
         );
     }
@@ -1803,5 +1607,80 @@ mod tests {
             matches!(error, BroadcastError::Upstream(_)),
             "a refused connection delivered nothing, got {error:?}"
         );
+    }
+
+    /// A fee quote naming `fees`, as `(feeType, satoshis, bytes)`.
+    fn quoting(fees: &[(&str, u64, u64)]) -> Value {
+        let fees: Vec<Value> = fees
+            .iter()
+            .map(|(fee_type, satoshis, bytes)| {
+                json!({
+                    "feeType": fee_type,
+                    "miningFee": { "satoshis": satoshis, "bytes": bytes },
+                    "relayFee": { "satoshis": satoshis, "bytes": bytes },
+                })
+            })
+            .collect();
+        signed(&json!({
+            "apiVersion": "1.5.0",
+            "timestamp": "2026-09-16T00:00:00Z",
+            "expiryTime": "2026-09-16T00:10:00Z",
+            "minerId": "02abc",
+            "currentHighestBlockHash": "0000abc",
+            "currentHighestBlockHeight": 812_345,
+            "fees": fees,
+        }))
+    }
+
+    async fn rate_from(fees: &[(&str, u64, u64)]) -> (Option<u64>, MockServer) {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/mapi/feeQuote"))
+            .respond_with(ok(quoting(fees)))
+            .mount(&server)
+            .await;
+        let rate = broadcaster(&server).fee_satoshis_per_kb().await;
+        (rate, server)
+    }
+
+    /// CS-627: the standard mining rate, per kilobyte, rounded up -- as
+    /// uls-client reads it.
+    #[tokio::test]
+    async fn cs_627_the_fee_rate_is_the_standard_mining_fee_per_kb_rounded_up() {
+        assert_eq!(rate_from(&[("standard", 50, 1000)]).await.0, Some(50));
+        // 1 satoshi per 300 bytes is 3.33 per kilobyte: 4, never 3.
+        assert_eq!(rate_from(&[("standard", 1, 300)]).await.0, Some(4));
+        // The data rate does not price a funding transaction.
+        assert_eq!(
+            rate_from(&[("data", 9, 1000), ("standard", 5, 1000)])
+                .await
+                .0,
+            Some(5)
+        );
+    }
+
+    /// A quote naming one fee under another label is taken for everything;
+    /// a zero rate is not a usable answer, and leaves the current rate.
+    #[tokio::test]
+    async fn cs_627_one_fee_under_another_name_is_used_and_a_zero_rate_is_not() {
+        assert_eq!(rate_from(&[("other", 7, 1000)]).await.0, Some(7));
+        assert_eq!(rate_from(&[("standard", 0, 1000)]).await.0, None);
+        assert_eq!(rate_from(&[("standard", 5, 0)]).await.0, None);
+    }
+
+    /// CS-627: asked afresh on every sweep, not cached until the quote
+    /// expires, so a fee change reaches funding within one sweep.
+    #[tokio::test]
+    async fn cs_627_the_fee_quote_is_asked_afresh_each_time() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/mapi/feeQuote"))
+            .respond_with(ok(quoting(&[("standard", 50, 1000)])))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let broadcaster = broadcaster(&server);
+        broadcaster.fee_satoshis_per_kb().await;
+        broadcaster.fee_satoshis_per_kb().await;
     }
 }
