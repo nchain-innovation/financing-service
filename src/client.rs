@@ -5,6 +5,7 @@ use chain_gang::{
     interface::blockchain_interface::UNCONFIRMED_HEIGHT,
     interface::{Balance, BlockchainInterface, Utxo, UtxoEntry},
     messages::{OutPoint, Tx, TxIn, TxOut},
+    network::Network,
     script::Script,
     transaction::{
         //generate_signature,
@@ -306,14 +307,39 @@ pub struct Client {
     spent_change: HashMap<String, SpentChange>,
 }
 
+/// Why a key whose WIF says `key` cannot be a wallet on `network`
+/// (`blockchain_interface.network`), or `None` if it can (CS-634). Its address
+/// would be on the other network, so the wallet would read empty and every
+/// funding fail. A WIF only tells mainnet from the rest: testnet, regtest and
+/// STN keys share a version byte. Names the client, never the key.
+fn key_network_mismatch(client_id: &str, key: Network, network: &str) -> Option<String> {
+    let key_on_mainnet = key == Network::BSV_Mainnet;
+    if key_on_mainnet == (network == "mainnet") {
+        return None;
+    }
+    let (key, wanted) = if key_on_mainnet {
+        ("a mainnet", "a test-network (testnet, regtest or STN)")
+    } else {
+        ("a test-network (testnet, regtest or STN)", "a mainnet")
+    };
+    Some(format!(
+        r#"wif_key is {key} key, but blockchain_interface.network is {network} (client_id = "{client_id}"): its address would be on the other network, so its wallet would read empty. Use {wanted} key."#
+    ))
+}
+
 impl Client {
-    pub fn try_new(config: &ClientConfig) -> Result<Self, String> {
+    /// A client funding from `config`'s key on `network`, the configured
+    /// `blockchain_interface.network`, which the key must be for (CS-634).
+    pub fn try_new(config: &ClientConfig, network: &str) -> Result<Self, String> {
         let wallet = Wallet::from_wif(&config.wif_key).map_err(|_| {
             format!(
                 r#"wif_key is not a valid WIF key (client_id = "{}")."#,
                 config.client_id
             )
         })?;
+        if let Some(why) = key_network_mismatch(&config.client_id, wallet.network, network) {
+            return Err(why);
+        }
         let address = wallet.get_address().map_err(|_| {
             format!(
                 r#"wif_key is not a valid WIF key - issues with address (client_id = "{}")."#,
@@ -1579,7 +1605,7 @@ mod tests {
         let blockchain_interface = test_blockchain_interface(&config).await;
 
         let client_config = config.client.unwrap();
-        let mut client = Client::try_new(&client_config[0]).unwrap();
+        let mut client = Client::try_new(&client_config[0], "regtest").unwrap();
 
         let result = client.update_balance(&*blockchain_interface).await;
         assert!(result.is_ok());
@@ -1620,7 +1646,7 @@ mod tests {
             wif_key: "EGa6cZHpfLZmUzXbkvq72s15rbiUonkrQAhDU4FG".to_string(),
             api_key: None,
         };
-        assert!(Client::try_new(&client_config).is_err());
+        assert!(Client::try_new(&client_config, "regtest").is_err());
     }
 
     #[tokio::test]
@@ -1630,7 +1656,7 @@ mod tests {
             wif_key: crate::test_support::TEST_WIF.to_string(),
             api_key: None,
         };
-        let mut client = Client::try_new(&client_config).unwrap();
+        let mut client = Client::try_new(&client_config, "regtest").unwrap();
         let fund_request = FundRequest {
             client_id: TEST_CLIENT_ID.to_string(),
             satoshi: 123,
@@ -1652,7 +1678,7 @@ mod tests {
             wif_key: crate::test_support::TEST_WIF.to_string(),
             api_key: None,
         };
-        let mut client = Client::try_new(&client_config).unwrap();
+        let mut client = Client::try_new(&client_config, "regtest").unwrap();
         client.unspent = values
             .iter()
             .enumerate()
@@ -1684,6 +1710,7 @@ mod tests {
             &crate::test_support::test_config(&crate::test_support::unique_dynamic_config_path())
                 .client
                 .unwrap()[0],
+            "regtest",
         )
         .unwrap();
         let utxo = |height, seed: char| UtxoEntry {
@@ -1826,7 +1853,7 @@ mod tests {
             wif_key: crate::test_support::TEST_WIF.to_string(),
             api_key: None,
         };
-        let mut client = Client::try_new(&client_config).unwrap();
+        let mut client = Client::try_new(&client_config, "regtest").unwrap();
         client.apply_chain_state(unspent);
         client
     }
@@ -3370,5 +3397,42 @@ mod tests {
         client.release_claim(&plan);
         assert_eq!(client.forget_refused_own_change(&plan), 0);
         assert_eq!(client.unspent.len(), 1);
+    }
+
+    /// CS-634: a key must be for `blockchain_interface.network`. A WIF only
+    /// tells mainnet from the rest, so a test-network key serves testnet,
+    /// regtest and STN. The refusal names the client and both networks, and
+    /// no part of the key.
+    #[test]
+    fn cs_634_a_key_must_be_for_the_configured_network() {
+        use crate::test_support::{MAPI_TEST_SIGNER_WIF as MAINNET_WIF, TEST_WIF};
+        let client = |wif: &str| ClientConfig {
+            client_id: TEST_CLIENT_ID.to_string(),
+            wif_key: wif.to_string(),
+            api_key: None,
+        };
+        for (wif, network) in [
+            (MAINNET_WIF, "testnet"),
+            (MAINNET_WIF, "regtest"),
+            (MAINNET_WIF, "stn"),
+            (TEST_WIF, "mainnet"),
+        ] {
+            let Err(error) = Client::try_new(&client(wif), network) else {
+                panic!("{network} took the key");
+            };
+            assert!(error.contains(TEST_CLIENT_ID), "{error}");
+            assert!(
+                error.contains(&format!("blockchain_interface.network is {network}")),
+                "{error}"
+            );
+            assert!(!error.contains(&wif[..8]), "{error}");
+        }
+        assert!(Client::try_new(&client(MAINNET_WIF), "mainnet").is_ok());
+        for network in ["testnet", "regtest", "stn"] {
+            assert!(
+                Client::try_new(&client(TEST_WIF), network).is_ok(),
+                "{network}"
+            );
+        }
     }
 }
