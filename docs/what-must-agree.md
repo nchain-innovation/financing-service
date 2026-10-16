@@ -34,7 +34,7 @@ Every caller has to give up later than the service it calls. Otherwise a hung no
 
 Mismatches that nothing catches today. Each one shows only when it is used:
 
-- **Credentials, before CS-631 and CS-632.** Until those land, a wrong FS client key is found by Event's first write. On mainnet and testnet, mapi-lite and FS require a token or key to be *set* (unless `allow_unauthenticated`), but not that it matches.
+- **Credentials, at the service that holds them.** On mainnet and testnet, mapi-lite and FS require a token or key to be *set* (unless `allow_unauthenticated`), but cannot tell whether a caller holds the same one. The callers check: FS and Event the mapi-lite token (CS-632), and Event its FS client key (CS-631, teranode-event-rs).
 - **mapi-lite's nodes against each other.** `chain` comes from the node with the best tip. Nodes on different chains are not refused.
 - **mapi-lite's `woc.network` against its nodes' chain**, and FS's client WIFs against `blockchain_interface.network`. A WIF of the other network gives an address on the other network.
 - **Event's network against FS's directly.** Both are checked against the same mapi-lite, which makes them agree when they share one.
