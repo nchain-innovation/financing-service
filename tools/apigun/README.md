@@ -156,11 +156,9 @@ docker logs -f <container> > fs.log 2>&1
 cargo run 2>&1 | tee fs.log
 ```
 
-**A release build logs only `warn` and above.**
-
-`RUST_LOG=info` is enough for the techniques below. At a few
-hundred failures a second this file grows quickly, so send it to disk rather
-than a terminal.
+`RUST_LOG=info` is enough for the techniques below, in a release build such as
+the Docker image as in a debug one. At a few hundred failures a second this
+file grows quickly, so send it to disk rather than a terminal.
 
 ### 1. Were there any double spends?
 

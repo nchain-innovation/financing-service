@@ -247,7 +247,7 @@ WARN  broadcast failed: funding tx <txid> (class=rejected, broadcaster=mapi-lite
 
 `class` is `failed`, `rejected` or `indeterminate`, matching the `broadcast_failed`, `broadcast_rejected` or `broadcast_outcome_unknown` the caller was answered with. At `debug` the transaction's hex is logged too, as `funding tx <txid> hex=...`.
 
-**A release build logs only `warn` and above**, whatever `level` says: the levels below it are compiled out. In a release build, which is what the Docker image runs, a failed broadcast is logged but the attempt and acceptance lines are not.
+`RUST_LOG` applies to a release build, which is what the Docker image runs, as it does to any other: no level is compiled out (CS-630). At `debug` and `trace` the dependencies log too, among them chain-gang's blockchain interface calls and the HTTP client's connections; `RUST_LOG=info,financing_service=debug` keeps them at `info`.
 
 ## [telemetry]
 
