@@ -429,12 +429,20 @@ mod tests {
             "the workflow must default the token to no permissions"
         );
         assert!(workflow.contains("contents: read"));
+        // The one write permission is the image job's `packages: write`, to
+        // push to ghcr.io (CS-606); no other job, and nothing else, writes.
+        let writes: Vec<&str> = workflow
+            .lines()
+            .map(|l| l.split(" #").next().unwrap().trim())
+            .filter(|l| l.ends_with(": write") || *l == "permissions: write-all")
+            .collect();
+        assert_eq!(writes, ["packages: write"], "only the image job writes");
+        let image = workflow.find("\n  image:\n").expect("the image job");
+        let packages = workflow.find("packages: write").unwrap();
+        assert!(packages > image, "packages: write belongs to the image job");
         assert!(
-            !workflow
-                .lines()
-                .map(|l| l.split(" #").next().unwrap().trim_end())
-                .any(|l| l.ends_with(": write") || l.trim() == "permissions: write-all"),
-            "no job needs a write permission"
+            !workflow.contains("persist-credentials: true"),
+            "no checkout keeps the token"
         );
         assert!(workflow.contains("persist-credentials: false"));
     }
