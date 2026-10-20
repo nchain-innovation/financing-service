@@ -549,6 +549,15 @@ impl Service {
             ) {
                 return Err(why);
             }
+            // So is a token mapi-lite refuses (CS-632).
+            if broadcaster.token_refused() {
+                return Err(
+                    "mapi-lite refuses mapi_lite.auth_token, or needs one and none is set (401): \
+                     every funding through it would be refused. Set it to the token in \
+                     mapi-lite's auth_token, alone"
+                        .to_string(),
+                );
+            }
         }
 
         let service = Self::build(config, backend, broadcaster)?;
@@ -3249,6 +3258,47 @@ mod tests {
                 Err(e) => {
                     assert!(!starts, "{chain}: {e}");
                     assert!(e.contains("on mainnet") && e.contains("testnet"), "{e}");
+                }
+            }
+        }
+    }
+
+    /// CS-632: a mapi-lite that refuses the token stops startup, naming the
+    /// setting and never the token; one that accepts it starts.
+    #[tokio::test]
+    async fn cs_632_a_refused_mapi_lite_token_stops_startup() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for (quote_status, starts) in [(401, false), (404, true)] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/ready"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ready": true,
+                    "chain": "testnet",
+                    "checks": {}
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/mapi/feeQuote"))
+                .respond_with(ResponseTemplate::new(quote_status))
+                .mount(&server)
+                .await;
+            let mut config = test_config(&unique_dynamic_config_path());
+            let mut mapi_lite = crate::config::MapiLiteConfig::for_base_url(server.uri());
+            mapi_lite.auth_token = Some("hunter2".to_string());
+            config.mapi_lite = Some(mapi_lite);
+            match Service::new(&config).await {
+                Ok(_) => assert!(starts, "started though mapi-lite answered {quote_status}"),
+                Err(e) => {
+                    assert!(!starts, "{quote_status}: {e}");
+                    assert!(
+                        e.contains("mapi_lite.auth_token") && e.contains("401"),
+                        "{e}"
+                    );
+                    assert!(!e.contains("hunter2"), "{e}");
                 }
             }
         }
