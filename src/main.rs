@@ -82,6 +82,9 @@ async fn main() -> std::io::Result<()> {
     // Which way funding transactions leave the service. Reads always go
     // through [blockchain_interface]; this names the write path.
     log::info!("{}", broadcaster::factory::describe_broadcaster(&config));
+    if let Some(warning) = config.shared_woc_budget_warning() {
+        log::warn!("{warning}");
+    }
     if service.admin_auth_required() {
         log::info!("Admin API key authentication enabled for POST /client");
     } else {
