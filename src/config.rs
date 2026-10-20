@@ -10,7 +10,10 @@ use crate::secrets::resolve_secret;
 #[derive(Debug, Deserialize, Clone)]
 pub struct BlockchainInterfaceConfig {
     pub interface_type: String,
-    pub network_type: String,
+    /// `mainnet`, `testnet`, `regtest` or `stn`, spelt exactly so: the names
+    /// mapi-lite publishes for its nodes' chain, which this is checked
+    /// against, and Event's (CS-624). It was `network_type`.
+    pub network: String,
     /// Endpoint for the interfaces that need one: the UaaS base URL, or the
     /// node's JSON-RPC host and port for `rpc` (a bare `host:port` is taken
     /// as `http://`).
@@ -67,7 +70,7 @@ impl Default for BlockchainInterfaceConfig {
     fn default() -> Self {
         BlockchainInterfaceConfig {
             interface_type: String::new(),
-            network_type: String::new(),
+            network: String::new(),
             url: None,
             rpc_user: None,
             rpc_password: None,
@@ -76,6 +79,35 @@ impl Default for BlockchainInterfaceConfig {
             timeout_seconds: None,
         }
     }
+}
+
+/// The networks `blockchain_interface.network` may name, spelt as mapi-lite
+/// publishes its nodes' chain (`uls_core::wire::network_of_chain`).
+pub const NETWORKS: [&str; 4] = ["mainnet", "testnet", "regtest", "stn"];
+
+/// `network` exactly as one of [`NETWORKS`], or why not, naming the spelling
+/// to write for one that means the same network (CS-624). Another spelling
+/// used to fail later and less clearly, as "unable to decode network".
+fn check_network(network: &str) -> Result<(), String> {
+    if NETWORKS.contains(&network) {
+        return Ok(());
+    }
+    let meant = match network.trim().to_ascii_lowercase().as_str() {
+        "mainnet" | "main" | "livenet" | "bsv" => Some("mainnet"),
+        "testnet" | "test" | "testnet3" => Some("testnet"),
+        "regtest" => Some("regtest"),
+        "stn" => Some("stn"),
+        _ => None,
+    };
+    Err(match meant {
+        Some(canonical) => format!(
+            "blockchain_interface.network {network:?} is not a network name: write \"{canonical}\""
+        ),
+        None => format!(
+            "blockchain_interface.network {network:?} is not a network name: it is one of {}",
+            NETWORKS.join(", ")
+        ),
+    })
 }
 
 impl BlockchainInterfaceConfig {
@@ -108,6 +140,7 @@ impl BlockchainInterfaceConfig {
     /// Reject a configuration the chosen interface cannot work with, at
     /// startup rather than on the first request.
     pub fn validate(&self) -> Result<(), String> {
+        check_network(&self.network)?;
         match self.interface_type.as_str() {
             "uaas" => {
                 if self.url.as_deref().unwrap_or("").is_empty() {
@@ -771,7 +804,7 @@ impl Config {
     /// or testnet, whose wallets are shared and slow to refill (CS-514).
     pub fn is_production_network(&self) -> bool {
         matches!(
-            self.blockchain_interface.network_type.as_str(),
+            self.blockchain_interface.network.as_str(),
             "mainnet" | "testnet"
         )
     }
@@ -786,7 +819,7 @@ impl Config {
             return Err(format!(
                 "dynamic_config.allow_plaintext_wif is for development only and cannot be set on \
                  {}: POST /client must use wif_env",
-                self.blockchain_interface.network_type
+                self.blockchain_interface.network
             ));
         }
         Ok(())
@@ -823,7 +856,7 @@ impl Config {
             Some(mapi_lite) if self.is_production_network() => match mapi_lite.unpinned_warning() {
                 Some(why) => Err(format!(
                     "{why} It is required on {}.",
-                    self.blockchain_interface.network_type
+                    self.blockchain_interface.network
                 )),
                 None => Ok(()),
             },
@@ -848,7 +881,7 @@ impl Config {
                     .to_string(),
             );
         }
-        match self.blockchain_interface.network_type.as_str() {
+        match self.blockchain_interface.network.as_str() {
             "mainnet" | "testnet" => Ok(()),
             other => Err(format!(
                 "blockchain_interface.interface_type = \"mapi_lite\" cannot read {other}: \
@@ -858,8 +891,31 @@ impl Config {
         }
     }
 
+    /// The startup warning for a deployment with two WhatsOnChain clients
+    /// (CS-635), or `None`. With `[mapi_lite]` and `interface_type = "woc"` on
+    /// mainnet or testnet, this service reads WhatsOnChain itself, and so does
+    /// mapi-lite when its `[woc]` is on: each paces for WhatsOnChain's free 3
+    /// requests a second, so together they can exceed it. Not refused, since
+    /// this service cannot tell whether mapi-lite's `[woc]` is on.
+    pub fn shared_woc_budget_warning(&self) -> Option<String> {
+        let shared = self.mapi_lite.is_some()
+            && self.blockchain_interface.interface_type == "woc"
+            && self.is_production_network();
+        shared.then(|| {
+            format!(
+                "blockchain_interface.interface_type = \"woc\" with [mapi_lite] on {}: this \
+                 service reads WhatsOnChain itself, and so does mapi-lite when its [woc] is on, \
+                 each pacing for WhatsOnChain's free 3 requests a second, which the two can \
+                 exceed between them (HTTP 429). Set interface_type = \"mapi_lite\" so mapi-lite \
+                 makes every WhatsOnChain request; keep \"woc\" only if mapi-lite runs without \
+                 [woc].",
+                self.blockchain_interface.network
+            )
+        })
+    }
+
     pub fn get_network(&self) -> Result<Network, &str> {
-        match self.blockchain_interface.network_type.as_str() {
+        match self.blockchain_interface.network.as_str() {
             "mainnet" => Ok(Network::BSV_Mainnet),
             "testnet" => Ok(Network::BSV_Testnet),
             "stn" => Ok(Network::BSV_STN),
@@ -1015,20 +1071,29 @@ fn read_layers(path: &str, with_env: bool) -> Result<Config, String> {
         .build()
         .map_err(|e| format!("Error reading config file {path}: {e}"))?;
     let mut unused = Vec::new();
-    let config: Config = serde_ignored::deserialize(built, |key| {
+    let parsed: Result<Config, _> = serde_ignored::deserialize(built, |key| {
         // serde_ignored writes an Option's inside as a `?` segment.
         unused.push(key.to_string().replace(".?", ""))
-    })
-    .map_err(|e| format!("Error in config file {path}: {e}"))?;
-    if !unused.is_empty() {
-        unused.sort();
-        return Err(format!(
+    });
+    unused.sort();
+    let unread = |keys: &[String]| {
+        format!(
             "configuration keys no setting reads: {}. Check the spelling: a key belongs in the \
              [table] it is written under, and an override is {ENV_OVERRIDE_PREFIX}<TABLE>__<KEY>",
-            unused.join(", ")
-        ));
+            keys.join(", ")
+        )
+    };
+    match parsed {
+        // A key renamed or misspelt is usually why a required one is
+        // missing: `network_type` for `network`. Name both.
+        Err(e) if !unused.is_empty() => Err(format!(
+            "Error in config file {path}: {e}; and {}",
+            unread(&unused)
+        )),
+        Err(e) => Err(format!("Error in config file {path}: {e}")),
+        Ok(_) if !unused.is_empty() => Err(unread(&unused)),
+        Ok(config) => Ok(config),
     }
-    Ok(config)
 }
 
 #[cfg(test)]
@@ -1100,7 +1165,7 @@ listen_addr = "127.0.0.1:9091"
 
 [blockchain_interface]
 interface_type = "test"
-network_type = "testnet"
+network = "testnet"
 
 [web_interface]
 allow_unauthenticated = true  # testnet without keys (CS-514)
@@ -1296,7 +1361,7 @@ filename = "./data/dynamic.toml"
 
     #[test]
     fn sr_bchn_002_get_network_supports_mainnet_testnet_stn_and_regtest() {
-        for (network_type, expected) in [
+        for (network, expected) in [
             ("mainnet", Network::BSV_Mainnet),
             ("testnet", Network::BSV_Testnet),
             ("stn", Network::BSV_STN),
@@ -1304,13 +1369,43 @@ filename = "./data/dynamic.toml"
         ] {
             let config = Config {
                 blockchain_interface: BlockchainInterfaceConfig {
-                    network_type: network_type.to_string(),
+                    network: network.to_string(),
                     ..Default::default()
                 },
                 ..Default::default()
             };
             assert_eq!(config.get_network().unwrap(), expected);
         }
+    }
+
+    /// Only the four names mapi-lite publishes are accepted, spelt exactly;
+    /// one meaning the same network is refused naming the spelling to write,
+    /// and the old key is refused rather than ignored (CS-624).
+    #[test]
+    fn sr_bchn_002_the_network_is_one_of_four_exact_names() {
+        for network in NETWORKS {
+            assert!(check_network(network).is_ok(), "{network}");
+        }
+        for (network, write) in [
+            ("main", "\"mainnet\""),
+            ("livenet", "\"mainnet\""),
+            ("Mainnet", "\"mainnet\""),
+            ("test", "\"testnet\""),
+            ("Testnet", "\"testnet\""),
+            ("REGTEST", "\"regtest\""),
+        ] {
+            let err = check_network(network).unwrap_err();
+            assert!(err.contains(write), "{network}: {err}");
+        }
+        let err = check_network("private").unwrap_err();
+        assert!(err.contains("mainnet, testnet, regtest, stn"), "{err}");
+
+        let path = write_temp_config(
+            "network-type",
+            &MINIMAL_TOML.replace("network = \"testnet\"", "network_type = \"testnet\""),
+        );
+        let err = with_env(&[], || load_config(path.to_str().unwrap()).unwrap_err());
+        assert!(err.contains("blockchain_interface.network_type"), "{err}");
     }
 
     fn rpc_interface_config(
@@ -1320,7 +1415,7 @@ filename = "./data/dynamic.toml"
     ) -> BlockchainInterfaceConfig {
         BlockchainInterfaceConfig {
             interface_type: "rpc".to_string(),
-            network_type: "regtest".to_string(),
+            network: "regtest".to_string(),
             url: url.map(str::to_string),
             rpc_user: user.map(str::to_string),
             rpc_password: password.map(str::to_string),
@@ -1348,6 +1443,44 @@ filename = "./data/dynamic.toml"
         }
     }
 
+    /// CS-635: reading WhatsOnChain here while broadcasting through mapi-lite
+    /// on mainnet or testnet is warned about, naming the fix; reading through
+    /// mapi-lite, no `[mapi_lite]`, or a private network is not.
+    #[test]
+    fn sr_bchn_022_two_whatsonchain_clients_are_warned_about() {
+        let config = |interface_type: &str, network: &str, mapi_lite: bool| Config {
+            blockchain_interface: BlockchainInterfaceConfig {
+                interface_type: interface_type.to_string(),
+                network: network.to_string(),
+                ..Default::default()
+            },
+            mapi_lite: mapi_lite.then(|| MapiLiteConfig::for_base_url("http://mapi:8080")),
+            ..Default::default()
+        };
+        for network in ["mainnet", "testnet"] {
+            let warning = config("woc", network, true)
+                .shared_woc_budget_warning()
+                .expect(network);
+            assert!(warning.contains(&format!("on {network}")), "{warning}");
+            assert!(
+                warning.contains("interface_type = \"mapi_lite\""),
+                "{warning}"
+            );
+        }
+        for (interface_type, network, mapi_lite) in [
+            ("mapi_lite", "testnet", true),
+            ("woc", "testnet", false),
+            ("woc", "stn", true),
+            ("rpc", "mainnet", true),
+        ] {
+            assert_eq!(
+                config(interface_type, network, mapi_lite).shared_woc_budget_warning(),
+                None,
+                "{interface_type} on {network}, [mapi_lite] {mapi_lite}"
+            );
+        }
+    }
+
     /// CS-601: reading through mapi-lite needs its server, and a network its
     /// WhatsOnChain-backed address reads can answer for.
     #[test]
@@ -1355,7 +1488,7 @@ filename = "./data/dynamic.toml"
         let reads = |network: &str, mapi_lite: bool| Config {
             blockchain_interface: BlockchainInterfaceConfig {
                 interface_type: "mapi_lite".to_string(),
-                network_type: network.to_string(),
+                network: network.to_string(),
                 ..Default::default()
             },
             mapi_lite: mapi_lite.then(|| MapiLiteConfig::for_base_url("http://mapi:8080")),
@@ -1375,7 +1508,7 @@ filename = "./data/dynamic.toml"
         let woc = Config {
             blockchain_interface: BlockchainInterfaceConfig {
                 interface_type: "woc".to_string(),
-                network_type: "regtest".to_string(),
+                network: "regtest".to_string(),
                 ..Default::default()
             },
             ..Default::default()
@@ -1388,7 +1521,7 @@ filename = "./data/dynamic.toml"
     #[test]
     fn rpc_import_addresses_defaults_to_on() {
         let config: BlockchainInterfaceConfig = toml::from_str(
-            "interface_type = \"rpc\"\nnetwork_type = \"regtest\"\nurl = \"127.0.0.1:18443\"",
+            "interface_type = \"rpc\"\nnetwork = \"regtest\"\nurl = \"127.0.0.1:18443\"",
         )
         .unwrap();
         assert!(config.rpc_import_addresses);
@@ -1418,7 +1551,7 @@ filename = "./data/dynamic.toml"
         for interface_type in ["woc", "test"] {
             let config = BlockchainInterfaceConfig {
                 interface_type: interface_type.to_string(),
-                network_type: "testnet".to_string(),
+                network: "testnet".to_string(),
                 ..Default::default()
             };
             assert!(config.validate().is_ok());
@@ -1520,7 +1653,7 @@ filename = "./data/dynamic.toml"
             r#"
 [blockchain_interface]
 interface_type = "test"
-network_type = "testnet"
+network = "testnet"
 
 [web_interface]
 allow_unauthenticated = true  # testnet without keys (CS-514)
@@ -1547,7 +1680,7 @@ filename = "./data/dynamic.toml"
     const MINIMAL_TOML: &str = r#"
 [blockchain_interface]
 interface_type = "test"
-network_type = "testnet"
+network = "testnet"
 
 [web_interface]
 allow_unauthenticated = true  # testnet without keys (CS-514)
@@ -2059,7 +2192,7 @@ filename = "./data/dynamic.toml"
     fn policy_config(network: &str, admin: Option<&str>, open: bool, plaintext: bool) -> Config {
         Config {
             blockchain_interface: BlockchainInterfaceConfig {
-                network_type: network.to_string(),
+                network: network.to_string(),
                 ..Default::default()
             },
             web_interface: WebInterfaceConfig {
@@ -2187,7 +2320,7 @@ filename = "./data/dynamic.toml"
             Config {
                 blockchain_interface: BlockchainInterfaceConfig {
                     interface_type: "woc".to_string(),
-                    network_type: network.to_string(),
+                    network: network.to_string(),
                     ..Default::default()
                 },
                 mapi_lite: Some(mapi_lite),

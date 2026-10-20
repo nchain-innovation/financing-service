@@ -14,8 +14,8 @@ Configures the blockchain interface. Supported `interface_type` values: `woc`, `
 
 ```toml
 [blockchain_interface]
-interface_type = "woc"
-network_type = "testnet"
+interface_type = "mapi_lite"             # reads through [mapi_lite]; see below
+network = "testnet"
 # url = "http://localhost:5010"  # required for uaas, and for rpc (host:port)
 # rpc_user = "rpcuser"                    # required for rpc
 # rpc_password = "env:FS_RPC_PASSWORD"    # required for rpc
@@ -24,7 +24,7 @@ network_type = "testnet"
 # timeout_seconds = 30                    # deadline on each interface call; 0 turns it off
 ```
 
-Supported `network_type` values: `mainnet`, `testnet`, `stn`, `regtest`.
+`network` is one of `mainnet`, `testnet`, `regtest` or `stn`, spelt exactly so: they are the names mapi-lite publishes for its nodes' chain, and Event's. Any other spelling stops startup; one that means the same network (`main`, `livenet`, `test`, `Mainnet`, …) is refused naming the one to write. It was `network_type` until CS-624, and that key is now refused.
 
 ### Which interface reaches which network
 
@@ -47,13 +47,15 @@ The interface serves both chain *reads* (balances, UTXOs) and, by default, the *
 ```toml
 [blockchain_interface]
 interface_type = "mapi_lite"
-network_type = "testnet"
+network = "testnet"
 
 [mapi_lite]
 base_url = "http://127.0.0.1:8080"
 ```
 
 Reads each client's UTXO set and balance through the `[mapi_lite]` server's `/query/address/*` endpoints, with the same `base_url`, `auth_token` and `miner_id_public_keys` as broadcasts (CS-601, SR-BCHN-019). mapi-lite then makes every WhatsOnChain request for the deployment, paced by its one limit (`[woc] max_requests_per_second` there) against WhatsOnChain's one quota. With `woc` here as well, this service and mapi-lite each pace their own requests against that same quota and can exceed it between them.
+
+**This is the interface for mainnet and testnet** (CS-635), and the sample config uses it. With `[mapi_lite]` and `interface_type = "woc"` on mainnet or testnet, startup warns, naming the shared quota and this interface as the fix (SR-BCHN-022). It is a warning, not a refusal: this service cannot tell whether mapi-lite's `[woc]` is on, and with it off, `woc` here is the only WhatsOnChain client. Neither service sends a WhatsOnChain API key, so both are on the free quota.
 
 * Needs a `[mapi_lite]` section, and mapi-lite needs `[woc]` configured: without it mapi-lite answers address reads with `503`, which this service reports as `chain_unavailable`, never as an empty wallet.
 * mainnet and testnet only, since mapi-lite answers these reads from WhatsOnChain. Startup refuses `regtest` and `stn`; use `rpc` for a private chain.
@@ -65,7 +67,7 @@ Reads each client's UTXO set and balance through the `[mapi_lite]` server's `/qu
 ```toml
 [blockchain_interface]
 interface_type = "rpc"
-network_type = "regtest"
+network = "regtest"
 url = "127.0.0.1:18332"   # bitcoin-sv's regtest RPC port; Bitcoin Core's is 18443
 rpc_user = "rpcuser"
 rpc_password = "env:FS_RPC_PASSWORD"
@@ -136,7 +138,7 @@ Note that `GET /health` stays `ok` throughout: it is a liveness check and delibe
 
 **An unreachable blockchain interface at startup is a warning, not a fatal error** (CS-505). It used to stop the service — on a single WhatsOnChain 429 — and the restart that followed met the same rate limit. Now the service starts degraded, logs `Unable to reach the blockchain interface at startup`, and `GET /ready` answers 503 until the first chain read succeeds; `/health` and `/status` serve throughout.
 
-**`test` is a fixture, not a backend.** It is an in-process stub used by the unit tests, with a UTXO set injected directly by the test harness. It has no network of its own, so the `network_type` you set alongside it only affects address encoding. It will start and serve requests as a configured backend, but its UTXO set is empty, so balances read zero and funding is refused — useful for exercising the API surface, not for funding anything.
+**`test` is a fixture, not a backend.** It is an in-process stub used by the unit tests, with a UTXO set injected directly by the test harness. It has no network of its own, so the `network` you set alongside it only affects address encoding. It will start and serve requests as a configured backend, but its UTXO set is empty, so balances read zero and funding is refused — useful for exercising the API surface, not for funding anything.
 
 ### Every interface call has a deadline
 
@@ -154,7 +156,7 @@ It bounds a whole call, and WhatsOnChain's UTXO listing is one call made of seve
 
 Most keys have defaults, and most sections can be left out. These cannot, and the service refuses to start without them:
 
-* `blockchain_interface.interface_type` and `blockchain_interface.network_type`
+* `blockchain_interface.interface_type` and `blockchain_interface.network`
 * `service.utxo_refresh_period`
 * `dynamic_config.filename`
 
@@ -196,7 +198,7 @@ When `admin_api_key` is omitted, `POST /client` is unauthenticated. The service 
 
 ### Authentication is required on mainnet and testnet
 
-With `network_type` `mainnet` or `testnet`, the service **refuses to start** (CS-514) when:
+With `network` `mainnet` or `testnet`, the service **refuses to start** (CS-514) when:
 
 * `admin_api_key` is unset — `POST /client` and `DELETE /client` would be open; or
 * any client, static or dynamic, has no `api_key` — its `/fund`, balance and address routes would be open; or
@@ -476,7 +478,7 @@ auth_token = "env:MAPI_AUTH_TOKEN"
 ```
 
 * `base_url` — **required.** Base URL of the mapi-lite server, `http://` or `https://`. Surrounding whitespace and a trailing `/` are stripped before the URL is validated or used, so the value that is checked at startup is the one that is requested.
-* `auth_token` — optional. The token alone, as mapi-lite's own `auth_token` is: every request carries `Authorization: Bearer <token>`. **Before CS-624 this held the whole header**; a value starting `Bearer `, or holding any space, is now refused at startup, so drop the prefix. Takes an `env:VAR_NAME` reference, or can be set with `FS__MAPI_LITE__AUTH_TOKEN`. A plaintext value is reported at startup like any other plaintext secret. Never logged.
+* `auth_token` — optional. The token alone, as mapi-lite's own `auth_token` is: every request carries `Authorization: Bearer <token>`. **Before CS-624 this held the whole header**; a value starting `Bearer `, or holding any space, is now refused at startup, so drop the prefix. Takes an `env:VAR_NAME` reference, or can be set with `FS__MAPI_LITE__AUTH_TOKEN`. A plaintext value is reported at startup like any other plaintext secret. Never logged. mapi-lite's `GET /ready` is unauthenticated, so the startup probe and `GET /ready` also fetch its signed fee quote, which is not: a 401 there, a token mapi-lite refuses or one it needs and was not given, stops startup and makes `/ready` report mapi-lite not ready, naming the setting (CS-632).
 * `miner_id_public_keys` — mapi-lite's miner-ID public keys, as hex (33-byte compressed or 65-byte uncompressed): the `minerId` in every response it signs (CS-523, SR-SEC-019). **Set this.** A signed response is otherwise checked only against the key *it carries*, which shows it was not altered, not who sent it. Anyone able to answer in mapi-lite's place — over plain HTTP, anyone on the path — could then forge an "accepted" or a fee quote. A response signed by any other key is refused: a fee quote is ignored, and a submit is reported as `broadcast_outcome_unknown`, because what the real mapi-lite did is hidden. Once any signed answer has shown mapi-lite signing with an unlisted key, `GET /ready` reports mapi-lite not ready and `POST /fund` sends nothing, answering 503 `broadcaster_untrusted`, until a signed answer verifies again (CS-618, SR-SEC-033): otherwise each funding would land and be reported as an unknown outcome, holding its inputs for 600s. List more than one key to cover a rotation; from the environment, `FS__MAPI_LITE__MINER_ID_PUBLIC_KEYS` takes them comma-separated (CS-636). **Required on mainnet and testnet**: left empty there, the service refuses to start (CS-624). On regtest and STN it may be empty, which accepts any valid signature and is warned about at startup. Invalid hex or length is refused at startup.
 * `total_timeout_seconds` — ceiling on a whole submit: every attempt and every back-off between them. Default `45`. The one timing setting for mapi-lite (CS-624): the rest is derived from it and from what mapi-lite publishes, below. It is the worst case a `POST /fund` caller — and the actix worker serving it — can be held by an unresponsive mapi-lite.
 
@@ -500,13 +502,13 @@ A `total_timeout_seconds` shorter than one attempt against the ceiling cuts ever
 When the section is present the service:
 
 * Logs at startup: `mapi-lite integration configured (base_url=...): funding transactions will be broadcast via mapi-lite`. Without the section the line reads `mapi-lite not configured: funding transactions will be broadcast via the 'woc' blockchain interface` (naming whichever `interface_type` is configured).
-* Probes mapi-lite at startup (its `GET /ready`) and **warns** if it is unreachable or not ready, without refusing to start. Funding will fail until mapi-lite is reachable, but the read paths — `/status`, balances, UTXO refreshes — do not depend on it and keep serving, and the service recovers on its own when mapi-lite returns. Refusing to start would instead put the container in a restart loop driven by its own health check, taking the read paths down with it.
+* Probes mapi-lite at startup (its `GET /ready`) and **warns** if it is unreachable or not ready, without refusing to start. Funding will fail until mapi-lite is reachable, but the read paths — `/status`, balances, UTXO refreshes — do not depend on it and keep serving, and the service recovers on its own when mapi-lite returns. Refusing to start would instead put the container in a restart loop driven by its own health check, taking the read paths down with it. The one exception is a mapi-lite whose nodes are on another network than `network`: that is the configuration, which no wait mends, so the service refuses to start (CS-624).
 * Asks mapi-lite's own `GET /ready` for this service's `GET /ready`, and returns HTTP 503 when mapi-lite is unreachable or not ready, reusing a verdict for up to 2s. mapi-lite's readiness fails when it cannot do its work: its nodes are unreachable, its block ingest has fallen behind, or it cannot sign or reach its database; the fee quote this used to probe is served from mapi-lite's configuration and answered with every node down (CS-505). `GET /health` is unaffected. See [Readiness check](SupportedEndpoints.md#readiness-check).
 * Reports `"broadcaster": "mapi-lite"` in `GET /status`.
 * Funds a request from cached chain state that has merely aged, rather than waiting for it to be refreshed through `[blockchain_interface]`, and refreshes it behind the request — see [How often the service reads the chain](#how-often-the-service-reads-the-chain).
 * Submits each funding transaction as a one-element batch to `POST /mapi/txs`, with the merkle proof declined (no callbacks are wanted). A rejection by mapi-lite or the node surfaces to the caller as `broadcast_rejected` (HTTP 409) when the upstream calls it final or names a conflicting transaction, since retrying cannot help, and otherwise as `broadcast_failed` (HTTP 502), as does a mapi-lite `503` (no node can have received it); either way the reason is in the service log. Anything that may have reached the network surfaces as `broadcast_outcome_unknown` (HTTP 504) instead, and the inputs are reserved: an answer that never arrives or cannot be read, a mapi-lite `500`/`502`/`504` (from mapi-lite v0.4.0 a `504` means a node may have received it), and mapi-lite's "accepted by the node but could not be recorded", which is resubmitted first since the resubmission records it (CS-501).
 
-The mapi-lite server must be pointed at the same network as `network_type`, since the funding transactions are signed for that network. Because mapi-lite talks to a node directly, this is also a way to broadcast on regtest while still reading chain state through another interface.
+The mapi-lite server must be pointed at the same network as `network`, since the funding transactions are signed for that network. **It is checked (CS-624):** mapi-lite v0.6.0 and later publish their nodes' network in `GET /ready` (`chain`), and when it is not `network` the service refuses to start, naming both. A mapi-lite that cannot be reached at startup is still only warned about. If it later answers with another network, or a mapi-lite that answered nothing about its network now does, `GET /ready` reports mapi-lite not ready. Its body says only "mapi-lite probe failed", as for any mapi-lite failure, since it answers anyone; the message naming both networks goes to the log. Because mapi-lite talks to a node directly, this is also a way to broadcast on regtest while still reading chain state through another interface.
 
 Building the service with this integration requires read access to the private `mapi-lite` repository — see [Dependencies.md](Dependencies.md).
 
@@ -546,7 +548,7 @@ api_key = "your-client-secret"
 ```
 
 * `client_id` — identifier used in API requests
-* `wif_key` — WIF private key for the client's funding wallet
+* `wif_key` — WIF private key for the client's funding wallet. It must be a key for `blockchain_interface.network` (CS-634): a mainnet key on mainnet, a test-network key on testnet, regtest or STN, which share a WIF version. A key for the other network stops startup, naming the client and both networks, and `POST /client` refuses one with HTTP 400 `invalid_request`. Its address would be on the other network, so its wallet would read empty and every funding would fail.
 * `api_key` — optional shared secret for this client's API endpoints
 
 When `api_key` is set for a client, requests for that client must include either `Authorization: Bearer <api_key>` or `X-API-Key: <api_key>`. Clients without an `api_key` remain unauthenticated; restrict them via network isolation. The service logs a warning at startup listing clients without an `api_key`.

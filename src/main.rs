@@ -76,12 +76,15 @@ async fn main() -> std::io::Result<()> {
         log::warn!(
             "web_interface.allow_unauthenticated is set on {}: authentication is left to whatever \
              is in front of this service",
-            config.blockchain_interface.network_type
+            config.blockchain_interface.network
         );
     }
     // Which way funding transactions leave the service. Reads always go
     // through [blockchain_interface]; this names the write path.
     log::info!("{}", broadcaster::factory::describe_broadcaster(&config));
+    if let Some(warning) = config.shared_woc_budget_warning() {
+        log::warn!("{warning}");
+    }
     if service.admin_auth_required() {
         log::info!("Admin API key authentication enabled for POST /client");
     } else {
