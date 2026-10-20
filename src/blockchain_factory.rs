@@ -233,7 +233,7 @@ mod tests {
         Config {
             blockchain_interface: BlockchainInterfaceConfig {
                 interface_type: interface_type.to_string(),
-                network_type: "testnet".to_string(),
+                network: "testnet".to_string(),
                 url: url.map(str::to_string),
                 ..Default::default()
             },
@@ -266,7 +266,7 @@ mod tests {
         Config {
             blockchain_interface: BlockchainInterfaceConfig {
                 interface_type: "rpc".to_string(),
-                network_type: "regtest".to_string(),
+                network: "regtest".to_string(),
                 url: url.map(str::to_string),
                 rpc_user: user.map(str::to_string),
                 rpc_password: password.map(str::to_string),

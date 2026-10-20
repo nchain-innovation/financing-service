@@ -136,6 +136,14 @@ pub trait TxBroadcaster: Send + Sync {
     async fn knows_tx(&self, _txid: &str) -> Option<bool> {
         None
     }
+
+    /// The network this upstream last said its nodes are on, as `mainnet`,
+    /// `testnet`, `regtest` or `stn` (CS-624): mapi-lite publishes it in
+    /// `/ready`, which [`TxBroadcaster::health_check`] reads. `None` before
+    /// it has said, or for an upstream that reads the wallet's own chain.
+    fn published_network(&self) -> Option<String> {
+        None
+    }
 }
 
 #[cfg(test)]

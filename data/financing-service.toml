@@ -5,14 +5,14 @@ listen_addr = "127.0.0.1:8080"
 
 [blockchain_interface]
 interface_type = "woc"
-network_type = "testnet"
+network = "testnet"
 # Or read through the [mapi_lite] server below, so it is the deployment's only
 # WhatsOnChain client (mainnet and testnet only; needs [mapi_lite]):
 # interface_type = "mapi_lite"
 # For a local node, the only way to reach regtest. The service imports each
 # client's address into the node's wallet so their balances are visible.
 # interface_type = "rpc"
-# network_type = "regtest"
+# network = "regtest"
 # url = "127.0.0.1:18332"   # bitcoin-sv's regtest RPC port (Bitcoin Core's is 18443)
 # rpc_user = "rpcuser"
 # rpc_password = "env:FS_RPC_PASSWORD"
