@@ -31,6 +31,7 @@ The FS is designed to be as simple as possible, in that light it:
 * FS build dependencies are open-source Rust crates, except `uls-client` and `uls-core`, which come from the private mapi-lite repository (see [Dependencies](docs/Dependencies.md)).
 
 * FS does not support Hierarchical Deterministic (HD) Keys (BIP-32).
+* What FS must agree on with Event and mapi-lite (network, miner ID, mapi-lite token, its clients' keys, fee rate, the timeout chain), who owns each, and how a mismatch shows is in [What must agree](docs/what-must-agree.md).
 * FS supports optional per-client API key authentication and an optional admin key for `POST /client`. Clients without an `api_key` rely on network isolation (firewalls, private networks, reverse proxies). See [Configuration](docs/Configuration.md) and [Supported endpoints](docs/SupportedEndpoints.md).
 * FS supports secret references (`env:VAR`), environment variable overrides, and `wif_env` / `api_key_env` when adding clients at runtime. See [Configuration](docs/Configuration.md#secret-management).
 * FS supports optional per-IP HTTP rate limiting (disabled by default). See [Configuration](docs/Configuration.md#rate-limiting).
