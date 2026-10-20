@@ -404,8 +404,9 @@ pub struct MapiLiteConfig {
     /// response it signs (CS-523, SR-SEC-019). A response signed by any other
     /// key is refused. Several allow a rotation. Empty -- the default -- accepts
     /// any valid signature, which proves nothing about the sender, so the
-    /// service warns at startup.
-    #[serde(default)]
+    /// service warns at startup. An `FS__` override gives it comma-separated,
+    /// the one form an override can (CS-636).
+    #[serde(default, deserialize_with = "list_or_comma_separated")]
     pub miner_id_public_keys: Vec<String>,
 }
 
@@ -578,6 +579,31 @@ impl MapiLiteConfig {
     pub fn unpinned_warning(&self) -> Option<&'static str> {
         self.miner_id_public_keys.is_empty().then_some(UNPINNED)
     }
+}
+
+/// A list of strings, as a file writes one, or as one comma-separated string,
+/// which is all an `FS__` override can give (CS-636): environment variables
+/// are text. Each entry is trimmed and empty ones dropped, so `""` is an empty
+/// list. Only the settings that ask for it take a string this way.
+fn list_or_comma_separated<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum ListOrText {
+        List(Vec<String>),
+        Text(String),
+    }
+    Ok(match ListOrText::deserialize(deserializer)? {
+        ListOrText::List(list) => list,
+        ListOrText::Text(text) => text
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(str::to_string)
+            .collect(),
+    })
 }
 
 /// Why an empty `miner_id_public_keys` is warned about, or refused.
@@ -2248,6 +2274,42 @@ filename = "./data/dynamic.toml"
     }
 
     const PINNED_KEY: &str = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+    const OTHER_PINNED_KEY: &str =
+        "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5";
+
+    /// CS-636: `FS__MAPI_LITE__MINER_ID_PUBLIC_KEYS` gives the keys
+    /// comma-separated, replacing the file's, so a deployment configured from
+    /// the environment needs no file for them; the file's list still works,
+    /// and a bad key from either is refused by name.
+    #[test]
+    fn cs_636_miner_ids_can_come_from_an_override() {
+        let section = format!(
+            "\n[mapi_lite]\nbase_url = \"http://mapi:8080\"\nminer_id_public_keys = [\"{PINNED_KEY}\"]\n"
+        );
+        let path = write_temp_config("pins-file", &format!("{MINIMAL_TOML}{section}"));
+        let keys = |vars: &[(&str, &str)]| {
+            with_env(vars, || load_config(path.to_str().unwrap()))
+                .map(|config| config.mapi_lite.unwrap().miner_id_public_keys)
+        };
+        assert_eq!(keys(&[]).unwrap(), [PINNED_KEY]);
+
+        let var = "FS__MAPI_LITE__MINER_ID_PUBLIC_KEYS";
+        let both = format!(" {OTHER_PINNED_KEY} ,{PINNED_KEY},");
+        assert_eq!(
+            keys(&[(var, &both)]).unwrap(),
+            [OTHER_PINNED_KEY, PINNED_KEY]
+        );
+        assert_eq!(
+            keys(&[(var, OTHER_PINNED_KEY)]).unwrap(),
+            [OTHER_PINNED_KEY]
+        );
+
+        // Empty is an empty list, which testnet refuses as unpinned.
+        let err = keys(&[(var, "")]).unwrap_err();
+        assert!(err.contains("miner_id_public_keys is empty"), "{err}");
+        let err = keys(&[(var, &format!("{PINNED_KEY},nope"))]).unwrap_err();
+        assert!(err.contains("\"nope\" is not a public key"), "{err}");
+    }
 
     /// On mainnet and testnet an unpinned section stops startup (CS-624).
     #[test]
