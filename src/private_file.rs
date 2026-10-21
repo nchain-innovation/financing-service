@@ -1,7 +1,7 @@
 //! Writing a file that holds secrets (CS-526).
 
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Replaces `path` with `bytes` so that it is never half-written and never
@@ -68,9 +68,9 @@ pub fn make_private(_path: &Path) -> std::io::Result<bool> {
 fn sync_directory(path: &Path) {
     #[cfg(unix)]
     {
-        let directory: PathBuf = match path.parent() {
+        let directory: std::path::PathBuf = match path.parent() {
             Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
-            _ => PathBuf::from("."),
+            _ => std::path::PathBuf::from("."),
         };
         if let Err(error) = std::fs::File::open(&directory).and_then(|d| d.sync_all()) {
             log::debug!("could not sync {}: {error}", directory.display());
@@ -83,6 +83,7 @@ fn sync_directory(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn temporary_directory() -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
